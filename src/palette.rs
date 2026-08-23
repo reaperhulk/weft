@@ -472,17 +472,19 @@ impl NearestMap {
                     let gb = (((key >> GRID_BITS) & 63) as u8) << 2;
                     let bb = ((key & 63) as u8) << 2;
                     let q = cv.srgb_to_oklab(rb + 2, gb + 2, bb + 2);
-                    let mut rmax2 = 0f32;
+                    // All 8 corners in SIMD lanes (slightly inflated to
+                    // stay an upper bound): candidate lists built from it
+                    // are supersets of the exact-rmax lists, so lookups
+                    // still return the true nearest.
+                    let mut lr = [0f32; 8];
+                    let mut lg = [0f32; 8];
+                    let mut lb = [0f32; 8];
                     for corner in 0..8 {
-                        let cr = rb + if corner & 1 != 0 { 3 } else { 0 };
-                        let cg = gb + if corner & 2 != 0 { 3 } else { 0 };
-                        let cb = bb + if corner & 4 != 0 { 3 } else { 0 };
-                        let l = cv.srgb_to_oklab(cr, cg, cb);
-                        let d = dist2(&l, &q);
-                        if d > rmax2 {
-                            rmax2 = d;
-                        }
+                        lr[corner] = cv.linear(rb + if corner & 1 != 0 { 3 } else { 0 });
+                        lg[corner] = cv.linear(gb + if corner & 2 != 0 { 3 } else { 0 });
+                        lb[corner] = cv.linear(bb + if corner & 4 != 0 { 3 } else { 0 });
                     }
+                    let rmax2 = crate::simdops::corner_rmax2(level, &lr, &lg, &lb, q);
                     let rmax = rmax2.sqrt();
                     // one SIMD distance pass, buffered, shared by the dmin
                     // scan and the candidate filter

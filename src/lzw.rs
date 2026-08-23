@@ -172,17 +172,20 @@ impl<'a> BitWriter<'a> {
     fn put(&mut self, code: u32, width: u32) {
         self.acc |= (code as u64) << self.nbits;
         self.nbits += width;
-        while self.nbits >= 8 {
-            self.out.push(self.acc as u8);
-            self.acc >>= 8;
-            self.nbits -= 8;
+        // Drain four bytes at a time (codes are <= 12 bits, so the
+        // accumulator never overflows 64 bits between drains); one 4-byte
+        // extend beats four bounds-checked pushes.
+        if self.nbits >= 32 {
+            self.out.extend_from_slice(&(self.acc as u32).to_le_bytes());
+            self.acc >>= 32;
+            self.nbits -= 32;
         }
     }
     fn flush(&mut self) {
-        if self.nbits > 0 {
+        while self.nbits > 0 {
             self.out.push(self.acc as u8);
-            self.acc = 0;
-            self.nbits = 0;
+            self.acc >>= 8;
+            self.nbits = self.nbits.saturating_sub(8);
         }
     }
 }

@@ -147,6 +147,10 @@ pub struct MuxParams<'a> {
 /// Write the full GIF stream. Consecutive empty-body frames fold their
 /// delays into the previous visible frame.
 pub fn mux(params: &MuxParams, frames: &[EncodedFrame], out: &mut Vec<u8>) {
+    // exact preallocation: header+GCT+loop ext, then per visible frame an
+    // 8-byte graphic control extension plus its body, and the trailer
+    let fixed = 13 + 3 * (1 << params.gct_bits) + 19 + 1;
+    out.reserve(fixed + frames.iter().map(|f| 8 + f.body.len()).sum::<usize>());
     out.extend_from_slice(b"GIF89a");
     out.extend_from_slice(&(params.width as u16).to_le_bytes());
     out.extend_from_slice(&(params.height as u16).to_le_bytes());

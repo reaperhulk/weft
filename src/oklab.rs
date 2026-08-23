@@ -29,6 +29,12 @@ impl LabConverter {
         LabConverter { lut: linear_lut() }
     }
 
+    /// Linearized sRGB channel value (the LUT the Lab transform uses).
+    #[inline(always)]
+    pub fn linear(&self, v: u8) -> f32 {
+        self.lut[v as usize]
+    }
+
     #[inline(always)]
     pub fn srgb_to_oklab(&self, r: u8, g: u8, b: u8) -> [f32; 3] {
         self.srgb_to_oklab_with(r, g, b, f32::cbrt)

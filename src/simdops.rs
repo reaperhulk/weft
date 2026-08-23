@@ -3,7 +3,7 @@
 
 #[allow(unused_imports)]
 use fearless_simd::prelude::*;
-use fearless_simd::{f32x8, i32x8, u8x16, Level, Simd};
+use fearless_simd::{f32x8, i32x8, u32x8, u8x16, Level, Simd};
 use std::sync::OnceLock;
 
 /// Runtime-detected SIMD level, cached (feature detection once).
@@ -104,6 +104,60 @@ fn convert_group<S: Simd>(
     for (dst, v) in out.as_chunks_mut::<4>().0.iter_mut().zip(tmp) {
         *dst = v.to_le_bytes();
     }
+}
+
+/// Vectorized fast cube root for 8 non-negative lanes: shift-series
+/// approximation of bits/3 plus the Kahan offset for the seed, then two
+/// Halley iterations — a few ULPs of accuracy, like `oklab::cbrt_fast`.
+#[inline(always)]
+fn cbrt_x8<S: Simd>(simd: S, x: f32x8<S>) -> f32x8<S> {
+    let bits: u32x8<S> = x.bitcast();
+    // t = bits * (1/4 + 1/16) * (1 + 1/16) * (1 + 1/256) ~= bits / 3
+    let t = (bits >> 2u32) + (bits >> 4u32);
+    let t = t + (t >> 4u32);
+    let t = t + (t >> 8u32);
+    let seed = t + u32x8::splat(simd, 709_921_077);
+    let mut y: f32x8<S> = seed.bitcast();
+    let two = f32x8::splat(simd, 2.0);
+    for _ in 0..2 {
+        let y3 = y * y * y;
+        y = y * (y3 + two * x) / (two * y3 + x);
+    }
+    y
+}
+
+/// Max squared OkLab distance from 8 cell corners (given as linearized
+/// sRGB channel values per corner) to the reference point `q`. All eight
+/// corners are evaluated in lanes with the vectorized cube root; the
+/// result is inflated slightly so bounds built from it remain valid upper
+/// bounds despite the cbrt approximation.
+pub fn corner_rmax2(level: Level, lr: &[f32; 8], lg: &[f32; 8], lb: &[f32; 8], q: [f32; 3]) -> f32 {
+    fearless_simd::dispatch!(level, simd => corner_rmax2_impl(simd, lr, lg, lb, q))
+}
+
+#[inline(always)]
+fn corner_rmax2_impl<S: Simd>(
+    simd: S,
+    lr: &[f32; 8],
+    lg: &[f32; 8],
+    lb: &[f32; 8],
+    q: [f32; 3],
+) -> f32 {
+    let lrv = f32x8::from_slice(simd, lr);
+    let lgv = f32x8::from_slice(simd, lg);
+    let lbv = f32x8::from_slice(simd, lb);
+    let l = lrv * 0.4122214708 + lgv * 0.5363325363 + lbv * 0.0514459929;
+    let m = lrv * 0.2119034982 + lgv * 0.6806995451 + lbv * 0.1073969566;
+    let s = lrv * 0.0883024619 + lgv * 0.2817188376 + lbv * 0.6299787005;
+    let l_ = cbrt_x8(simd, l);
+    let m_ = cbrt_x8(simd, m);
+    let s_ = cbrt_x8(simd, s);
+    let dl = l_ * 0.2104542553 + m_ * 0.7936177850 + s_ * -0.0040720468 - f32x8::splat(simd, q[0]);
+    let da = l_ * 1.9779984951 + m_ * -2.4285922050 + s_ * 0.4505937099 - f32x8::splat(simd, q[1]);
+    let db = l_ * 0.0259040371 + m_ * 0.7827717662 + s_ * -0.8086757660 - f32x8::splat(simd, q[2]);
+    let d = dl * dl + da * da + db * db;
+    let arr: [f32; 8] = d.into();
+    arr.iter().fold(0f32, |m, &v| m.max(v)) * 1.0002
 }
 
 /// Palette OkLab channels in structure-of-arrays form, padded to a
