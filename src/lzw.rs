@@ -588,7 +588,7 @@ pub mod tests {
         };
         let data: Vec<u8> = (0..200_000)
             .map(|i| {
-                let base = ((i / 512) % 60 + 2) as i32;
+                let base = (i / 512) % 60 + 2;
                 (base + (rng() % 3) as i32 - 1) as u8
             })
             .collect();
