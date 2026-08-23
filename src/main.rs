@@ -445,9 +445,10 @@ fn run(args: &Args) -> io::Result<()> {
     // restore-to-background disposal (any_alpha comes from pass 1).
     let t3 = Instant::now();
     let quant = Quantizer {
-        colors: &colors,
         nearest: &nearest,
         trans_idx,
+        // median_cut returns the exact colors when they all fit
+        exact_palette: n_entries < args.colors,
     };
     let delays = gif::frame_delays(nread, meta.fps_num, meta.fps_den);
     let disposal = if any_alpha {

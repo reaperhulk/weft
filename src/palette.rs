@@ -575,16 +575,23 @@ pub fn median_cut(entries: &[(u32, u32)], max_colors: usize) -> Vec<[u8; 3]> {
 /// OkLab distance to the query color is minimal; for most cells there is a
 /// single candidate and the search collapses to one load.
 pub struct NearestMap {
-    /// single-candidate fast path: palette index, or 0xFF when the cell
-    /// needs the candidate list (0xFF is never a palette index — palettes
-    /// cap at 255 colors, and the transparent slot is not in `colors`)
-    direct: Vec<u8>,
+    /// Single-candidate fast path, packed `r<<24 | g<<16 | b<<8 | idx` so
+    /// the caller gets the palette color with the same load as the index
+    /// (no dependent colors[] fetch); u32::MAX marks a multi-candidate
+    /// cell (a real entry can't collide: palettes cap at 255 colors, so
+    /// the index byte never reaches 0xFF).
+    direct: Vec<u32>,
     /// start offset into `cands` for each cell; len GRID_SIZE + 1
     starts: Vec<u32>,
     cands: Vec<u8>,
+    /// packed 24-bit sRGB per palette entry, for re-packing resolve results
+    pal_rgb: Vec<u32>,
     pal_lab: Vec<[f32; 3]>,
     cv: LabConverter,
 }
+
+/// A packed lookup result: `r<<24 | g<<16 | b<<8 | idx`.
+pub type PackedNearest = u32;
 
 impl NearestMap {
     pub fn build(colors: &[[u8; 3]]) -> Self {
@@ -641,12 +648,20 @@ impl NearestMap {
             )
             .collect();
 
+        let pal_rgb: Vec<u32> = colors
+            .iter()
+            .map(|c| ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32)
+            .collect();
         let mut direct = Vec::with_capacity(GRID_SIZE);
         let mut starts = Vec::with_capacity(GRID_SIZE + 1);
         let mut cands = Vec::new();
         let mut off = 0u32;
         for l in &cell_lists {
-            direct.push(if l.len() == 1 { l[0] } else { 0xFF });
+            direct.push(if l.len() == 1 {
+                (pal_rgb[l[0] as usize] << 8) | l[0] as u32
+            } else {
+                u32::MAX
+            });
             starts.push(off);
             cands.extend_from_slice(l);
             off += l.len() as u32;
@@ -656,6 +671,7 @@ impl NearestMap {
             direct,
             starts,
             cands,
+            pal_rgb,
             pal_lab,
             cv,
         }
@@ -666,39 +682,63 @@ impl NearestMap {
         self.cands.len() as f32 / GRID_SIZE as f32
     }
 
-    /// Uncached lookup (tests; `lookup_cached` is the hot path).
+    /// Uncached lookup (tests; `lookup_packed` is the hot path).
     #[cfg_attr(not(test), allow(dead_code))]
     #[inline(always)]
     pub fn lookup(&self, r: u8, g: u8, b: u8) -> u8 {
         let key = grid_key(r, g, b);
         let d = self.direct[key];
-        if d != 0xFF {
-            return d;
+        if d != u32::MAX {
+            return d as u8;
         }
         self.resolve_cell(key, r, g, b)
     }
 
-    /// Like `lookup` but memoizes multi-candidate resolutions in a
-    /// per-thread direct-mapped cache — dithered content repeats adjusted
-    /// colors heavily, and this skips the Lab conversion for repeats.
+    /// Nearest palette entry as a packed `rgb<<8 | idx` word, memoizing
+    /// multi-candidate resolutions in a per-thread direct-mapped cache —
+    /// dithered content repeats adjusted colors heavily, and this skips
+    /// the Lab conversion for repeats. Returning the palette color with
+    /// the index keeps the caller's error math off a dependent load.
     #[inline(always)]
-    pub fn lookup_cached(&self, cache: &mut IdxCache, r: u8, g: u8, b: u8) -> u8 {
+    pub fn lookup_packed(&self, cache: &mut IdxCache, r: u8, g: u8, b: u8) -> PackedNearest {
         let key = grid_key(r, g, b);
         let d = self.direct[key];
-        if d != 0xFF {
+        if d != u32::MAX {
             return d;
         }
+        self.lookup_slow(cache, key as u32, r, g, b)
+    }
+
+    /// The direct[] entry for a precomputed grid key (staged gather loops).
+    #[inline(always)]
+    pub fn direct_lookup(&self, key: u32) -> u32 {
+        self.direct[key as usize]
+    }
+
+    /// The multi-candidate path of `lookup_packed`, for callers that
+    /// already saw `direct_lookup` miss on `key`.
+    #[inline]
+    pub fn lookup_slow(
+        &self,
+        cache: &mut IdxCache,
+        key: u32,
+        r: u8,
+        g: u8,
+        b: u8,
+    ) -> PackedNearest {
         let color = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
         let slot = (color.wrapping_mul(0x9E37_79B1) >> 18) as usize;
         let e = cache.slots[slot];
-        // the e != MAX guard keeps the empty sentinel (color 0xFFFFFF,
-        // index 0xFF) from false-hitting on white
-        if e >> 8 == color && e != u32::MAX {
-            return e as u8;
+        // the e != MAX guard keeps the empty sentinel (whose tag bits read
+        // as 0xFFFFFF) from false-hitting on white; a real white entry has
+        // an index byte below 0xFF and never equals MAX
+        if (e >> 40) == color as u64 && e != u64::MAX {
+            return e as u32;
         }
-        let idx = self.resolve_cell(key, r, g, b);
-        cache.slots[slot] = (color << 8) | idx as u32;
-        idx
+        let idx = self.resolve_cell(key as usize, r, g, b);
+        let packed = (self.pal_rgb[idx as usize] << 8) | idx as u32;
+        cache.slots[slot] = ((color as u64) << 40) | packed as u64;
+        packed
     }
 
     /// Prefetch the fast-path cell for a color a few pixels ahead of the
@@ -743,18 +783,19 @@ impl NearestMap {
     }
 }
 
-/// Direct-mapped memo cache for multi-candidate nearest lookups (64K
-/// slots). Key and value share one u32 (color << 8 | palette index) so a
-/// probe touches a single cache line: palettes cap at 255 colors, so a
-/// real index never exceeds 254 and u32::MAX can mark empty slots.
+/// Direct-mapped memo cache for multi-candidate nearest lookups (16K
+/// slots). Each u64 packs `query_color<<40 | palette_rgb<<8 | idx`, so a
+/// probe touches one cache line and a hit returns the palette color along
+/// with the index. Empty slots are u64::MAX (see the sentinel guard in
+/// `lookup_packed`).
 pub struct IdxCache {
-    slots: Vec<u32>,
+    slots: Vec<u64>,
 }
 
 impl Default for IdxCache {
     fn default() -> Self {
         IdxCache {
-            slots: vec![u32::MAX; 1 << 14],
+            slots: vec![u64::MAX; 1 << 14],
         }
     }
 }
