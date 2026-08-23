@@ -10,6 +10,10 @@ pub enum Dither {
     FloydSteinberg,
     /// 8x8 ordered Bayer: fastest dithered mode, fully branch-predictable.
     Bayer,
+    /// 64x64 void-and-cluster blue-noise two-candidate ordered dither: no
+    /// serial error-diffusion chain, temporally stable, far less visible
+    /// structure than Bayer.
+    BlueNoise,
     None,
 }
 
@@ -61,9 +65,77 @@ impl<'a> Quantizer<'a> {
         match mode {
             Dither::None => self.quantize_plain(src, w, h, scratch, out),
             Dither::Bayer => self.quantize_bayer(src, w, h, scratch, out),
+            Dither::BlueNoise => self.quantize_bluenoise(src, w, h, scratch, out),
             Dither::Sierra2_4a => self.quantize_diffuse(src, w, h, scratch, out, false),
             Dither::FloydSteinberg => self.quantize_diffuse(src, w, h, scratch, out, true),
         }
+    }
+
+    fn quantize_bluenoise(
+        &self,
+        src: &crate::color::RowSource,
+        w: usize,
+        h: usize,
+        scratch: &mut QuantScratch,
+        out: &mut [u8],
+    ) -> bool {
+        // Two-candidate ordered dither: c1 = nearest(p); if quantization
+        // error is nonzero, c2 = nearest across the error direction, and
+        // the blue-noise threshold picks between c1 and c2 in proportion
+        // to where p sits between them. Pixels with an exact palette match
+        // never dither (like error diffusion, unlike plain threshold
+        // offsetting), so flat regions stay clean and delta-friendly.
+        let mask = &crate::bluenoise::BLUE_NOISE_64;
+        let mut has_alpha = false;
+        let cache = &mut scratch.cache;
+        for y in 0..h {
+            src.fill_row(y, &mut scratch.row);
+            let row = &scratch.row[..];
+            let orow = &mut out[y * w..(y + 1) * w];
+            let mrow = &mask[(y & 63) << 6..((y & 63) << 6) + 64];
+            for (x, (px, o)) in row
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(orow.iter_mut())
+                .enumerate()
+            {
+                if px[3] < 128 {
+                    *o = self.trans_idx;
+                    has_alpha = true;
+                    continue;
+                }
+                let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
+                let idx1 = self.nearest.lookup_cached(cache, px[0], px[1], px[2]);
+                let c1 = &self.colors[idx1 as usize];
+                let er = r - c1[0] as i32;
+                let eg = g - c1[1] as i32;
+                let eb = b - c1[2] as i32;
+                if er == 0 && eg == 0 && eb == 0 {
+                    *o = idx1;
+                    continue;
+                }
+                // probe across the error direction for the far candidate
+                let r2 = (r + 2 * er).clamp(0, 255) as u8;
+                let g2 = (g + 2 * eg).clamp(0, 255) as u8;
+                let b2 = (b + 2 * eb).clamp(0, 255) as u8;
+                let idx2 = self.nearest.lookup_cached(cache, r2, g2, b2);
+                if idx2 == idx1 {
+                    *o = idx1;
+                    continue;
+                }
+                let c2 = &self.colors[idx2 as usize];
+                let dr = c2[0] as i32 - c1[0] as i32;
+                let dg = c2[1] as i32 - c1[1] as i32;
+                let db = c2[2] as i32 - c1[2] as i32;
+                // fraction of the c1->c2 span covered by p, vs threshold
+                let num = (er * dr + eg * dg + eb * db).max(0);
+                let den = dr * dr + dg * dg + db * db;
+                let m = mrow[x & 63] as i32;
+                *o = if m * den < num * 256 { idx2 } else { idx1 };
+            }
+        }
+        has_alpha
     }
 
     fn quantize_plain(

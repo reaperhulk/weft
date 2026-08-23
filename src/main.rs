@@ -5,6 +5,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod bluenoise;
 mod color;
 mod dither;
 mod gif;
@@ -52,7 +53,10 @@ options:
   --format F         auto | rgba | y4m          (default: auto)
   --colors N         max palette colors, 2-256  (default: 256; one slot is
                      reserved for transparency, so 256 means 255 colors)
-  --dither D         sierra2 | fs | bayer | none (default: sierra2)
+  --dither D         sierra2 | fs | bluenoise | bayer | none
+                     (default: sierra2; bluenoise is faster, temporally
+                     stable, and compresses better at slightly lower
+                     visual quality)
   --loop N           loop count, 0 = forever    (default: 0)
   --lossy N          lossy LZW compression, 0-200 (default: 0 = lossless
                      encoding of the quantized frames; ~30 is subtle and
@@ -119,6 +123,7 @@ fn parse_args() -> Result<Args, String> {
                     "sierra2" | "sierra2_4a" => Dither::Sierra2_4a,
                     "fs" | "floyd_steinberg" => Dither::FloydSteinberg,
                     "bayer" => Dither::Bayer,
+                    "bluenoise" | "bn" => Dither::BlueNoise,
                     "none" => Dither::None,
                     d => return Err(format!("unknown dither {d}")),
                 }

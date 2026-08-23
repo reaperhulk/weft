@@ -108,13 +108,19 @@ pub fn encode_frame(
                 plain.extend_from_slice(a);
             }
             let descriptor_len = body.len();
-            let mut alt = Vec::new();
             enc.encode(min_code_size, &punched, lossy, &mut body);
-            enc.encode(min_code_size, &plain, lossy, &mut alt);
-            if alt.len() < body.len() - descriptor_len {
-                // the opaque encoding won: swap it in after the descriptor
-                body.truncate(descriptor_len);
-                body.extend_from_slice(&alt);
+            // Skip the opaque attempt when the rect is almost entirely
+            // transparent — punching always wins there, and sparse-change
+            // frames dominate typical animations.
+            let trans_count = punched.iter().filter(|&&p| p == trans_idx).count();
+            if trans_count * 10 < punched.len() * 9 {
+                let mut alt = Vec::new();
+                enc.encode(min_code_size, &plain, lossy, &mut alt);
+                if alt.len() < body.len() - descriptor_len {
+                    // the opaque encoding won: swap it in after the descriptor
+                    body.truncate(descriptor_len);
+                    body.extend_from_slice(&alt);
+                }
             }
         }
         None => enc.encode(min_code_size, idx, lossy, &mut body),
@@ -230,7 +236,18 @@ mod tests {
         let mut cur = prev.clone();
         cur[3 * w + 2] = 9; // single changed pixel at (2,3)
         let mut enc = LzwEncoder::default();
-        let f = encode_frame(&cur, Some(&prev), w, h, 255, 8, 3, DISPOSAL_NONE, None, &mut enc);
+        let f = encode_frame(
+            &cur,
+            Some(&prev),
+            w,
+            h,
+            255,
+            8,
+            3,
+            DISPOSAL_NONE,
+            None,
+            &mut enc,
+        );
         // descriptor: 2C x0 y0 w h
         assert_eq!(f.body[0], 0x2C);
         assert_eq!(u16::from_le_bytes([f.body[1], f.body[2]]), 2);

@@ -434,7 +434,17 @@ impl LzwEncoder {
                 }
                 if let Ok(code) = self.probe(gen, (node_code << 8) | b2 as u32) {
                     let nd = map.next_dither(b, b2, &dither);
-                    self.lossy_dfs(gen, data, pos + 1, code, nd, accum + d as u64, visits, best, map);
+                    self.lossy_dfs(
+                        gen,
+                        data,
+                        pos + 1,
+                        code,
+                        nd,
+                        accum + d as u64,
+                        visits,
+                        best,
+                        map,
+                    );
                 }
             }
         }
@@ -602,9 +612,7 @@ pub mod tests {
         let mut sse = 0i64;
         for (i, (&got, &want)) in dec.iter().zip(&data).enumerate() {
             let d: i64 = (0..3)
-                .map(|c| {
-                    (colors[got as usize][c] as i64 - colors[want as usize][c] as i64).pow(2)
-                })
+                .map(|c| (colors[got as usize][c] as i64 - colors[want as usize][c] as i64).pow(2))
                 .sum();
             assert!(d <= raw_cap, "pixel {i}: {want}->{got} d2 {d} > {raw_cap}");
             sse += d;
