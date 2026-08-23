@@ -139,8 +139,8 @@ pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8]) {
         // raw words share alpha, so every counted pixel is opaque.
         if i < n && pixels[i] == px {
             let mut pattern = [0u8; 32];
-            for chunk in pattern.chunks_exact_mut(4) {
-                chunk.copy_from_slice(&px);
+            for chunk in pattern.as_chunks_mut::<4>().0 {
+                *chunk = px;
             }
             let bytes = &rgba[i * 4..];
             let mut off = 0usize;

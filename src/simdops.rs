@@ -101,8 +101,8 @@ fn convert_group<S: Simd>(
     let px = r | (g << 8u32) | (b << 16u32) | ALPHA;
     let mut tmp = [0i32; 8];
     px.store_slice(&mut tmp);
-    for (dst, v) in out.chunks_exact_mut(4).zip(tmp) {
-        dst.copy_from_slice(&v.to_le_bytes());
+    for (dst, v) in out.as_chunks_mut::<4>().0.iter_mut().zip(tmp) {
+        *dst = v.to_le_bytes();
     }
 }
 
