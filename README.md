@@ -127,3 +127,7 @@ accumulation) and an end-to-end test that decodes weft's output with an
 independent minimal GIF decoder and compares canvases byte-for-byte.
 
 Only dependency: rayon.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
