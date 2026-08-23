@@ -50,7 +50,11 @@ pub fn encode_frame(
             }
             let Some(y0) = y0 else {
                 // identical frame: fold into predecessor at mux time
-                return EncodedFrame { delay_cs, body, disposal };
+                return EncodedFrame {
+                    delay_cs,
+                    body,
+                    disposal,
+                };
             };
             let mut x0 = w;
             let mut x1 = 0usize;
@@ -59,7 +63,13 @@ pub fn encode_frame(
                 let b = &prev[y * w..(y + 1) * w];
                 if let Some(first) = a.iter().zip(b).position(|(p, q)| p != q) {
                     x0 = x0.min(first);
-                    let last = w - 1 - a.iter().zip(b.iter()).rev().position(|(p, q)| p != q).unwrap();
+                    let last = w
+                        - 1
+                        - a.iter()
+                            .zip(b.iter())
+                            .rev()
+                            .position(|(p, q)| p != q)
+                            .unwrap();
                     x1 = x1.max(last);
                 }
             }
@@ -70,7 +80,11 @@ pub fn encode_frame(
             for y in y0..=y1 {
                 let a = &idx[y * w + x0..y * w + x1 + 1];
                 let b = &prev[y * w + x0..y * w + x1 + 1];
-                sub.extend(a.iter().zip(b).map(|(&p, &q)| if p == q { trans_idx } else { p }));
+                sub.extend(
+                    a.iter()
+                        .zip(b)
+                        .map(|(&p, &q)| if p == q { trans_idx } else { p }),
+                );
             }
             (x0, y0, x1, y1, Some(sub))
         }
@@ -91,7 +105,11 @@ pub fn encode_frame(
         None => enc.encode(min_code_size, idx, &mut body),
     }
 
-    EncodedFrame { delay_cs, body, disposal }
+    EncodedFrame {
+        delay_cs,
+        body,
+        disposal,
+    }
 }
 
 pub struct MuxParams<'a> {

@@ -8,6 +8,11 @@ license = "Apache-2.0"
 [dependencies]
 rayon = "1.10"
 
+# musl's malloc is slow under multithreaded allocation; swap it out so the
+# static binary matches the glibc build's speed
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
+
 [profile.release]
 opt-level = 3
 lto = "fat"

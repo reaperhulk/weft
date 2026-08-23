@@ -111,7 +111,12 @@ fn decode_gif(data: &[u8]) -> DecodedGif {
             b => panic!("unexpected block 0x{b:02X} at {pos}"),
         }
     }
-    DecodedGif { width, height, frames, loop_ext }
+    DecodedGif {
+        width,
+        height,
+        frames,
+        loop_ext,
+    }
 }
 
 fn lzw_decode(min_code_size: u8, mut bytes: &[u8]) -> Vec<u8> {
@@ -181,7 +186,12 @@ fn run_weft(args: &[&str], input: &[u8]) -> Vec<u8> {
         .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn weft");
-    child.stdin.take().unwrap().write_all(input).expect("write stdin");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input)
+        .expect("write stdin");
     let out = child.wait_with_output().expect("wait");
     assert!(out.status.success(), "weft exited with {:?}", out.status);
     out.stdout
@@ -234,9 +244,7 @@ fn roundtrip_exact_with_delta_frames() {
 fn duplicate_frames_fold_delays() {
     let (w, h) = (32usize, 32usize);
     // 3 identical frames then a different one, then identical again
-    let solid = |c: [u8; 4]| -> Vec<u8> {
-        std::iter::repeat(c).take(w * h).flatten().collect()
-    };
+    let solid = |c: [u8; 4]| -> Vec<u8> { std::iter::repeat(c).take(w * h).flatten().collect() };
     let a = solid([10, 200, 10, 255]);
     let b = solid([200, 10, 10, 255]);
     let mut raw = Vec::new();
@@ -255,7 +263,10 @@ fn duplicate_frames_fold_delays() {
 #[test]
 fn no_loop_flag_drops_extension() {
     let (w, h) = (16usize, 16usize);
-    let raw: Vec<u8> = std::iter::repeat([1u8, 2, 3, 255]).take(w * h).flatten().collect();
+    let raw: Vec<u8> = std::iter::repeat([1u8, 2, 3, 255])
+        .take(w * h)
+        .flatten()
+        .collect();
     let gif = run_weft(&["--size", "16x16", "--no-loop"], &raw);
     let dec = decode_gif(&gif);
     assert!(!dec.loop_ext);

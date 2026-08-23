@@ -7,6 +7,18 @@ weft targets the quality and size of ffmpeg's `palettegen`/`paletteuse`
 pipeline (the standard way to make good GIFs) while being several times
 faster by parallelizing every stage across frames.
 
+## Install
+
+Prebuilt fully static Linux binaries (x86_64 and aarch64) are attached to
+releases and built by CI for every push. They are linked against musl with
+mimalloc as the allocator, so they run on any Linux distro — any glibc
+version, Alpine, scratch containers — with no runtime dependencies, at the
+same speed as a glibc build.
+
+From source: `cargo build --release` (or
+`cargo build --release --target x86_64-unknown-linux-musl` for the static
+build; needs `musl-tools`).
+
 ## Usage
 
 ```sh

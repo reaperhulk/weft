@@ -84,7 +84,11 @@ impl LzwEncoder {
     fn encode_raw(&mut self, min_code_size: u8, data: &[u8], out: &mut Vec<u8>) {
         let clear = 1u32 << min_code_size;
         let eoi = clear + 1;
-        let mut bw = BitWriter { out, acc: 0, nbits: 0 };
+        let mut bw = BitWriter {
+            out,
+            acc: 0,
+            nbits: 0,
+        };
         let mut width = min_code_size as u32 + 1;
         bw.put(clear, width);
         if data.is_empty() {
@@ -252,7 +256,9 @@ pub mod tests {
     fn encoder_reuse_across_frames() {
         let mut enc = LzwEncoder::default();
         for round in 0..5u32 {
-            let data: Vec<u8> = (0..50_000).map(|i| ((i as u32 * (round + 3)) % 251) as u8).collect();
+            let data: Vec<u8> = (0..50_000)
+                .map(|i| ((i as u32 * (round + 3)) % 251) as u8)
+                .collect();
             let mut raw = Vec::new();
             enc.encode_raw(8, &data, &mut raw);
             assert_eq!(lzw_decode(8, &raw, data.len()), data);

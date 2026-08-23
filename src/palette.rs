@@ -21,7 +21,9 @@ pub const GRID_SIZE: usize = 1 << (3 * GRID_BITS); // 262144
 
 #[inline(always)]
 pub fn grid_key(r: u8, g: u8, b: u8) -> usize {
-    (((r as usize) >> 2) << (2 * GRID_BITS)) | (((g as usize) >> 2) << GRID_BITS) | ((b as usize) >> 2)
+    (((r as usize) >> 2) << (2 * GRID_BITS))
+        | (((g as usize) >> 2) << GRID_BITS)
+        | ((b as usize) >> 2)
 }
 
 // ---------------------------------------------------------------------------
@@ -377,7 +379,13 @@ impl NearestMap {
             off += l.len() as u32;
         }
         starts.push(off);
-        NearestMap { direct, starts, cands, pal_lab, cv }
+        NearestMap {
+            direct,
+            starts,
+            cands,
+            pal_lab,
+            cv,
+        }
     }
 
     /// Average candidates per cell — perf diagnostic.
@@ -541,15 +549,29 @@ mod tests {
             x
         };
         for _ in 0..255 {
-            pal.push([(rng() % 256) as u8, (rng() % 256) as u8, (rng() % 256) as u8]);
+            pal.push([
+                (rng() % 256) as u8,
+                (rng() % 256) as u8,
+                (rng() % 256) as u8,
+            ]);
         }
         let nm = NearestMap::build(&pal);
-        let pal_lab: Vec<[f32; 3]> = pal.iter().map(|c| cv.srgb_to_oklab(c[0], c[1], c[2])).collect();
+        let pal_lab: Vec<[f32; 3]> = pal
+            .iter()
+            .map(|c| cv.srgb_to_oklab(c[0], c[1], c[2]))
+            .collect();
         for _ in 0..50_000 {
-            let (r, g, b) = ((rng() % 256) as u8, (rng() % 256) as u8, (rng() % 256) as u8);
+            let (r, g, b) = (
+                (rng() % 256) as u8,
+                (rng() % 256) as u8,
+                (rng() % 256) as u8,
+            );
             let got = nm.lookup(r, g, b);
             let q = cv.srgb_to_oklab(r, g, b);
-            let bd = pal_lab.iter().map(|pl| dist2(pl, &q)).fold(f32::MAX, f32::min);
+            let bd = pal_lab
+                .iter()
+                .map(|pl| dist2(pl, &q))
+                .fold(f32::MAX, f32::min);
             let gd = dist2(&pal_lab[got as usize], &q);
             assert!(
                 (gd - bd).abs() <= bd * 1e-5 + 1e-12,
@@ -567,14 +589,23 @@ mod tests {
             pal.push([i, i / 2, i / 3]);
         }
         let nm = NearestMap::build(&pal);
-        let pal_lab: Vec<[f32; 3]> = pal.iter().map(|c| cv.srgb_to_oklab(c[0], c[1], c[2])).collect();
+        let pal_lab: Vec<[f32; 3]> = pal
+            .iter()
+            .map(|c| cv.srgb_to_oklab(c[0], c[1], c[2]))
+            .collect();
         for r in 0..40u8 {
             for g in 0..40u8 {
                 let got = nm.lookup(r, g, 5);
                 let q = cv.srgb_to_oklab(r, g, 5);
-                let bd = pal_lab.iter().map(|pl| dist2(pl, &q)).fold(f32::MAX, f32::min);
+                let bd = pal_lab
+                    .iter()
+                    .map(|pl| dist2(pl, &q))
+                    .fold(f32::MAX, f32::min);
                 let gd = dist2(&pal_lab[got as usize], &q);
-                assert!((gd - bd).abs() <= bd * 1e-5 + 1e-12, "mismatch at {r},{g},5");
+                assert!(
+                    (gd - bd).abs() <= bd * 1e-5 + 1e-12,
+                    "mismatch at {r},{g},5"
+                );
             }
         }
     }

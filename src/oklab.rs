@@ -78,11 +78,21 @@ mod tests {
     #[test]
     fn roundtrip_extremes() {
         let cv = LabConverter::new();
-        for c in [[0u8, 0, 0], [255, 255, 255], [255, 0, 0], [0, 255, 0], [0, 0, 255], [17, 130, 200]] {
+        for c in [
+            [0u8, 0, 0],
+            [255, 255, 255],
+            [255, 0, 0],
+            [0, 255, 0],
+            [0, 0, 255],
+            [17, 130, 200],
+        ] {
             let lab = cv.srgb_to_oklab(c[0], c[1], c[2]);
             let back = oklab_to_srgb(lab);
             for i in 0..3 {
-                assert!((back[i] as i32 - c[i] as i32).abs() <= 1, "{c:?} -> {back:?}");
+                assert!(
+                    (back[i] as i32 - c[i] as i32).abs() <= 1,
+                    "{c:?} -> {back:?}"
+                );
             }
         }
     }

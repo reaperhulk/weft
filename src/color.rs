@@ -32,7 +32,12 @@ pub struct RowSource<'a> {
 
 impl<'a> RowSource<'a> {
     pub fn new(frame: &'a Frame, w: usize, h: usize, chroma: Option<Chroma>) -> Self {
-        RowSource { frame, w, h, chroma }
+        RowSource {
+            frame,
+            w,
+            h,
+            chroma,
+        }
     }
 
     /// Fill `out` (len w*4) with RGBA for row `y`.
@@ -153,6 +158,10 @@ mod tests {
         let mut out = vec![0u8; 16];
         frame_to_rgba(&Frame::Yuv(buf), w, h, Some(Chroma::C444), &mut out);
         // red-ish first pixel (bt601 red: Y81 U90 V240)
-        assert!(out[0] > 200 && out[1] < 60 && out[2] < 60, "{:?}", &out[..4]);
+        assert!(
+            out[0] > 200 && out[1] < 60 && out[2] < 60,
+            "{:?}",
+            &out[..4]
+        );
     }
 }

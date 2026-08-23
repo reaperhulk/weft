@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (glibc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo test --release
+
+  static:
+    name: static musl (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    env:
+      # mimalloc's C sources must be compiled against musl
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Run tests against the musl target
+        run: cargo test --release --target ${{ matrix.target }}
+
+      - name: Build static binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Verify the binary is fully static and runs
+        run: |
+          bin=target/${{ matrix.target }}/release/weft
+          file "$bin"
+          # must not be a dynamic executable
+          if ldd "$bin" 2>&1 | grep -q "=>"; then
+            echo "binary is dynamically linked" >&2
+            exit 1
+          fi
+          # smoke test: 2 raw RGBA frames in, a decodable GIF out
+          python3 - "$bin" <<'EOF'
+          import subprocess, sys
+          frames = bytes([255, 0, 0, 255]) * (8 * 8) + bytes([0, 0, 255, 255]) * (8 * 8)
+          out = subprocess.run(
+              [sys.argv[1], "--size", "8x8", "--fps", "10"],
+              input=frames, capture_output=True, check=True,
+          ).stdout
+          assert out[:6] == b"GIF89a", out[:6]
+          assert out[-1] == 0x3B, "missing trailer"
+          print(f"smoke test OK ({len(out)} bytes)")
+          EOF
+
+      - name: Prepare artifact
+        run: |
+          cp target/${{ matrix.target }}/release/weft weft-${{ matrix.arch }}-linux-musl
+          strip weft-${{ matrix.arch }}-linux-musl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: weft-${{ matrix.arch }}-linux-musl
+          path: weft-${{ matrix.arch }}-linux-musl
+          if-no-files-found: error
+
+  release:
+    name: attach binaries to release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, static]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: weft-*-linux-musl

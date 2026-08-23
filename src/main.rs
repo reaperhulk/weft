@@ -1,12 +1,16 @@
 //! weft: fast parallel GIF encoder.
 //! Reads raw RGBA or yuv4mpegpipe from stdin, writes GIF to stdout.
 
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod color;
-mod oklab;
 mod dither;
 mod gif;
 mod input;
 mod lzw;
+mod oklab;
 mod palette;
 
 use dither::{Dither, Quantizer};
@@ -116,7 +120,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--loop" => a.loop_count = Some(val("--loop")?.parse().map_err(|_| "bad --loop")?),
             "--no-loop" => a.loop_count = None,
-            "--threads" => a.threads = Some(val("--threads")?.parse().map_err(|_| "bad --threads")?),
+            "--threads" => {
+                a.threads = Some(val("--threads")?.parse().map_err(|_| "bad --threads")?)
+            }
             "--stats" => a.stats = true,
             "--help" | "-h" => {
                 print!("{USAGE}");
@@ -187,7 +193,10 @@ fn run(args: &Args) -> io::Result<()> {
             line
         };
         if !header.starts_with("YUV4MPEG2") {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "not a y4m stream"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a y4m stream",
+            ));
         }
         let mut meta = input::parse_y4m_header(&header)?;
         if let Some((n, d)) = args.fps {
@@ -197,16 +206,32 @@ fn run(args: &Args) -> io::Result<()> {
         (meta, Source::Y4m(reader))
     } else {
         let (w, h) = args.size.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "--size WxH is required for raw RGBA input")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--size WxH is required for raw RGBA input",
+            )
         })?;
         let (n, d) = args.fps.unwrap_or((30, 1));
-        let meta = VideoIn { width: w, height: h, fps_num: n, fps_den: d, chroma: None };
-        let leftover = if probe_consumed { probe.to_vec() } else { Vec::new() };
+        let meta = VideoIn {
+            width: w,
+            height: h,
+            fps_num: n,
+            fps_den: d,
+            chroma: None,
+        };
+        let leftover = if probe_consumed {
+            probe.to_vec()
+        } else {
+            Vec::new()
+        };
         (meta, Source::Rgba(io::Cursor::new(leftover).chain(reader)))
     };
     let (w, h) = (meta.width, meta.height);
     if w == 0 || h == 0 || w > 65535 || h > 65535 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame size exceeds GIF limits"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame size exceeds GIF limits",
+        ));
     }
 
     // ---- read + histogram, overlapped -------------------------------------
@@ -261,7 +286,10 @@ fn run(args: &Args) -> io::Result<()> {
     });
     let nread = read_res?;
     let Some((hist, mut indexed_frames, _)) = acc else {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "no frames in input"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no frames in input",
+        ));
     };
     debug_assert_eq!(indexed_frames.len(), nread);
     indexed_frames.sort_unstable_by_key(|(i, _)| *i);
@@ -291,7 +319,11 @@ fn run(args: &Args) -> io::Result<()> {
 
     // ---- pass 2: quantize + dither (parallel per frame) ------------------
     let t3 = Instant::now();
-    let quant = Quantizer { colors: &colors, nearest: &nearest, trans_idx };
+    let quant = Quantizer {
+        colors: &colors,
+        nearest: &nearest,
+        trans_idx,
+    };
     let results: Vec<(Vec<u8>, bool)> = frames
         .into_par_iter()
         .map_init(
@@ -314,13 +346,29 @@ fn run(args: &Args) -> io::Result<()> {
     // fall back to full frames with restore-to-background disposal.
     let t4 = Instant::now();
     let delays = gif::frame_delays(indexed.len(), meta.fps_num, meta.fps_den);
-    let disposal = if any_alpha { gif::DISPOSAL_BACKGROUND } else { gif::DISPOSAL_NONE };
+    let disposal = if any_alpha {
+        gif::DISPOSAL_BACKGROUND
+    } else {
+        gif::DISPOSAL_NONE
+    };
     let encoded: Vec<gif::EncodedFrame> = (0..indexed.len())
         .into_par_iter()
         .map_init(LzwEncoder::default, |enc, i| {
-            let prev = if any_alpha || i == 0 { None } else { Some(indexed[i - 1].as_slice()) };
+            let prev = if any_alpha || i == 0 {
+                None
+            } else {
+                Some(indexed[i - 1].as_slice())
+            };
             gif::encode_frame(
-                &indexed[i], prev, w, h, trans_idx, min_code_size, delays[i], disposal, enc,
+                &indexed[i],
+                prev,
+                w,
+                h,
+                trans_idx,
+                min_code_size,
+                delays[i],
+                disposal,
+                enc,
             )
         })
         .collect();
@@ -347,7 +395,10 @@ fn run(args: &Args) -> io::Result<()> {
         let n = encoded.len();
         eprintln!(
             "weft: {n} frames {w}x{h} @{}/{} fps, {} colors, {} bytes",
-            meta.fps_num, meta.fps_den, colors.len(), out.len()
+            meta.fps_num,
+            meta.fps_den,
+            colors.len(),
+            out.len()
         );
         eprintln!(
             "  read+hist {:?} (hist span {:?})  palette+lut {:?}  quantize {:?}  delta+lzw {:?}  mux+write {:?}  total {:?}",

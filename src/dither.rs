@@ -66,7 +66,14 @@ impl<'a> Quantizer<'a> {
         }
     }
 
-    fn quantize_plain(&self, src: &crate::color::RowSource, w: usize, h: usize, scratch: &mut QuantScratch, out: &mut [u8]) -> bool {
+    fn quantize_plain(
+        &self,
+        src: &crate::color::RowSource,
+        w: usize,
+        h: usize,
+        scratch: &mut QuantScratch,
+        out: &mut [u8],
+    ) -> bool {
         let mut has_alpha = false;
         let cache = &mut scratch.cache;
         for y in 0..h {
@@ -84,7 +91,14 @@ impl<'a> Quantizer<'a> {
         has_alpha
     }
 
-    fn quantize_bayer(&self, src: &crate::color::RowSource, w: usize, h: usize, scratch: &mut QuantScratch, out: &mut [u8]) -> bool {
+    fn quantize_bayer(
+        &self,
+        src: &crate::color::RowSource,
+        w: usize,
+        h: usize,
+        scratch: &mut QuantScratch,
+        out: &mut [u8],
+    ) -> bool {
         let mut has_alpha = false;
         let cache = &mut scratch.cache;
         for y in 0..h {
@@ -194,8 +208,14 @@ mod tests {
     fn plain_exact_colors_lossless() {
         let colors = vec![[0u8, 0, 0], [255, 255, 255], [255, 0, 0]];
         let nm = NearestMap::build(&colors);
-        let q = Quantizer { colors: &colors, nearest: &nm, trans_idx: 3 };
-        let rgba = vec![255u8, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 0];
+        let q = Quantizer {
+            colors: &colors,
+            nearest: &nm,
+            trans_idx: 3,
+        };
+        let rgba = vec![
+            255u8, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 0,
+        ];
         let frame = crate::input::Frame::Rgba(rgba);
         let src = crate::color::RowSource::new(&frame, 4, 1, None);
         let mut out = [9u8; 4];
@@ -210,7 +230,11 @@ mod tests {
         // With an exact palette, dithering must be a no-op.
         let colors = vec![[10u8, 20, 30], [200, 100, 50]];
         let nm = NearestMap::build(&colors);
-        let q = Quantizer { colors: &colors, nearest: &nm, trans_idx: 2 };
+        let q = Quantizer {
+            colors: &colors,
+            nearest: &nm,
+            trans_idx: 2,
+        };
         let mut rgba = Vec::new();
         for i in 0..64 {
             let c = &colors[i % 2];
