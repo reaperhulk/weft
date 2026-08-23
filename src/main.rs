@@ -13,6 +13,7 @@ mod input;
 mod lzw;
 mod oklab;
 mod palette;
+mod simdops;
 
 use dither::{Dither, Quantizer};
 use input::{Frame, VideoIn};

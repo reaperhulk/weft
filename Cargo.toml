@@ -6,6 +6,7 @@ description = "Fast parallel GIF encoder: raw RGBA or yuv4mpegpipe on stdin, GIF
 license = "Apache-2.0"
 
 [dependencies]
+fearless_simd = "0.7.0"
 rayon = "1.10"
 
 # musl's malloc is slow under multithreaded allocation; swap it out so the

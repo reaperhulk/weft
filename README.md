@@ -165,7 +165,13 @@ Every heavy stage is embarrassingly parallel across frames (rayon):
    bound makes the argmin over the cell's candidates the true OkLab
    nearest for every color in the cell. Most cells hold one candidate, so
    the hot path is a single table load; multi-candidate lookups memoize in
-   a per-thread direct-mapped cache.
+   a per-thread direct-mapped cache. The build's 262k-cell × 256-color
+   distance sweep runs on fearless_simd's portable f32 lanes with runtime
+   dispatch, so the baseline-CPU static binaries still use AVX2/NEON when
+   the machine has it (bit-exact vs the scalar path — no FMA contraction).
+   SIMD is deliberately scoped to this stage: error diffusion is a serial
+   dependency chain per pixel, LZW is a serial hash walk, and palette
+   lookups are gather-bound, so none of them vectorize profitably.
 4. **Quantize + dither, parallel per frame.** Sierra-2-4A error diffusion
    by default (ffmpeg's paletteuse default), diffusing sRGB error with
    truncating division (an arithmetic shift would diffuse >100% of

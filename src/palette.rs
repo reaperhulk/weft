@@ -326,46 +326,43 @@ impl NearestMap {
         // nearest for p then satisfies dist(c, q) <= dmin(q) + 2*rmax, so
         // collecting all palette colors within that bound makes the argmin
         // over candidates exact for every p in the cell.
+        let soa = crate::simdops::PalSoa::new(&pal_lab);
+        let level = fearless_simd::Level::new();
         let cell_lists: Vec<Vec<u8>> = (0..GRID_SIZE)
             .into_par_iter()
-            .map_init(LabConverter::new, |cv, key| {
-                let rb = (((key >> (2 * GRID_BITS)) & 63) as u8) << 2;
-                let gb = (((key >> GRID_BITS) & 63) as u8) << 2;
-                let bb = ((key & 63) as u8) << 2;
-                let q = cv.srgb_to_oklab(rb + 2, gb + 2, bb + 2);
-                let mut rmax2 = 0f32;
-                for corner in 0..8 {
-                    let cr = rb + if corner & 1 != 0 { 3 } else { 0 };
-                    let cg = gb + if corner & 2 != 0 { 3 } else { 0 };
-                    let cb = bb + if corner & 4 != 0 { 3 } else { 0 };
-                    let l = cv.srgb_to_oklab(cr, cg, cb);
-                    let d = dist2(&l, &q);
-                    if d > rmax2 {
-                        rmax2 = d;
+            .map_init(
+                || (LabConverter::new(), vec![0f32; soa.l.len()]),
+                |(cv, dists), key| {
+                    let rb = (((key >> (2 * GRID_BITS)) & 63) as u8) << 2;
+                    let gb = (((key >> GRID_BITS) & 63) as u8) << 2;
+                    let bb = ((key & 63) as u8) << 2;
+                    let q = cv.srgb_to_oklab(rb + 2, gb + 2, bb + 2);
+                    let mut rmax2 = 0f32;
+                    for corner in 0..8 {
+                        let cr = rb + if corner & 1 != 0 { 3 } else { 0 };
+                        let cg = gb + if corner & 2 != 0 { 3 } else { 0 };
+                        let cb = bb + if corner & 4 != 0 { 3 } else { 0 };
+                        let l = cv.srgb_to_oklab(cr, cg, cb);
+                        let d = dist2(&l, &q);
+                        if d > rmax2 {
+                            rmax2 = d;
+                        }
                     }
-                }
-                let rmax = rmax2.sqrt();
-                // one distance pass, buffered, shared by the dmin scan and
-                // the candidate filter
-                let mut dists = [0f32; 256];
-                let mut dmin2 = f32::MAX;
-                for (i, pl) in pal_lab.iter().enumerate() {
-                    let d = dist2(pl, &q);
-                    dists[i] = d;
-                    if d < dmin2 {
-                        dmin2 = d;
+                    let rmax = rmax2.sqrt();
+                    // one SIMD distance pass, buffered, shared by the dmin
+                    // scan and the candidate filter
+                    let dmin2 = crate::simdops::cell_distances(level, &soa, q, dists);
+                    let bound = dmin2.sqrt() + 2.0 * rmax + 1e-6;
+                    let bound2 = bound * bound;
+                    let mut list = Vec::new();
+                    for (i, &d) in dists[..pal_lab.len()].iter().enumerate() {
+                        if d <= bound2 {
+                            list.push(i as u8);
+                        }
                     }
-                }
-                let bound = dmin2.sqrt() + 2.0 * rmax + 1e-6;
-                let bound2 = bound * bound;
-                let mut list = Vec::new();
-                for (i, &d) in dists[..pal_lab.len()].iter().enumerate() {
-                    if d <= bound2 {
-                        list.push(i as u8);
-                    }
-                }
-                list
-            })
+                    list
+                },
+            )
             .collect();
 
         let mut direct = Vec::with_capacity(GRID_SIZE);
