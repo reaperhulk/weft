@@ -5,6 +5,32 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Make mimalloc give freed pages back to the OS promptly. The pipeline
+/// frees in large phase-sized bursts (raw frames after packing, histogram
+/// tables after the palette, index buffers per block), and with the default
+/// 10ms purge delay + no abandoned-page purging those bursts linger and the
+/// static binary peaks 20-30% above the glibc build. A 1ms delay recovers
+/// nearly all of that while still letting the reader's hot frame buffers
+/// recycle without madvise churn (0 costs real throughput on fast inputs);
+/// abandoned-page purging matters because the reader thread — which
+/// allocates every raw frame — exits after pass 1, and its heap's pages
+/// otherwise stay resident until another thread happens to reclaim them.
+#[cfg(target_env = "musl")]
+fn tune_mimalloc() {
+    // Indices into mimalloc's mi_option_t enum; libmimalloc-sys names only
+    // a subset of the options, but the layout is fixed by the mimalloc
+    // release the locked libmimalloc-sys bundles.
+    const MI_OPTION_ABANDONED_PAGE_PURGE: i32 = 12;
+    const MI_OPTION_PURGE_DELAY: i32 = 15; // milliseconds
+    unsafe {
+        libmimalloc_sys::mi_option_set(MI_OPTION_ABANDONED_PAGE_PURGE, 1);
+        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 1);
+    }
+}
+
+#[cfg(not(target_env = "musl"))]
+fn tune_mimalloc() {}
+
 mod bluenoise;
 mod color;
 mod dither;
@@ -16,10 +42,11 @@ mod palette;
 mod simdops;
 
 use dither::{Dither, Quantizer};
-use input::{Frame, VideoIn};
+use input::{Frame, StoredFrame, VideoIn};
 use lzw::LzwEncoder;
 use rayon::prelude::*;
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::sync::Mutex;
 use std::time::Instant;
 
 struct Args {
@@ -153,6 +180,7 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() {
+    tune_mimalloc();
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -256,9 +284,24 @@ fn run(args: &Args) -> io::Result<()> {
     // A reader thread streams frames into a bounded channel while rayon
     // workers accumulate per-thread histograms, so palette statistics are
     // (nearly) free whenever input arrives slower than it can be hashed.
+    // Each frame is LZ4-packed by the worker that histogrammed it (while
+    // its bytes are still cache-warm), so the set buffered for pass 2
+    // shrinks to roughly the compressed size of the input. Alpha presence
+    // is detected here too — pass 2+3 needs it before the first frame is
+    // quantized.
     let t1 = Instant::now();
     let nthreads = rayon::current_num_threads().max(1);
     let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(2 * nthreads);
+    // Worker-local histograms flush to a shared list of entry runs once
+    // they exceed this many distinct colors. This bounds each worker's
+    // open-addressed table to a few MB — on true-color content the tables
+    // otherwise balloon to hundreds of MB per thread — while keeping the
+    // lock trivially cheap: a flush converts the table to a plain entry
+    // vector (linear scan, done outside any lock) and the critical section
+    // is a single Vec push. Colors counted by several runs are summed by
+    // one parallel sort + adjacent-merge afterwards.
+    const HIST_SPILL: usize = 1 << 20;
+    let spilled: Mutex<Vec<Vec<(u32, u32)>>> = Mutex::new(Vec::new());
     let (read_res, acc) = std::thread::scope(|scope| {
         let meta_ref = &meta;
         let reader_handle = scope.spawn(move || -> io::Result<usize> {
@@ -284,26 +327,45 @@ fn run(args: &Args) -> io::Result<()> {
             .into_iter()
             .par_bridge()
             .fold(
-                || (palette::ColorHist::new(), Vec::new(), vec![0u8; w * 4]),
-                |(mut hist, mut frames, mut row), (i, f)| {
+                || {
+                    (
+                        palette::ColorHist::new(),
+                        Vec::new(),
+                        vec![0u8; w * 4],
+                        false,
+                    )
+                },
+                |(mut hist, mut frames, mut row, mut alpha), (i, f)| {
                     let src = color::RowSource::new(&f, w, h, meta_ref.chroma);
                     for y in 0..h {
                         src.fill_row(y, &mut row);
-                        palette::accumulate_frame(&mut hist, &row);
+                        alpha |= palette::accumulate_frame(&mut hist, &row);
                     }
-                    frames.push((i, f));
-                    (hist, frames, row)
+                    if hist.len() > HIST_SPILL {
+                        let run = hist.entries();
+                        spilled.lock().unwrap().push(run);
+                        hist = palette::ColorHist::new();
+                    }
+                    frames.push((i, StoredFrame::pack(f)));
+                    (hist, frames, row, alpha)
                 },
             )
-            .reduce_with(|(mut ha, mut fa, row), (hb, fb, _)| {
-                ha.merge(&hb);
+            .reduce_with(|(ha, mut fa, row, aa), (hb, fb, _, ab)| {
+                // Flush instead of hash-merging: reductions run while other
+                // workers still accumulate, and a table-into-table merge of
+                // millions of colors would serialize them behind cache-miss
+                // heavy rehashing. The sort below dedups across runs.
+                let run = hb.entries();
+                if !run.is_empty() {
+                    spilled.lock().unwrap().push(run);
+                }
                 fa.extend(fb);
-                (ha, fa, row)
+                (ha, fa, row, aa | ab)
             });
         (reader_handle.join().expect("reader thread panicked"), acc)
     });
     let nread = read_res?;
-    let Some((hist, mut indexed_frames, _)) = acc else {
+    let Some((hist, mut indexed_frames, _, any_alpha)) = acc else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "no frames in input",
@@ -311,9 +373,35 @@ fn run(args: &Args) -> io::Result<()> {
     };
     debug_assert_eq!(indexed_frames.len(), nread);
     indexed_frames.sort_unstable_by_key(|(i, _)| *i);
-    let frames: Vec<Frame> = indexed_frames.into_iter().map(|(_, f)| f).collect();
-    let entries = hist.entries();
+    let frames: Vec<StoredFrame> = indexed_frames.into_iter().map(|(_, f)| f).collect();
+    // Concatenate all flushed runs plus the surviving accumulator, then sum
+    // duplicate colors with one parallel sort + adjacent merge. median_cut
+    // canonicalizes its input by the same sort, so this costs nothing extra
+    // beyond the (already tight) concatenated allocation.
+    let mut runs = spilled.into_inner().unwrap();
+    runs.push(hist.entries());
     drop(hist);
+    let mut entries = Vec::with_capacity(runs.iter().map(Vec::len).sum());
+    while let Some(r) = runs.pop() {
+        entries.extend_from_slice(&r); // pop + drop each run: concat never
+                                       // holds two full copies
+    }
+    drop(runs);
+    if entries.len() > 16384 {
+        entries.par_sort_unstable();
+    } else {
+        entries.sort_unstable();
+    }
+    entries.dedup_by(|cur, prev| {
+        if cur.0 == prev.0 {
+            prev.1 = prev.1.saturating_add(cur.1);
+            true
+        } else {
+            false
+        }
+    });
+    entries.shrink_to_fit(); // drops the duplicates' share before the
+                             // palette build allocates its scratch
     let t_read = t0.elapsed();
     let t_hist = t1.elapsed();
 
@@ -339,64 +427,82 @@ fn run(args: &Args) -> io::Result<()> {
         );
     }
 
-    // ---- pass 2: quantize + dither (parallel per frame) ------------------
+    // ---- pass 2+3: quantize + dither + delta + LZW, fused in blocks -------
+    // Fusing keeps the full indexed set (frames x w*h) from ever being
+    // resident: frames are processed in blocks — every frame in a block
+    // quantizes in parallel, then every frame encodes against its
+    // predecessor's indices in parallel (quantization is deterministic, and
+    // with disposal "none" the canvas after frame i-1 is exactly frame i-1's
+    // indices), and only the block's last indexed frame survives to seed the
+    // next block's first delta. With source alpha, transparency can't double
+    // as "unchanged" marker, so frames encode whole with
+    // restore-to-background disposal (any_alpha comes from pass 1).
     let t3 = Instant::now();
     let quant = Quantizer {
         colors: &colors,
         nearest: &nearest,
         trans_idx,
     };
-    let results: Vec<(Vec<u8>, bool)> = frames
-        .into_par_iter()
-        .map_init(
-            || dither::QuantScratch::new(w),
-            |scratch, f| {
-                let mut idx = vec![0u8; w * h];
-                let src = color::RowSource::new(&f, w, h, meta.chroma);
-                let has_alpha = quant.quantize(&src, w, h, args.dither, scratch, &mut idx);
-                drop(f);
-                (idx, has_alpha)
-            },
-        )
-        .collect();
-    let any_alpha = results.iter().any(|(_, a)| *a);
-    let indexed: Vec<Vec<u8>> = results.into_iter().map(|(i, _)| i).collect();
-    let t_quant = t3.elapsed();
-
-    // ---- pass 3: delta + LZW (parallel per frame) -------------------------
-    // With source alpha, transparency can't double as "unchanged" marker, so
-    // fall back to full frames with restore-to-background disposal.
-    let t4 = Instant::now();
-    let delays = gif::frame_delays(indexed.len(), meta.fps_num, meta.fps_den);
+    let delays = gif::frame_delays(nread, meta.fps_num, meta.fps_den);
     let disposal = if any_alpha {
         gif::DISPOSAL_BACKGROUND
     } else {
         gif::DISPOSAL_NONE
     };
     let lossy_map = (args.lossy > 0).then(|| lzw::LossyMap::build(&colors, trans_idx, args.lossy));
-    let encoded: Vec<gif::EncodedFrame> = (0..indexed.len())
-        .into_par_iter()
-        .map_init(LzwEncoder::default, |enc, i| {
-            let prev = if any_alpha || i == 0 {
-                None
-            } else {
-                Some(indexed[i - 1].as_slice())
-            };
-            gif::encode_frame(
-                &indexed[i],
-                prev,
-                w,
-                h,
-                trans_idx,
-                min_code_size,
-                delays[i],
-                disposal,
-                lossy_map.as_ref(),
-                enc,
+    // Enough frames per block that both halves keep every worker busy;
+    // small enough that the block's index buffers stay a modest, clip-
+    // length-independent working set.
+    let block = 4 * nthreads;
+    let mut encoded: Vec<gif::EncodedFrame> = Vec::with_capacity(nread);
+    let mut prev_last: Option<Vec<u8>> = None;
+    let mut frames_it = frames.into_iter();
+    let mut start = 0usize;
+    while start < nread {
+        let chunk: Vec<StoredFrame> = frames_it.by_ref().take(block).collect();
+        let cn = chunk.len();
+        let idx_block: Vec<Vec<u8>> = chunk
+            .into_par_iter()
+            .map_init(
+                || (dither::QuantScratch::new(w), Vec::new()),
+                |(scratch, raw), f| {
+                    let mut idx = vec![0u8; w * h];
+                    let src = color::RowSource::from_bytes(f.unpack(raw), w, h, meta.chroma);
+                    quant.quantize(&src, w, h, args.dither, scratch, &mut idx);
+                    idx
+                },
             )
-        })
-        .collect();
-    let t_lzw = t4.elapsed();
+            .collect();
+        encoded.par_extend(
+            (0..cn)
+                .into_par_iter()
+                .map_init(LzwEncoder::default, |enc, j| {
+                    let i = start + j;
+                    let prev = if any_alpha || i == 0 {
+                        None
+                    } else if j == 0 {
+                        prev_last.as_deref()
+                    } else {
+                        Some(idx_block[j - 1].as_slice())
+                    };
+                    gif::encode_frame(
+                        &idx_block[j],
+                        prev,
+                        w,
+                        h,
+                        trans_idx,
+                        min_code_size,
+                        delays[i],
+                        disposal,
+                        lossy_map.as_ref(),
+                        enc,
+                    )
+                }),
+        );
+        prev_last = idx_block.into_iter().next_back();
+        start += cn;
+    }
+    let t_qlzw = t3.elapsed();
 
     // ---- mux --------------------------------------------------------------
     let t5 = Instant::now();
@@ -408,10 +514,11 @@ fn run(args: &Args) -> io::Result<()> {
         gct_bits,
         loop_count: args.loop_count,
     };
-    let mut out = Vec::new();
-    gif::mux(&params, &encoded, &mut out);
-    let mut stdout = BufWriter::with_capacity(1 << 20, io::stdout().lock());
-    stdout.write_all(&out)?;
+    let mut stdout = CountWriter {
+        inner: BufWriter::with_capacity(1 << 20, io::stdout().lock()),
+        written: 0,
+    };
+    gif::mux(&params, &encoded, &mut stdout)?;
     stdout.flush()?;
     let t_mux = t5.elapsed();
 
@@ -422,12 +529,30 @@ fn run(args: &Args) -> io::Result<()> {
             meta.fps_num,
             meta.fps_den,
             colors.len(),
-            out.len()
+            stdout.written
         );
         eprintln!(
-            "  read+hist {:?} (hist span {:?})  palette+lut {:?}  quantize {:?}  delta+lzw {:?}  mux+write {:?}  total {:?}",
-            t_read, t_hist, t_pal, t_quant, t_lzw, t_mux, t0.elapsed()
+            "  read+hist {:?} (hist span {:?})  palette+lut {:?}  quantize+lzw {:?}  mux+write {:?}  total {:?}",
+            t_read, t_hist, t_pal, t_qlzw, t_mux, t0.elapsed()
         );
     }
     Ok(())
+}
+
+/// Passthrough writer that counts bytes for the --stats report.
+struct CountWriter<W> {
+    inner: W,
+    written: u64,
+}
+
+impl<W: Write> Write for CountWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }

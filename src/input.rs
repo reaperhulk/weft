@@ -23,13 +23,60 @@ impl Chroma {
     }
 }
 
-/// A stored input frame: either raw RGBA bytes or raw Y4M planes.
+/// A decoded input frame: either raw RGBA bytes or raw Y4M planes.
 /// Y4M frames are kept in their native (smaller) form and converted to RGBA
 /// on the fly in each parallel pass, trading a cheap reconversion for a
 /// much smaller resident set.
 pub enum Frame {
     Rgba(Vec<u8>),
     Yuv(Vec<u8>),
+}
+
+/// A frame as buffered between the histogram and quantize passes,
+/// LZ4-compressed whenever that wins. Frames are touched exactly twice —
+/// streamed through the histogram, then through quantization — and sit idle
+/// for the entire palette build in between, so the resident set between the
+/// passes shrinks to roughly the LZ4 size of the input while every consumer
+/// still sees plain raw bytes (the interpretation — RGBA or Y4M planes — is
+/// the stream's `chroma`, uniform across frames).
+pub struct StoredFrame {
+    data: Vec<u8>,
+    /// Uncompressed length; `data` is an LZ4 block iff `data.len() < raw_len`
+    /// (raw is kept whenever compression doesn't strictly shrink, so the
+    /// comparison is unambiguous).
+    raw_len: usize,
+}
+
+impl StoredFrame {
+    pub fn pack(frame: Frame) -> StoredFrame {
+        let (Frame::Rgba(raw) | Frame::Yuv(raw)) = frame;
+        let data = lz4_flex::block::compress(&raw);
+        if data.len() < raw.len() {
+            StoredFrame {
+                data,
+                raw_len: raw.len(),
+            }
+        } else {
+            StoredFrame {
+                raw_len: raw.len(),
+                data: raw,
+            }
+        }
+    }
+
+    /// The raw frame bytes, decompressing into `scratch` when needed.
+    /// `scratch` is caller-owned so parallel consumers can reuse one
+    /// allocation per worker.
+    pub fn unpack<'a>(&'a self, scratch: &'a mut Vec<u8>) -> &'a [u8] {
+        if self.data.len() == self.raw_len {
+            return &self.data;
+        }
+        scratch.resize(self.raw_len, 0);
+        let n = lz4_flex::block::decompress_into(&self.data, scratch)
+            .expect("in-memory LZ4 frame corrupt");
+        debug_assert_eq!(n, self.raw_len);
+        &scratch[..n]
+    }
 }
 
 pub struct VideoIn {
