@@ -204,6 +204,9 @@ impl<'a> Quantizer<'a> {
         has_alpha
     }
 
+    // the interleaved stripe loop indexes two rows at different offsets;
+    // an iterator form would obscure the lag structure
+    #[allow(clippy::needless_range_loop)]
     fn quantize_diffuse(
         &self,
         src: &crate::color::RowSource,

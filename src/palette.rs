@@ -235,7 +235,9 @@ fn axis_key(b: &HBin, axis: usize) -> u64 {
 /// whose count sum exceeds `median`, and k is the s-th smallest key.
 /// Quickselect-style ping-pong partitioning: expected O(len), vs the
 /// O(len log len) comparator sort it replaces.
-fn weighted_split(pairs: &mut [(u64, u32)], tmp: &mut [(u64, u32)], median: u64) -> (usize, u64) {
+type KeyCount = (u64, u32);
+
+fn weighted_split(pairs: &mut [KeyCount], tmp: &mut [KeyCount], median: u64) -> (usize, u64) {
     let mut in_cur = true; // current range lives in `pairs` (else `tmp`)
     let mut start = 0usize;
     let mut n = pairs.len();
@@ -243,7 +245,7 @@ fn weighted_split(pairs: &mut [(u64, u32)], tmp: &mut [(u64, u32)], median: u64)
     let mut acc = 0u64; // their count sum
     loop {
         // Invariant: acc <= median and the boundary lies inside the range.
-        let (cur, other): (&mut [(u64, u32)], &mut [(u64, u32)]) = if in_cur {
+        let (cur, other): (&mut [KeyCount], &mut [KeyCount]) = if in_cur {
             (&mut *pairs, &mut *tmp)
         } else {
             (&mut *tmp, &mut *pairs)
@@ -271,8 +273,7 @@ fn weighted_split(pairs: &mut [(u64, u32)], tmp: &mut [(u64, u32)], median: u64)
         let mut l = start;
         let mut r = start + n;
         let mut wl = 0u64;
-        for k in start..start + n {
-            let e = cur[k];
+        for &e in cur.iter().skip(start).take(n) {
             let less = e.0 < pivot;
             let dst = if less { l } else { r - 1 };
             other[dst] = e;
