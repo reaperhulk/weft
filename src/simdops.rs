@@ -3,7 +3,7 @@
 
 #[allow(unused_imports)]
 use fearless_simd::prelude::*;
-use fearless_simd::{f32x16, f32x8, i32x8, u32x8, u8x16, Level, Simd};
+use fearless_simd::{f32x16, f32x8, i32x16, i32x8, u32x16, u32x8, u8x16, u8x64, Level, Simd};
 use std::sync::OnceLock;
 
 /// Runtime-detected SIMD level, cached (feature detection once).
@@ -156,6 +156,207 @@ fn corner_rmax2_impl<S: Simd>(
     let d = dl * dl + da * da + db * db;
     let arr: [f32; 8] = d.into();
     arr.iter().fold(0f32, |m, &v| m.max(v)) * 1.0002
+}
+
+// ---------------------------------------------------------------------------
+// Staged blue-noise quantizer kernels. The mode has no cross-pixel
+// dependency, so a row is processed as vector passes over per-pixel
+// arrays (keys, packed lookup results, probe colors) with the table
+// lookups staged as scalar loops between them — portable lanes for the
+// math, plain loads for the gathers (NEON has no gather instruction, and
+// staged independent scalar loads pipeline comparably to microcoded x86
+// gathers).
+
+/// 16 RGBA pixels reinterpreted as one u32 lane each (LE: r|g<<8|b<<16|a<<24).
+#[inline(always)]
+fn px16<S: Simd>(simd: S, rgba: &[u8]) -> u32x16<S> {
+    u8x64::from_slice(simd, &rgba[..64]).bitcast()
+}
+
+/// Grid key per lane: (r>>2)<<12 | (g>>2)<<6 | (b>>2), from packed pixels.
+#[inline(always)]
+fn keys16<S: Simd>(simd: S, px: u32x16<S>) -> u32x16<S> {
+    ((px & u32x16::splat(simd, 0xFC)) << 10u32)
+        | (((px >> 8u32) & u32x16::splat(simd, 0xFC)) << 4u32)
+        | ((px >> 18u32) & u32x16::splat(simd, 0x3F))
+}
+
+#[inline(always)]
+fn grid_key_scalar(r: u8, g: u8, b: u8) -> u32 {
+    (((r as u32) >> 2) << 12) | (((g as u32) >> 2) << 6) | ((b as u32) >> 2)
+}
+
+/// Stage 1: grid key per pixel; returns true if any alpha byte < 128.
+pub fn bn_keys(level: Level, rgba: &[u8], keys: &mut [u32]) -> bool {
+    fearless_simd::dispatch!(level, simd => bn_keys_impl(simd, rgba, keys))
+}
+
+#[inline(always)]
+fn bn_keys_impl<S: Simd>(simd: S, rgba: &[u8], keys: &mut [u32]) -> bool {
+    let w = keys.len();
+    let mut amin = i32x16::splat(simd, 255);
+    let mut i = 0usize;
+    while i + 16 <= w {
+        let px = px16(simd, &rgba[i * 4..]);
+        keys16(simd, px).store_slice(&mut keys[i..i + 16]);
+        // alpha lanes are <= 255, so a signed min is safe
+        amin = amin.min((px >> 24u32).bitcast::<i32x16<S>>());
+        i += 16;
+    }
+    let arr: [i32; 16] = amin.into();
+    let mut any_alpha = arr.iter().any(|&a| a < 128);
+    while i < w {
+        let p = &rgba[i * 4..i * 4 + 4];
+        keys[i] = grid_key_scalar(p[0], p[1], p[2]);
+        any_alpha |= p[3] < 128;
+        i += 1;
+    }
+    any_alpha
+}
+
+/// Stage 4: from packed c1 results, compute per pixel the nonzero-error
+/// flag (`ors`, 0 means the pixel matched its palette color exactly), the
+/// clamped far-probe color (`c2c`, packed r<<16|g<<8|b), and its grid key.
+pub fn bn_probe(
+    level: Level,
+    rgba: &[u8],
+    pk1: &[u32],
+    ors: &mut [u32],
+    c2c: &mut [u32],
+    keys2: &mut [u32],
+) {
+    fearless_simd::dispatch!(level, simd => bn_probe_impl(simd, rgba, pk1, ors, c2c, keys2))
+}
+
+#[inline(always)]
+fn bn_probe_impl<S: Simd>(
+    simd: S,
+    rgba: &[u8],
+    pk1: &[u32],
+    ors: &mut [u32],
+    c2c: &mut [u32],
+    keys2: &mut [u32],
+) {
+    let w = pk1.len();
+    let ff = u32x16::splat(simd, 0xFF);
+    let zero = i32x16::splat(simd, 0);
+    let hi = i32x16::splat(simd, 255);
+    let mut i = 0usize;
+    while i + 16 <= w {
+        let px = px16(simd, &rgba[i * 4..]);
+        let p1 = u32x16::from_slice(simd, &pk1[i..i + 16]);
+        let r: i32x16<S> = (px & ff).bitcast();
+        let g: i32x16<S> = ((px >> 8u32) & ff).bitcast();
+        let b: i32x16<S> = ((px >> 16u32) & ff).bitcast();
+        let er = r - (p1 >> 24u32).bitcast::<i32x16<S>>();
+        let eg = g - ((p1 >> 16u32) & ff).bitcast::<i32x16<S>>();
+        let eb = b - ((p1 >> 8u32) & ff).bitcast::<i32x16<S>>();
+        let o: u32x16<S> = (er | eg | eb).bitcast();
+        o.store_slice(&mut ors[i..i + 16]);
+        let r2 = (r + er + er).max(zero).min(hi).bitcast::<u32x16<S>>();
+        let g2 = (g + eg + eg).max(zero).min(hi).bitcast::<u32x16<S>>();
+        let b2 = (b + eb + eb).max(zero).min(hi).bitcast::<u32x16<S>>();
+        ((r2 << 16u32) | (g2 << 8u32) | b2).store_slice(&mut c2c[i..i + 16]);
+        (((r2 >> 2u32) << 12u32) | ((g2 >> 2u32) << 6u32) | (b2 >> 2u32))
+            .store_slice(&mut keys2[i..i + 16]);
+        i += 16;
+    }
+    while i < w {
+        let p = &rgba[i * 4..i * 4 + 4];
+        let p1 = pk1[i];
+        let er = p[0] as i32 - (p1 >> 24) as i32;
+        let eg = p[1] as i32 - ((p1 >> 16) & 0xFF) as i32;
+        let eb = p[2] as i32 - ((p1 >> 8) & 0xFF) as i32;
+        ors[i] = (er | eg | eb) as u32;
+        let r2 = (p[0] as i32 + 2 * er).clamp(0, 255) as u32;
+        let g2 = (p[1] as i32 + 2 * eg).clamp(0, 255) as u32;
+        let b2 = (p[2] as i32 + 2 * eb).clamp(0, 255) as u32;
+        c2c[i] = (r2 << 16) | (g2 << 8) | b2;
+        keys2[i] = grid_key_scalar(r2 as u8, g2 as u8, b2 as u8);
+        i += 1;
+    }
+}
+
+/// Stage 7: the two-candidate threshold pick. `mrow32` is the row's
+/// blue-noise threshold line widened to u32 (64 entries, repeating every
+/// 64 pixels — rows start at x = 0, so chunks of 16 stay aligned to it).
+/// For pixels with zero error or equal candidates the math degenerates to
+/// picking c1, so no lane needs special casing (garbage pk2 lanes on
+/// exact pixels produce den >= 0 and num == 0, which always keeps c1).
+pub fn bn_threshold(
+    level: Level,
+    rgba: &[u8],
+    pk1: &[u32],
+    pk2: &[u32],
+    mrow32: &[u32; 64],
+    out: &mut [u8],
+) {
+    fearless_simd::dispatch!(level, simd => bn_threshold_impl(simd, rgba, pk1, pk2, mrow32, out))
+}
+
+#[inline(always)]
+fn bn_threshold_impl<S: Simd>(
+    simd: S,
+    rgba: &[u8],
+    pk1: &[u32],
+    pk2: &[u32],
+    mrow32: &[u32; 64],
+    out: &mut [u8],
+) {
+    let w = out.len();
+    let ff = u32x16::splat(simd, 0xFF);
+    let zero = i32x16::splat(simd, 0);
+    let mut i = 0usize;
+    while i + 16 <= w {
+        let px = px16(simd, &rgba[i * 4..]);
+        let p1 = u32x16::from_slice(simd, &pk1[i..i + 16]);
+        let p2 = u32x16::from_slice(simd, &pk2[i..i + 16]);
+        let c1r: i32x16<S> = (p1 >> 24u32).bitcast();
+        let c1g: i32x16<S> = ((p1 >> 16u32) & ff).bitcast();
+        let c1b: i32x16<S> = ((p1 >> 8u32) & ff).bitcast();
+        let er = (px & ff).bitcast::<i32x16<S>>() - c1r;
+        let eg = ((px >> 8u32) & ff).bitcast::<i32x16<S>>() - c1g;
+        let eb = ((px >> 16u32) & ff).bitcast::<i32x16<S>>() - c1b;
+        let dr = (p2 >> 24u32).bitcast::<i32x16<S>>() - c1r;
+        let dg = ((p2 >> 16u32) & ff).bitcast::<i32x16<S>>() - c1g;
+        let db = ((p2 >> 8u32) & ff).bitcast::<i32x16<S>>() - c1b;
+        let num = (er * dr + eg * dg + eb * db).max(zero);
+        let den = dr * dr + dg * dg + db * db;
+        let m: i32x16<S> = u32x16::from_slice(simd, &mrow32[(i & 63)..(i & 63) + 16]).bitcast();
+        let pick = (m * den).simd_lt(num << 8u32);
+        let idx: i32x16<S> = pick.select(
+            (p2 & ff).bitcast::<i32x16<S>>(),
+            (p1 & ff).bitcast::<i32x16<S>>(),
+        );
+        let arr: [i32; 16] = idx.into();
+        for (o, v) in out[i..i + 16].iter_mut().zip(arr) {
+            *o = v as u8;
+        }
+        i += 16;
+    }
+    while i < w {
+        let p = &rgba[i * 4..i * 4 + 4];
+        let p1 = pk1[i];
+        let p2 = pk2[i];
+        let c1r = (p1 >> 24) as i32;
+        let c1g = ((p1 >> 16) & 0xFF) as i32;
+        let c1b = ((p1 >> 8) & 0xFF) as i32;
+        let er = p[0] as i32 - c1r;
+        let eg = p[1] as i32 - c1g;
+        let eb = p[2] as i32 - c1b;
+        let dr = (p2 >> 24) as i32 - c1r;
+        let dg = ((p2 >> 16) & 0xFF) as i32 - c1g;
+        let db = ((p2 >> 8) & 0xFF) as i32 - c1b;
+        let num = (er * dr + eg * dg + eb * db).max(0);
+        let den = dr * dr + dg * dg + db * db;
+        let m = mrow32[i & 63] as i32;
+        out[i] = if m * den < num * 256 {
+            p2 as u8
+        } else {
+            p1 as u8
+        };
+        i += 1;
+    }
 }
 
 /// Fill `out` with the transparency-punched delta of one row (`trans`

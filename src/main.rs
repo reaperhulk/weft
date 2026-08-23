@@ -447,6 +447,8 @@ fn run(args: &Args) -> io::Result<()> {
     let quant = Quantizer {
         nearest: &nearest,
         trans_idx,
+        // median_cut returns the exact colors when they all fit
+        exact_palette: n_entries < args.colors,
     };
     let delays = gif::frame_delays(nread, meta.fps_num, meta.fps_den);
     let disposal = if any_alpha {

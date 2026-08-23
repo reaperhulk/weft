@@ -31,13 +31,25 @@ const BAYER8: [[u8; 8]; 8] = [
 pub struct Quantizer<'a> {
     pub nearest: &'a crate::palette::NearestMap,
     pub trans_idx: u8,
+    /// The palette reproduces every source color exactly (fewer distinct
+    /// colors than palette slots): every c1 lookup has zero error, so the
+    /// blue-noise mode's per-pixel early-out beats the staged pipeline.
+    pub exact_palette: bool,
 }
 
-/// Per-thread quantization scratch: RGBA row buffers + memo cache.
+/// Per-thread quantization scratch: RGBA row buffers, memo cache, and the
+/// per-pixel arrays of the staged blue-noise pipeline.
 pub struct QuantScratch {
     pub cache: crate::palette::IdxCache,
     row: Vec<u8>,
     row2: Vec<u8>,
+    keys: Vec<u32>,
+    keys2: Vec<u32>,
+    pk1: Vec<u32>,
+    pk2: Vec<u32>,
+    ors: Vec<u32>,
+    c2c: Vec<u32>,
+    wl: Vec<u32>,
 }
 
 impl QuantScratch {
@@ -46,6 +58,13 @@ impl QuantScratch {
             cache: crate::palette::IdxCache::default(),
             row: vec![0u8; w * 4],
             row2: vec![0u8; w * 4],
+            keys: vec![0; w],
+            keys2: vec![0; w],
+            pk1: vec![0; w],
+            pk2: vec![0; w],
+            ors: vec![0; w],
+            c2c: vec![0; w],
+            wl: vec![0; w],
         }
     }
 }
@@ -72,6 +91,19 @@ impl<'a> Quantizer<'a> {
         }
     }
 
+    /// Two-candidate blue-noise ordered dither: c1 = nearest(p); if
+    /// quantization error is nonzero, c2 = nearest across the error
+    /// direction, and the threshold picks between c1 and c2 in proportion
+    /// to where p sits between them. Pixels with an exact palette match
+    /// never dither, so flat regions stay clean and delta-friendly.
+    ///
+    /// There is no cross-pixel dependency, so each row runs as staged
+    /// passes: SIMD key computation, a branchless gather of the packed
+    /// fast-path entries, cache/resolve only for a compacted worklist of
+    /// misses, SIMD probe-color math, the same gather/resolve pair for
+    /// the far candidates (skipping exact pixels), and a SIMD threshold
+    /// pick. Results are identical to the per-pixel formulation — the
+    /// lookups and integer math are the same, just reordered.
     fn quantize_bluenoise(
         &self,
         src: &crate::color::RowSource,
@@ -80,12 +112,120 @@ impl<'a> Quantizer<'a> {
         scratch: &mut QuantScratch,
         out: &mut [u8],
     ) -> bool {
-        // Two-candidate ordered dither: c1 = nearest(p); if quantization
-        // error is nonzero, c2 = nearest across the error direction, and
-        // the blue-noise threshold picks between c1 and c2 in proportion
-        // to where p sits between them. Pixels with an exact palette match
-        // never dither (like error diffusion, unlike plain threshold
-        // offsetting), so flat regions stay clean and delta-friendly.
+        if self.exact_palette {
+            return self.quantize_bluenoise_scalar(src, w, h, scratch, out);
+        }
+        // Tile width: multiple of 64 so the blue-noise mask stays aligned
+        // to tile starts, small enough that a tile's stage arrays (~28
+        // bytes per pixel) stay L1-resident between passes.
+        const TILE: usize = 256;
+        let mask = &crate::bluenoise::BLUE_NOISE_64;
+        let level = crate::simdops::level();
+        let mut has_alpha = false;
+        let mut mrow32 = [0u32; 64];
+        for y in 0..h {
+            src.fill_row(y, &mut scratch.row);
+            let mrow = &mask[(y & 63) << 6..((y & 63) << 6) + 64];
+            for (d, &s) in mrow32.iter_mut().zip(mrow) {
+                *d = s as u32;
+            }
+            let mut x0 = 0usize;
+            while x0 < w {
+                let tw = TILE.min(w - x0);
+                let row = &scratch.row[x0 * 4..(x0 + tw) * 4];
+                let orow = &mut out[y * w + x0..y * w + x0 + tw];
+                let cache = &mut scratch.cache;
+
+                // stage 1: grid keys + alpha presence
+                let has_alpha_here = crate::simdops::bn_keys(level, row, &mut scratch.keys[..tw]);
+
+                // stage 2: branchless c1 gather; misses go to the worklist
+                let mut m1 = 0usize;
+                for i in 0..tw {
+                    let d = self.nearest.direct_lookup(scratch.keys[i]);
+                    scratch.pk1[i] = d;
+                    scratch.wl[m1] = i as u32;
+                    m1 += (d == u32::MAX) as usize;
+                }
+                // stage 3: resolve c1 misses through the memo cache
+                for &iu in &scratch.wl[..m1] {
+                    let i = iu as usize;
+                    let p = &row[i * 4..i * 4 + 4];
+                    scratch.pk1[i] =
+                        self.nearest
+                            .lookup_slow(cache, scratch.keys[i], p[0], p[1], p[2]);
+                }
+
+                // stage 4: errors, far-probe colors, and their keys
+                crate::simdops::bn_probe(
+                    level,
+                    row,
+                    &scratch.pk1[..tw],
+                    &mut scratch.ors[..tw],
+                    &mut scratch.c2c[..tw],
+                    &mut scratch.keys2[..tw],
+                );
+
+                // stage 5: c2 gather; only inexact pixels can enter the
+                // worklist (for exact ones c2 == p, and a stale pk2 entry
+                // is harmless: the threshold math then degenerates to
+                // picking c1)
+                let mut m2 = 0usize;
+                for i in 0..tw {
+                    let d = self.nearest.direct_lookup(scratch.keys2[i]);
+                    scratch.pk2[i] = d;
+                    scratch.wl[m2] = i as u32;
+                    m2 += ((d == u32::MAX) & (scratch.ors[i] != 0)) as usize;
+                }
+                // stage 6: resolve c2 misses
+                for &iu in &scratch.wl[..m2] {
+                    let i = iu as usize;
+                    let c = scratch.c2c[i];
+                    scratch.pk2[i] = self.nearest.lookup_slow(
+                        cache,
+                        scratch.keys2[i],
+                        (c >> 16) as u8,
+                        (c >> 8) as u8,
+                        c as u8,
+                    );
+                }
+
+                // stage 7: threshold pick (x0 is a multiple of 64, so the
+                // kernel's local x & 63 mask indexing stays aligned)
+                crate::simdops::bn_threshold(
+                    level,
+                    row,
+                    &scratch.pk1[..tw],
+                    &scratch.pk2[..tw],
+                    &mrow32,
+                    orow,
+                );
+
+                // stage 8: transparent pixels override whatever was computed
+                if has_alpha_here {
+                    has_alpha = true;
+                    for (o, px) in orow.iter_mut().zip(row.as_chunks::<4>().0) {
+                        if px[3] < 128 {
+                            *o = self.trans_idx;
+                        }
+                    }
+                }
+                x0 += tw;
+            }
+        }
+        has_alpha
+    }
+
+    fn quantize_bluenoise_scalar(
+        &self,
+        src: &crate::color::RowSource,
+        w: usize,
+        h: usize,
+        scratch: &mut QuantScratch,
+        out: &mut [u8],
+    ) -> bool {
+        // Per-pixel formulation: with an exact palette every pixel takes
+        // the zero-error early-out, which no staged pipeline can beat.
         let mask = &crate::bluenoise::BLUE_NOISE_64;
         let mut has_alpha = false;
         let cache = &mut scratch.cache;
@@ -347,6 +487,7 @@ mod tests {
         let q = Quantizer {
             nearest: &nm,
             trans_idx: 3,
+            exact_palette: false,
         };
         let rgba = vec![
             255u8, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 0,
@@ -368,6 +509,7 @@ mod tests {
         let q = Quantizer {
             nearest: &nm,
             trans_idx: 2,
+            exact_palette: false,
         };
         let mut rgba = Vec::new();
         for i in 0..64 {

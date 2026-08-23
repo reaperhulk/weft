@@ -706,6 +706,26 @@ impl NearestMap {
         if d != u32::MAX {
             return d;
         }
+        self.lookup_slow(cache, key as u32, r, g, b)
+    }
+
+    /// The direct[] entry for a precomputed grid key (staged gather loops).
+    #[inline(always)]
+    pub fn direct_lookup(&self, key: u32) -> u32 {
+        self.direct[key as usize]
+    }
+
+    /// The multi-candidate path of `lookup_packed`, for callers that
+    /// already saw `direct_lookup` miss on `key`.
+    #[inline]
+    pub fn lookup_slow(
+        &self,
+        cache: &mut IdxCache,
+        key: u32,
+        r: u8,
+        g: u8,
+        b: u8,
+    ) -> PackedNearest {
         let color = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
         let slot = (color.wrapping_mul(0x9E37_79B1) >> 18) as usize;
         let e = cache.slots[slot];
@@ -715,7 +735,7 @@ impl NearestMap {
         if (e >> 40) == color as u64 && e != u64::MAX {
             return e as u32;
         }
-        let idx = self.resolve_cell(key, r, g, b);
+        let idx = self.resolve_cell(key as usize, r, g, b);
         let packed = (self.pal_rgb[idx as usize] << 8) | idx as u32;
         cache.slots[slot] = ((color as u64) << 40) | packed as u64;
         packed
