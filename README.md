@@ -63,26 +63,32 @@ rate.
 
 | clip      | encoder | time (s) | peak RSS (MB) | size (KB) | PSNR (dB) | SSIM  |
 |-----------|---------|---------:|--------------:|----------:|----------:|------:|
-| rgba¹     | ffmpeg  | 1.69     | 202           | 2296      | 40.07     | 0.9847|
-| rgba¹     | weft    | **0.40** | 152           | **2294**  | **40.08** | 0.9846|
-| testsrc   | ffmpeg  | 1.63     | 200           | 2296      | 40.07     | 0.985 |
-| testsrc   | weft    | **0.39** | 69            | **2279**  | 39.71²    | 0.899²|
-| big (720p)| ffmpeg  | 10.16    | 1152          | 13751     | 42.16     | 0.993 |
-| big (720p)| weft    | **2.40** | 415           | **13738** | 41.25²    | 0.900²|
-| mandel    | ffmpeg  | 6.22     | 264           | 16762     | 31.40     | 0.886 |
-| mandel    | weft    | **0.97** | 93            | **16576** | 31.14     | 0.875 |
-| gradients | ffmpeg  | 1.30     | 190           | 2569      | inf³      | 1.000 |
-| gradients | weft    | **0.31** | 79            | **2507**  | 43.8²³    | 0.9997|
-| life      | ffmpeg  | 1.17     | 190           | 2559      | 76.02     | 0.9997|
-| life      | weft    | **0.30** | 70            | **2481**  | 54.8²     | 0.993 |
-| static    | ffmpeg  | 1.00     | 189           | 15        | inf³      | 1.000 |
-| static    | weft    | **0.27** | 73            | **11**    | 49.7²³    | 0.976 |
+| rgba¹     | ffmpeg  | 1.63     | 202           | 2296      | 40.07     | 0.9847|
+| rgba¹     | weft    | **0.24** | 37            | **2226**  | 39.60¹    | **0.9853**|
+| testsrc   | ffmpeg  | 1.70     | 199           | 2296      | 40.07     | 0.985 |
+| testsrc   | weft    | **0.22** | 28            | **2242**  | 39.24²    | 0.899²|
+| big (720p)| ffmpeg  | 10.84    | 1152          | 13751     | 42.16     | 0.993 |
+| big (720p)| weft    | **1.32** | 75            | **13596** | 41.09²    | 0.900²|
+| mandel    | ffmpeg  | 7.12     | 265           | 16762     | 31.40     | 0.886 |
+| mandel    | weft    | **0.85** | 108           | **16399** | 30.54     | 0.864 |
+| gradients | ffmpeg  | 1.29     | 190           | 2569      | inf³      | 1.000 |
+| gradients | weft    | **0.24** | 36            | **2086**  | 43.8²³    | 0.9997|
+| life      | ffmpeg  | 1.04     | 190           | 2559      | 76.02     | 0.9997|
+| life      | weft    | **0.25** | 31            | **2467**  | 54.8²     | 0.993 |
+| static    | ffmpeg  | 1.05     | 190           | 15        | inf³      | 1.000 |
+| static    | weft    | **0.12** | 29            | **11**    | 49.7²³    | 0.976 |
 
-**3.4–6.4× faster, smaller output on every clip, ~⅓ the memory.**
+**4–9× faster, smaller output on every clip, 5–15× less memory.**
+
+Each encoder runs its default dither: sierra2 error diffusion for
+ffmpeg's paletteuse, blue-noise for weft (temporally stable and smaller;
+see below).
 
 ¹ `rgba` is the apples-to-apples row: identical input bytes for both
-encoders, no YUV→RGB conversion anywhere. Quality is statistically
-identical (Δ0.01 dB / Δ0.00003 SSIM).
+encoders, no YUV→RGB conversion anywhere. The 0.5 dB PSNR gap is the
+blue-noise default's deliberate trade (SSIM is slightly *higher*, and the
+file 3% smaller); with `--dither sierra2` — the same algorithm ffmpeg
+uses — weft measures 40.08 dB / 0.9846: statistically identical.
 
 ² The y4m rows undercount weft's quality: the PSNR/SSIM reference is
 decoded with swscale, which *truncates* in YUV→RGB where weft rounds to
@@ -90,8 +96,9 @@ nearest (e.g. Y=180 → 1.164×164 = 190.96: correctly 191, swscale says
 190). weft's output therefore shows a constant ±1–2 offset against that
 reference in flat regions — despite being the *closer* conversion — which
 caps measurable PSNR around 44–55 dB and dents SSIM in zero-variance
-areas. Measured dither speckle (high-pass error RMS) is identical to
-ffmpeg's: 2.69/1.52/1.69 vs 2.65/1.52/1.86 per RGB channel on `testsrc`.
+areas. With `--dither sierra2` (ffmpeg's algorithm), measured dither
+speckle (high-pass error RMS) is identical to ffmpeg's: 2.69/1.52/1.69
+vs 2.65/1.52/1.86 per RGB channel on `testsrc`.
 
 ³ Sources with ≤255 distinct colors get a bit-exact (lossless) palette
 from both encoders.
