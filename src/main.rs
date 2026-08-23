@@ -161,7 +161,13 @@ fn run(args: &Args) -> io::Result<()> {
         Format::Y4m => true,
         Format::Rgba => false,
         Format::Auto => {
-            reader.read_exact(&mut probe)?;
+            reader.read_exact(&mut probe).map_err(|e| {
+                if e.kind() == io::ErrorKind::UnexpectedEof {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "no input on stdin")
+                } else {
+                    e
+                }
+            })?;
             &probe == b"YUV4MPEG2"
         }
     };
