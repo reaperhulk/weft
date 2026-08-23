@@ -83,10 +83,10 @@ options:
   --colors N         max palette colors, 2-256  (default: 256; one slot is
                      reserved for transparency, so 256 means 255 colors)
   --dither D         bluenoise | sierra2 | fs | bayer | none
-                     (default: bluenoise: fast, temporally stable, and
-                     compresses well; sierra2 error diffusion trades
-                     speed and stability for slightly higher visual
-                     quality)
+                     (default: bluenoise, which is fast, temporally
+                     stable, and compresses well; sierra2 error diffusion
+                     has slightly higher visual quality but is slower and
+                     shimmers frame-to-frame on animated content)
   --loop N           loop count, 0 = forever    (default: 0)
   --lossy N          lossy LZW compression, 0-200 (default: 0 = lossless
                      encoding of the quantized frames; ~30 is subtle and

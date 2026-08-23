@@ -45,6 +45,9 @@ weft --colors 64 --dither none --no-loop < input.y4m > out.gif
                    encoding of the quantized frames; ~30 is subtle and
                    much smaller on dithered content)
 --no-loop          play once (no NETSCAPE extension)
+--no-compress      buffer frames raw in memory instead of LZ4-packing
+                   them between passes (output is identical; raises
+                   peak memory, mainly for benchmarking the tradeoff)
 --threads N        worker threads             (default: all cores)
 --stats            print timing breakdown to stderr
 ```
