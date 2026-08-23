@@ -107,7 +107,10 @@ fn fill_row_yuv(buf: &[u8], w: usize, h: usize, chroma: Chroma, y: usize, out: &
 
 #[inline(always)]
 fn convert_row(yrow: &[u8], urow: &[u8], vrow: &[u8], cx_shift: u32, out: &mut [u8]) {
-    for (x, dst) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+    // SIMD main blocks (byte-identical math), scalar tail.
+    let done =
+        crate::simdops::convert_row(crate::simdops::level(), yrow, urow, vrow, cx_shift, out);
+    for (x, dst) in out.as_chunks_mut::<4>().0.iter_mut().enumerate().skip(done) {
         let cx = x >> cx_shift;
         let c = CY * (yrow[x] as i32 - 16);
         let d = urow[cx] as i32 - 128;

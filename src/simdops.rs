@@ -1,7 +1,110 @@
 //! SIMD kernels (fearless_simd): runtime-dispatched, so the shipped
 //! baseline-CPU binaries still use AVX2/NEON where the machine has it.
 
-use fearless_simd::{f32x8, Level, Simd, SimdBase};
+#[allow(unused_imports)]
+use fearless_simd::prelude::*;
+use fearless_simd::{f32x8, i32x8, u8x16, Level, Simd};
+use std::sync::OnceLock;
+
+/// Runtime-detected SIMD level, cached (feature detection once).
+pub fn level() -> Level {
+    static LEVEL: OnceLock<Level> = OnceLock::new();
+    *LEVEL.get_or_init(Level::new)
+}
+
+// BT.601 limited-range coefficients, 16.16 fixed point (same constants as
+// the scalar path in color.rs — results must stay byte-identical).
+const CY: i32 = 76309;
+const CRV: i32 = 104597;
+const CGU: i32 = -25675;
+const CGV: i32 = -53279;
+const CBU: i32 = 132201;
+const ROUND: i32 = 1 << 15;
+const ALPHA: i32 = 0xFF << 24;
+
+/// Convert one row of YUV to RGBA. `cx_shift` = 1 for 4:2:0/4:2:2 chroma
+/// (each chroma sample covers two pixels), 0 for 4:4:4. Returns the number
+/// of pixels converted; the caller finishes the tail with scalar code.
+pub fn convert_row(
+    level: Level,
+    yrow: &[u8],
+    urow: &[u8],
+    vrow: &[u8],
+    cx_shift: u32,
+    out: &mut [u8],
+) -> usize {
+    fearless_simd::dispatch!(level, simd => convert_row_impl(simd, yrow, urow, vrow, cx_shift, out))
+}
+
+#[inline(always)]
+fn convert_row_impl<S: Simd>(
+    simd: S,
+    yrow: &[u8],
+    urow: &[u8],
+    vrow: &[u8],
+    cx_shift: u32,
+    out: &mut [u8],
+) -> usize {
+    let w = yrow.len();
+    let mut x = 0usize;
+    // u8x16 loads need 16 readable bytes in both luma and chroma rows;
+    // the last block near the row end falls back to the scalar tail.
+    while x + 16 <= w && (x >> cx_shift) + 16 <= urow.len() {
+        let cx = x >> cx_shift;
+        let yv = u8x16::from_slice(simd, &yrow[x..x + 16]);
+        let (ylo, yhi) = yv.widen();
+        let (u0, u1, v0, v1) = if cx_shift == 1 {
+            // 8 chroma samples cover 16 pixels: duplicate pairwise
+            let (culo, _) = u8x16::from_slice(simd, &urow[cx..cx + 16]).widen();
+            let (cvlo, _) = u8x16::from_slice(simd, &vrow[cx..cx + 16]).widen();
+            (
+                culo.zip_low(culo),
+                culo.zip_high(culo),
+                cvlo.zip_low(cvlo),
+                cvlo.zip_high(cvlo),
+            )
+        } else {
+            let (culo, cuhi) = u8x16::from_slice(simd, &urow[cx..cx + 16]).widen();
+            let (cvlo, cvhi) = u8x16::from_slice(simd, &vrow[cx..cx + 16]).widen();
+            (culo, cuhi, cvlo, cvhi)
+        };
+        convert_group(simd, ylo, u0, v0, &mut out[x * 4..x * 4 + 32]);
+        convert_group(simd, yhi, u1, v1, &mut out[x * 4 + 32..x * 4 + 64]);
+        x += 16;
+    }
+    x
+}
+
+#[inline(always)]
+fn convert_group<S: Simd>(
+    simd: S,
+    y16: fearless_simd::u16x8<S>,
+    u16v: fearless_simd::u16x8<S>,
+    v16v: fearless_simd::u16x8<S>,
+    out: &mut [u8],
+) {
+    let (ya, yb) = y16.widen();
+    let yi: i32x8<S> = ya.combine(yb).bitcast();
+    let (ua, ub) = u16v.widen();
+    let ui: i32x8<S> = ua.combine(ub).bitcast();
+    let (va, vb) = v16v.widen();
+    let vi: i32x8<S> = va.combine(vb).bitcast();
+
+    let c = (yi - 16) * CY;
+    let d = ui - 128;
+    let e = vi - 128;
+    let zero = i32x8::splat(simd, 0);
+    let hi = i32x8::splat(simd, 255);
+    let r = ((c + e * CRV + ROUND) >> 16u32).max(zero).min(hi);
+    let g = ((c + d * CGU + e * CGV + ROUND) >> 16u32).max(zero).min(hi);
+    let b = ((c + d * CBU + ROUND) >> 16u32).max(zero).min(hi);
+    let px = r | (g << 8u32) | (b << 16u32) | ALPHA;
+    let mut tmp = [0i32; 8];
+    px.store_slice(&mut tmp);
+    for (dst, v) in out.chunks_exact_mut(4).zip(tmp) {
+        dst.copy_from_slice(&v.to_le_bytes());
+    }
+}
 
 /// Palette OkLab channels in structure-of-arrays form, padded to a
 /// multiple of 8 lanes with +inf (padding never wins a min and never

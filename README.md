@@ -166,12 +166,20 @@ Every heavy stage is embarrassingly parallel across frames (rayon):
    nearest for every color in the cell. Most cells hold one candidate, so
    the hot path is a single table load; multi-candidate lookups memoize in
    a per-thread direct-mapped cache. The build's 262k-cell × 256-color
-   distance sweep runs on fearless_simd's portable f32 lanes with runtime
-   dispatch, so the baseline-CPU static binaries still use AVX2/NEON when
-   the machine has it (bit-exact vs the scalar path — no FMA contraction).
-   SIMD is deliberately scoped to this stage: error diffusion is a serial
-   dependency chain per pixel, LZW is a serial hash walk, and palette
-   lookups are gather-bound, so none of them vectorize profitably.
+   distance sweep runs on fearless_simd's portable f32 lanes.
+
+Three hot paths are vectorized with fearless_simd behind runtime dispatch
+(SSE4.2/AVX2/AVX-512/NEON picked per machine, so the baseline-CPU static
+binaries lose nothing), all verified byte-identical to the scalar paths:
+the YUV→RGBA row conversion (16 px/iteration through widen/zip, feeding
+both the histogram and quantize passes), the nearest-map distance sweep,
+and bulk histogram run extension (8-pixel block compares, guarded by one
+scalar compare so noisy content skips the overhead). 720p end-to-end:
+2.48 s → 2.13 s. Verified not to help: sierra2 error diffusion (the
+carry→lookup→error chain is latency-bound, not throughput-bound), LZW (a
+serial hash walk), and palette lookups (gather-bound). Known follow-up: a
+radix sort on the cut axis inside median cut (mandel's remaining
+hotspot).
 4. **Quantize + dither, parallel per frame.** Sierra-2-4A error diffusion
    by default (ffmpeg's paletteuse default), diffusing sRGB error with
    truncating division (an arithmetic shift would diffuse >100% of

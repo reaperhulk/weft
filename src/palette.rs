@@ -111,10 +111,15 @@ impl ColorHist {
 /// Accumulate one RGBA frame. Pixels with alpha < 128 are skipped.
 /// Run-length batching keeps hash traffic low on flat content.
 pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8]) {
+    let pixels = rgba.as_chunks::<4>().0;
+    let n = pixels.len();
     let mut last: u32 = u32::MAX;
     let mut run: u32 = 0;
-    for px in rgba.as_chunks::<4>().0 {
+    let mut i = 0usize;
+    while i < n {
+        let px = pixels[i];
         if px[3] < 128 {
+            i += 1;
             continue;
         }
         let c = ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | px[2] as u32;
@@ -126,6 +131,24 @@ pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8]) {
             }
             last = c;
             run = 1;
+        }
+        i += 1;
+        // Bulk-extend the run in 8-pixel blocks (32-byte compares lower
+        // to SIMD memcmp). Guarded by one scalar pixel compare so noisy
+        // content doesn't pay the pattern-building cost per pixel; equal
+        // raw words share alpha, so every counted pixel is opaque.
+        if i < n && pixels[i] == px {
+            let mut pattern = [0u8; 32];
+            for chunk in pattern.chunks_exact_mut(4) {
+                chunk.copy_from_slice(&px);
+            }
+            let bytes = &rgba[i * 4..];
+            let mut off = 0usize;
+            while off + 32 <= bytes.len() && bytes[off..off + 32] == pattern {
+                off += 32;
+            }
+            run += (off / 4) as u32;
+            i += off / 4;
         }
     }
     if run > 0 {
