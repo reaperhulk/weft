@@ -49,14 +49,25 @@ pub struct StoredFrame {
 
 impl StoredFrame {
     /// `compress: false` stores the frame raw (the `--no-compress`
-    /// benchmarking path).
-    pub fn pack(frame: Frame, compress: bool) -> StoredFrame {
+    /// benchmarking path). `scratch` is a caller-owned compression buffer
+    /// reused across frames: compressing there and copying out exact-sized
+    /// keeps a packed frame from retaining LZ4's worst-case capacity, which
+    /// is >= the raw size — on allocators that hand back recycled dirty
+    /// pages, `lz4_flex::block::compress`'s truncate-in-place Vec would make
+    /// the "compressed" set cost as much residency as the raw one.
+    pub fn pack(frame: Frame, compress: bool, scratch: &mut Vec<u8>) -> StoredFrame {
         let (Frame::Rgba(raw) | Frame::Yuv(raw)) = frame;
         if compress {
-            let data = lz4_flex::block::compress(&raw);
-            if data.len() < raw.len() {
+            let max = lz4_flex::block::get_maximum_output_size(raw.len());
+            if scratch.len() < max {
+                scratch.resize(max, 0);
+            }
+            let n = lz4_flex::block::compress_into(&raw, scratch).expect("lz4 scratch sized");
+            // Only keep the compressed form when it saves at least 1/16:
+            // marginal shrinkage isn't worth re-decompressing in pass 2.
+            if n + n / 16 < raw.len() {
                 return StoredFrame {
-                    data,
+                    data: scratch[..n].to_vec(),
                     raw_len: raw.len(),
                 };
             }
@@ -65,6 +76,16 @@ impl StoredFrame {
             raw_len: raw.len(),
             data: raw,
         }
+    }
+
+    /// Bytes resident for this frame as stored.
+    pub fn stored_len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Uncompressed frame size.
+    pub fn raw_len(&self) -> usize {
+        self.raw_len
     }
 
     /// The raw frame bytes, decompressing into `scratch` when needed.

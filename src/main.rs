@@ -339,9 +339,10 @@ fn run(args: &Args) -> io::Result<()> {
                         Vec::new(),
                         vec![0u8; w * 4],
                         false,
+                        Vec::new(), // per-worker LZ4 scratch, reused
                     )
                 },
-                |(mut hist, mut frames, mut row, mut alpha), (i, f)| {
+                |(mut hist, mut frames, mut row, mut alpha, mut lz4buf), (i, f)| {
                     let src = color::RowSource::new(&f, w, h, meta_ref.chroma);
                     for y in 0..h {
                         src.fill_row(y, &mut row);
@@ -352,11 +353,11 @@ fn run(args: &Args) -> io::Result<()> {
                         spilled.lock().unwrap().push(run);
                         hist = palette::ColorHist::new();
                     }
-                    frames.push((i, StoredFrame::pack(f, args.compress)));
-                    (hist, frames, row, alpha)
+                    frames.push((i, StoredFrame::pack(f, args.compress, &mut lz4buf)));
+                    (hist, frames, row, alpha, lz4buf)
                 },
             )
-            .reduce_with(|(ha, mut fa, row, aa), (hb, fb, _, ab)| {
+            .reduce_with(|(ha, mut fa, row, aa, lz4buf), (hb, fb, _, ab, _)| {
                 // Flush instead of hash-merging: reductions run while other
                 // workers still accumulate, and a table-into-table merge of
                 // millions of colors would serialize them behind cache-miss
@@ -366,12 +367,12 @@ fn run(args: &Args) -> io::Result<()> {
                     spilled.lock().unwrap().push(run);
                 }
                 fa.extend(fb);
-                (ha, fa, row, aa | ab)
+                (ha, fa, row, aa | ab, lz4buf)
             });
         (reader_handle.join().expect("reader thread panicked"), acc)
     });
     let nread = read_res?;
-    let Some((hist, mut indexed_frames, _, any_alpha)) = acc else {
+    let Some((hist, mut indexed_frames, _, any_alpha, _)) = acc else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "no frames in input",
@@ -380,6 +381,16 @@ fn run(args: &Args) -> io::Result<()> {
     debug_assert_eq!(indexed_frames.len(), nread);
     indexed_frames.sort_unstable_by_key(|(i, _)| *i);
     let frames: Vec<StoredFrame> = indexed_frames.into_iter().map(|(_, f)| f).collect();
+    if args.stats {
+        let raw: u64 = frames.iter().map(|f| f.raw_len() as u64).sum();
+        let stored: u64 = frames.iter().map(|f| f.stored_len() as u64).sum();
+        eprintln!(
+            "  buffered: {:.1} MB raw -> {:.1} MB stored ({:.2}x)",
+            raw as f64 / 1e6,
+            stored as f64 / 1e6,
+            raw as f64 / stored.max(1) as f64
+        );
+    }
     // Concatenate all flushed runs plus the surviving accumulator, then sum
     // duplicate colors with one parallel sort + adjacent merge. median_cut
     // canonicalizes its input by the same sort, so this costs nothing extra
