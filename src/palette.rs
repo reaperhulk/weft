@@ -873,7 +873,7 @@ mod tests {
         };
         for case in 0..200 {
             let n = 2 + (rng() % 500) as usize;
-            let mut pairs: Vec<(u64, u32)> = (0..n)
+            let pairs: Vec<(u64, u32)> = (0..n)
                 .map(|i| {
                     let heavy = case % 3 == 0 && i == n - 1;
                     let w = if heavy { 1_000_000 } else { 1 + rng() % 50 };
