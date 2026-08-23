@@ -91,60 +91,50 @@ pub fn parse_y4m_header(line: &str) -> io::Result<VideoIn> {
     })
 }
 
-/// Read all Y4M frames after the stream header.
-pub fn read_y4m_frames(
-    r: &mut impl BufRead,
-    meta: &VideoIn,
-) -> io::Result<Vec<Frame>> {
-    let chroma = meta.chroma.unwrap();
-    let fsize = chroma.frame_bytes(meta.width, meta.height);
-    let mut frames = Vec::new();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = r.read_line(&mut line)?;
-        if n == 0 {
-            break; // clean EOF
-        }
-        if !line.starts_with("FRAME") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "y4m: expected FRAME marker",
-            ));
-        }
-        let mut buf = vec![0u8; fsize];
-        r.read_exact(&mut buf)?;
-        frames.push(Frame::Yuv(buf));
+/// Read exactly `n` bytes into a fresh buffer without pre-zeroing it
+/// (via `take` + `read_to_end`, which fills spare capacity directly).
+/// Returns None on immediate clean EOF; errors on a short read.
+fn read_frame_buf(r: &mut impl Read, n: usize, what: &str) -> io::Result<Option<Vec<u8>>> {
+    let mut buf = Vec::with_capacity(n);
+    let got = r.take(n as u64).read_to_end(&mut buf)?;
+    if got == 0 {
+        return Ok(None);
     }
-    Ok(frames)
+    if got < n {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("{what}: truncated frame ({got} of {n} bytes)"),
+        ));
+    }
+    Ok(Some(buf))
 }
 
-/// Read raw RGBA frames until EOF. A trailing partial frame is an error.
-pub fn read_rgba_frames(r: &mut impl Read, w: usize, h: usize) -> io::Result<Vec<Frame>> {
-    let fsize = w * h * 4;
-    let mut frames = Vec::new();
-    loop {
-        let mut buf = vec![0u8; fsize];
-        let mut got = 0usize;
-        while got < fsize {
-            let n = r.read(&mut buf[got..])?;
-            if n == 0 {
-                break;
-            }
-            got += n;
-        }
-        if got == 0 {
-            break;
-        }
-        if got < fsize {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!("raw rgba: truncated frame ({got} of {fsize} bytes)"),
-            ));
-        }
-        frames.push(Frame::Rgba(buf));
+/// Read the next Y4M frame (FRAME marker + planes), or None at EOF.
+pub fn read_y4m_frame(r: &mut impl BufRead, meta: &VideoIn) -> io::Result<Option<Frame>> {
+    let chroma = meta.chroma.unwrap();
+    let fsize = chroma.frame_bytes(meta.width, meta.height);
+    let mut line = String::new();
+    if r.read_line(&mut line)? == 0 {
+        return Ok(None); // clean EOF
     }
-    Ok(frames)
+    if !line.starts_with("FRAME") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "y4m: expected FRAME marker",
+        ));
+    }
+    match read_frame_buf(r, fsize, "y4m")? {
+        Some(buf) => Ok(Some(Frame::Yuv(buf))),
+        None => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "y4m: FRAME marker with no payload",
+        )),
+    }
+}
+
+/// Read the next raw RGBA frame, or None at EOF.
+pub fn read_rgba_frame(r: &mut impl Read, w: usize, h: usize) -> io::Result<Option<Frame>> {
+    Ok(read_frame_buf(r, w * h * 4, "raw rgba")?.map(Frame::Rgba))
 }
 
 #[cfg(test)]

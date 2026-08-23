@@ -137,6 +137,7 @@ pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8]) {
 #[derive(Clone, Copy)]
 struct HBin {
     count: u32,
+    srgb: u32,
     lab: [f32; 3],
 }
 
@@ -204,6 +205,7 @@ pub fn median_cut(entries: &[(u32, u32)], max_colors: usize) -> Vec<[u8; 3]> {
         .par_iter()
         .map(|&(c, n)| HBin {
             count: n,
+            srgb: c,
             lab: cv.srgb_to_oklab((c >> 16) as u8, (c >> 8) as u8, c as u8),
         })
         .collect();
@@ -223,7 +225,19 @@ pub fn median_cut(entries: &[(u32, u32)], max_colors: usize) -> Vec<[u8; 3]> {
             (b.start, b.len, b.cut_axis, b.count)
         };
         let slice = &mut bins[start..start + len];
-        slice.sort_unstable_by(|a, b| a.lab[axis].partial_cmp(&b.lab[axis]).unwrap());
+        // srgb tiebreak gives a total order: the split (and thus the final
+        // palette) never depends on input or thread-scheduling order
+        let by_axis = |a: &HBin, b: &HBin| {
+            a.lab[axis]
+                .partial_cmp(&b.lab[axis])
+                .unwrap()
+                .then(a.srgb.cmp(&b.srgb))
+        };
+        if len > 16384 {
+            slice.par_sort_unstable_by(by_axis);
+        } else {
+            slice.sort_unstable_by(by_axis);
+        }
         // count-weighted median split (>=1 color on each side)
         let median = (total + 1) / 2;
         let mut acc = 0u64;
@@ -243,13 +257,31 @@ pub fn median_cut(entries: &[(u32, u32)], max_colors: usize) -> Vec<[u8; 3]> {
     boxes
         .iter()
         .map(|bx| {
+            let slice = &bins[bx.start..bx.start + bx.len];
+            // A box that collapsed to one distinct color must reproduce it
+            // exactly — the f32 Lab->sRGB roundtrip can drift by ±1, and in
+            // large flat regions that off-by-one turns into dither speckle.
+            if slice.len() == 1 {
+                let c = slice[0].srgb;
+                return [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+            }
             let mut count = 0u64;
             let mut sum = [0f64; 3];
-            for b in &bins[bx.start..bx.start + bx.len] {
+            let mut dominant = &slice[0];
+            for b in slice {
                 count += b.count as u64;
+                if b.count > dominant.count {
+                    dominant = b;
+                }
                 for c in 0..3 {
                     sum[c] += b.count as f64 * b.lab[c] as f64;
                 }
+            }
+            // Same reasoning when one color overwhelms the box: the weighted
+            // average is that color, so snap to its exact sRGB.
+            if dominant.count as u64 * 100 >= count * 99 {
+                let c = dominant.srgb;
+                return [(c >> 16) as u8, (c >> 8) as u8, c as u8];
             }
             oklab_to_srgb([
                 (sum[0] / count as f64) as f32,
@@ -267,6 +299,10 @@ pub fn median_cut(entries: &[(u32, u32)], max_colors: usize) -> Vec<[u8; 3]> {
 /// OkLab distance to the query color is minimal; for most cells there is a
 /// single candidate and the search collapses to one load.
 pub struct NearestMap {
+    /// single-candidate fast path: palette index, or 0xFF when the cell
+    /// needs the candidate list (0xFF is never a palette index — palettes
+    /// cap at 255 colors, and the transparent slot is not in `colors`)
+    direct: Vec<u8>,
     /// start offset into `cands` for each cell; len GRID_SIZE + 1
     starts: Vec<u32>,
     cands: Vec<u8>,
@@ -307,9 +343,13 @@ impl NearestMap {
                     }
                 }
                 let rmax = rmax2.sqrt();
+                // one distance pass, buffered, shared by the dmin scan and
+                // the candidate filter
+                let mut dists = [0f32; 256];
                 let mut dmin2 = f32::MAX;
-                for pl in &pal_lab {
+                for (i, pl) in pal_lab.iter().enumerate() {
                     let d = dist2(pl, &q);
+                    dists[i] = d;
                     if d < dmin2 {
                         dmin2 = d;
                     }
@@ -317,8 +357,8 @@ impl NearestMap {
                 let bound = dmin2.sqrt() + 2.0 * rmax + 1e-6;
                 let bound2 = bound * bound;
                 let mut list = Vec::new();
-                for (i, pl) in pal_lab.iter().enumerate() {
-                    if dist2(pl, &q) <= bound2 {
+                for (i, &d) in dists[..pal_lab.len()].iter().enumerate() {
+                    if d <= bound2 {
                         list.push(i as u8);
                     }
                 }
@@ -326,16 +366,18 @@ impl NearestMap {
             })
             .collect();
 
+        let mut direct = Vec::with_capacity(GRID_SIZE);
         let mut starts = Vec::with_capacity(GRID_SIZE + 1);
         let mut cands = Vec::new();
         let mut off = 0u32;
         for l in &cell_lists {
+            direct.push(if l.len() == 1 { l[0] } else { 0xFF });
             starts.push(off);
             cands.extend_from_slice(l);
             off += l.len() as u32;
         }
         starts.push(off);
-        NearestMap { starts, cands, pal_lab, cv }
+        NearestMap { direct, starts, cands, pal_lab, cv }
     }
 
     /// Average candidates per cell — perf diagnostic.
@@ -346,12 +388,43 @@ impl NearestMap {
     #[inline(always)]
     pub fn lookup(&self, r: u8, g: u8, b: u8) -> u8 {
         let key = grid_key(r, g, b);
+        let d = self.direct[key];
+        if d != 0xFF {
+            return d;
+        }
+        self.resolve_cell(key, r, g, b)
+    }
+
+    /// Like `lookup` but memoizes multi-candidate resolutions in a
+    /// per-thread direct-mapped cache — dithered content repeats adjusted
+    /// colors heavily, and this skips the Lab conversion for repeats.
+    #[inline(always)]
+    pub fn lookup_cached(&self, cache: &mut IdxCache, r: u8, g: u8, b: u8) -> u8 {
+        let key = grid_key(r, g, b);
+        let d = self.direct[key];
+        if d != 0xFF {
+            return d;
+        }
+        let color = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
+        let slot = (color.wrapping_mul(0x9E37_79B1) >> 16) as usize;
+        if cache.keys[slot] == color {
+            return cache.vals[slot];
+        }
+        let idx = self.resolve_cell(key, r, g, b);
+        cache.keys[slot] = color;
+        cache.vals[slot] = idx;
+        idx
+    }
+
+    #[inline(never)]
+    fn resolve_cell(&self, key: usize, r: u8, g: u8, b: u8) -> u8 {
         let s = self.starts[key] as usize;
         let e = self.starts[key + 1] as usize;
-        let cands = &self.cands[s..e];
-        if cands.len() == 1 {
-            return cands[0];
-        }
+        self.resolve(&self.cands[s..e], r, g, b)
+    }
+
+    #[inline(always)]
+    fn resolve(&self, cands: &[u8], r: u8, g: u8, b: u8) -> u8 {
         let q = self.cv.srgb_to_oklab(r, g, b);
         let mut best = cands[0];
         let mut best_d = f32::MAX;
@@ -363,6 +436,21 @@ impl NearestMap {
             }
         }
         best
+    }
+}
+
+/// Direct-mapped memo cache for multi-candidate nearest lookups (64K slots).
+pub struct IdxCache {
+    keys: Vec<u32>,
+    vals: Vec<u8>,
+}
+
+impl Default for IdxCache {
+    fn default() -> Self {
+        IdxCache {
+            keys: vec![u32::MAX; 1 << 16],
+            vals: vec![0; 1 << 16],
+        }
     }
 }
 

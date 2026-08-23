@@ -150,10 +150,12 @@ fn main() {
 
 fn run(args: &Args) -> io::Result<()> {
     let t0 = Instant::now();
-    let stdin = io::stdin().lock();
-    let mut reader = BufReader::with_capacity(1 << 20, stdin);
+    // Stdin (not StdinLock): the reader moves to a worker thread, and
+    // StdinLock is not Send. Refills lock per read; at 1 MB granularity the
+    // lock cost vanishes.
+    let mut reader = BufReader::with_capacity(1 << 20, io::stdin());
 
-    // ---- input detection + read ------------------------------------------
+    // ---- input detection ---------------------------------------------------
     let mut probe = [0u8; 9];
     let is_y4m = match args.format {
         Format::Y4m => true,
@@ -165,7 +167,12 @@ fn run(args: &Args) -> io::Result<()> {
     };
     let probe_consumed = args.format == Format::Auto;
 
-    let (meta, frames): (VideoIn, Vec<Frame>) = if is_y4m {
+    enum Source {
+        Y4m(BufReader<io::Stdin>),
+        Rgba(io::Chain<io::Cursor<Vec<u8>>, BufReader<io::Stdin>>),
+    }
+
+    let (meta, mut source) = if is_y4m {
         let mut line = String::new();
         io::BufRead::read_line(&mut reader, &mut line)?;
         let header = if probe_consumed {
@@ -181,53 +188,81 @@ fn run(args: &Args) -> io::Result<()> {
             meta.fps_num = n;
             meta.fps_den = d;
         }
-        let frames = input::read_y4m_frames(&mut reader, &meta)?;
-        (meta, frames)
+        (meta, Source::Y4m(reader))
     } else {
         let (w, h) = args.size.ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "--size WxH is required for raw RGBA input")
         })?;
         let (n, d) = args.fps.unwrap_or((30, 1));
         let meta = VideoIn { width: w, height: h, fps_num: n, fps_den: d, chroma: None };
-        let frames = if probe_consumed {
-            // stitch the 9 probed bytes back onto the stream
-            input::read_rgba_frames(&mut probe.chain(reader), w, h)?
-        } else {
-            input::read_rgba_frames(&mut reader, w, h)?
-        };
-        (meta, frames)
+        let leftover = if probe_consumed { probe.to_vec() } else { Vec::new() };
+        (meta, Source::Rgba(io::Cursor::new(leftover).chain(reader)))
     };
-    if frames.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "no frames in input"));
-    }
     let (w, h) = (meta.width, meta.height);
-    if w > 65535 || h > 65535 {
+    if w == 0 || h == 0 || w > 65535 || h > 65535 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "frame size exceeds GIF limits"));
     }
-    let t_read = t0.elapsed();
 
-    // ---- pass 1: histogram (parallel over frame chunks) ------------------
+    // ---- read + histogram, overlapped -------------------------------------
+    // A reader thread streams frames into a bounded channel while rayon
+    // workers accumulate per-thread histograms, so palette statistics are
+    // (nearly) free whenever input arrives slower than it can be hashed.
     let t1 = Instant::now();
-    let nchunks = rayon::current_num_threads().max(1);
-    let chunk = frames.len().div_ceil(nchunks);
-    let hist = frames
-        .par_chunks(chunk)
-        .map(|fchunk| {
-            let mut local = palette::ColorHist::new();
-            let mut rgba = vec![0u8; w * h * 4];
-            for f in fchunk {
-                color::frame_to_rgba(f, w, h, meta.chroma, &mut rgba);
-                palette::accumulate_frame(&mut local, &rgba);
+    let nthreads = rayon::current_num_threads().max(1);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(2 * nthreads);
+    let (read_res, acc) = std::thread::scope(|scope| {
+        let meta_ref = &meta;
+        let reader_handle = scope.spawn(move || -> io::Result<usize> {
+            let mut n = 0usize;
+            loop {
+                let frame = match &mut source {
+                    Source::Y4m(r) => input::read_y4m_frame(r, meta_ref)?,
+                    Source::Rgba(r) => input::read_rgba_frame(r, w, h)?,
+                };
+                match frame {
+                    Some(f) => {
+                        if tx.send((n, f)).is_err() {
+                            break; // consumer died; its error surfaces below
+                        }
+                        n += 1;
+                    }
+                    None => break,
+                }
             }
-            local
-        })
-        .reduce_with(|mut a, b| {
-            a.merge(&b);
-            a
-        })
-        .unwrap();
+            Ok(n)
+        });
+        let acc = rx
+            .into_iter()
+            .par_bridge()
+            .fold(
+                || (palette::ColorHist::new(), Vec::new(), vec![0u8; w * 4]),
+                |(mut hist, mut frames, mut row), (i, f)| {
+                    let src = color::RowSource::new(&f, w, h, meta_ref.chroma);
+                    for y in 0..h {
+                        src.fill_row(y, &mut row);
+                        palette::accumulate_frame(&mut hist, &row);
+                    }
+                    frames.push((i, f));
+                    (hist, frames, row)
+                },
+            )
+            .reduce_with(|(mut ha, mut fa, row), (hb, fb, _)| {
+                ha.merge(&hb);
+                fa.extend(fb);
+                (ha, fa, row)
+            });
+        (reader_handle.join().expect("reader thread panicked"), acc)
+    });
+    let nread = read_res?;
+    let Some((hist, mut indexed_frames, _)) = acc else {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "no frames in input"));
+    };
+    debug_assert_eq!(indexed_frames.len(), nread);
+    indexed_frames.sort_unstable_by_key(|(i, _)| *i);
+    let frames: Vec<Frame> = indexed_frames.into_iter().map(|(_, f)| f).collect();
     let entries = hist.entries();
     drop(hist);
+    let t_read = t0.elapsed();
     let t_hist = t1.elapsed();
 
     // ---- palette + nearest-color map --------------------------------------
@@ -240,6 +275,13 @@ fn run(args: &Args) -> io::Result<()> {
     let min_code_size = gct_bits.max(2);
     let nearest = palette::NearestMap::build(&colors);
     let t_pal = t2.elapsed();
+    if args.stats {
+        eprintln!(
+            "  palette: {} colors, nearest-map avg candidates/cell {:.2}",
+            colors.len(),
+            nearest.avg_candidates()
+        );
+    }
 
     // ---- pass 2: quantize + dither (parallel per frame) ------------------
     let t3 = Instant::now();
@@ -247,12 +289,12 @@ fn run(args: &Args) -> io::Result<()> {
     let results: Vec<(Vec<u8>, bool)> = frames
         .into_par_iter()
         .map_init(
-            || vec![0u8; w * h * 4],
-            |rgba, f| {
-                color::frame_to_rgba(&f, w, h, meta.chroma, rgba);
-                drop(f);
+            || dither::QuantScratch::new(w),
+            |scratch, f| {
                 let mut idx = vec![0u8; w * h];
-                let has_alpha = quant.quantize(rgba, w, h, args.dither, &mut idx);
+                let src = color::RowSource::new(&f, w, h, meta.chroma);
+                let has_alpha = quant.quantize(&src, w, h, args.dither, scratch, &mut idx);
+                drop(f);
                 (idx, has_alpha)
             },
         )
@@ -302,7 +344,7 @@ fn run(args: &Args) -> io::Result<()> {
             meta.fps_num, meta.fps_den, colors.len(), out.len()
         );
         eprintln!(
-            "  read {:?}  hist {:?}  palette+lut {:?}  quantize {:?}  delta+lzw {:?}  mux+write {:?}  total {:?}",
+            "  read+hist {:?} (hist span {:?})  palette+lut {:?}  quantize {:?}  delta+lzw {:?}  mux+write {:?}  total {:?}",
             t_read, t_hist, t_pal, t_quant, t_lzw, t_mux, t0.elapsed()
         );
     }

@@ -63,6 +63,36 @@ quality() {
 printf "%-10s %-8s %8s %10s %10s %8s %8s\n" clip encoder "time(s)" "rss(MB)" "size(KB)" psnr ssim
 printf '%.0s-' {1..68}; echo
 
+# Apples-to-apples RGBA comparison: identical input bytes for both encoders,
+# no YUV->RGB converter anywhere. The y4m rows below carry a caveat: the
+# PSNR/SSIM reference is decoded with swscale, which truncates where weft
+# rounds-to-nearest, so weft's flat regions show a constant +-1-2 offset
+# against that reference (weft is the closer-to-exact conversion). This row
+# is the honest quality comparison.
+rgba_bench() {
+  local raw=data/testsrc.rgba
+  [ -f "$raw" ] || return 0
+  local vs="-f rawvideo -pix_fmt rgba -video_size 640x360 -framerate 30"
+  read -r ft frss < <(time_cmd ffmpeg -v error -y $vs -i "$raw" -filter_complex \
+    "[0:v]split[a][b];[a]palettegen[p];[b][p]paletteuse" out/ffmpeg_rgba.gif)
+  read -r wt wrss < <(time_cmd bash -c "$WEFT --size 640x360 --fps 30 < $raw > out/weft_rgba.gif")
+  for enc in ffmpeg weft; do
+    local gif=out/${enc}_rgba.gif t rss
+    if [ $enc = ffmpeg ]; then t=$ft; rss=$frss; else t=$wt; rss=$wrss; fi
+    local psnr ssim
+    psnr=$(ffmpeg -v info -i "$gif" $vs -i "$raw" -filter_complex \
+      "[0:v]fps=30,format=rgb24,setpts=N[a];[1:v]format=rgb24,setpts=N[b];[a][b]psnr" \
+      -f null - 2>&1 | grep -o 'average:[0-9.inf]*' | cut -d: -f2 || true)
+    ssim=$(ffmpeg -v info -i "$gif" $vs -i "$raw" -filter_complex \
+      "[0:v]fps=30,format=rgb24,setpts=N[a];[1:v]format=rgb24,setpts=N[b];[a][b]ssim" \
+      -f null - 2>&1 | grep -o 'All:[0-9.]*' | cut -d: -f2 || true)
+    printf "%-10s %-8s %8s %10s %10s %8s %8s\n" "rgba" "$enc" "$t" \
+      "$(awk "BEGIN{printf \"%.1f\", $rss/1024}")" \
+      "$(awk "BEGIN{printf \"%d\", $(stat -c%s "$gif")/1024}")" "${psnr:-err}" "${ssim:-err}"
+  done
+}
+rgba_bench
+
 for clip in "${clips[@]}"; do
   src="data/$clip.y4m"
   fps=$(fps_of "$src")

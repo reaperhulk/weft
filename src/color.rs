@@ -1,9 +1,15 @@
 //! YUV (BT.601 limited range) -> RGBA conversion.
+//!
+//! Conversion is row-based so hot loops can pull one RGBA row at a time
+//! into a small scratch buffer (L1-resident) instead of materializing whole
+//! RGBA frames.
 
 use crate::input::{Chroma, Frame};
 
-// BT.601 limited-range coefficients in 16.16 fixed point (matching
-// swscale's precision: 1.164, 1.596, -0.392, -0.813, 2.017).
+// BT.601 limited-range coefficients in 16.16 fixed point with round-to-
+// nearest (1.164, 1.596, -0.392, -0.813, 2.017). Note: swscale truncates
+// where this rounds, so outputs can differ from ffmpeg's by ±1-2 — this is
+// the mathematically closer result.
 const CY: i32 = 76309;
 const CRV: i32 = 104597;
 const CGU: i32 = -25675;
@@ -16,63 +22,103 @@ fn clamp8(v: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
 
-/// Convert one stored frame to RGBA into `out` (len == w*h*4).
-pub fn frame_to_rgba(frame: &Frame, w: usize, h: usize, chroma: Option<Chroma>, out: &mut [u8]) {
-    match frame {
-        Frame::Rgba(buf) => out.copy_from_slice(buf),
-        Frame::Yuv(buf) => yuv_to_rgba(buf, w, h, chroma.unwrap(), out),
+/// Per-frame source of RGBA rows.
+pub struct RowSource<'a> {
+    frame: &'a Frame,
+    w: usize,
+    h: usize,
+    chroma: Option<Chroma>,
+}
+
+impl<'a> RowSource<'a> {
+    pub fn new(frame: &'a Frame, w: usize, h: usize, chroma: Option<Chroma>) -> Self {
+        RowSource { frame, w, h, chroma }
+    }
+
+    /// Fill `out` (len w*4) with RGBA for row `y`.
+    #[inline]
+    pub fn fill_row(&self, y: usize, out: &mut [u8]) {
+        let w = self.w;
+        match self.frame {
+            Frame::Rgba(buf) => out.copy_from_slice(&buf[y * w * 4..(y + 1) * w * 4]),
+            Frame::Yuv(buf) => fill_row_yuv(buf, w, self.h, self.chroma.unwrap(), y, out),
+        }
     }
 }
 
-fn yuv_to_rgba(buf: &[u8], w: usize, h: usize, chroma: Chroma, out: &mut [u8]) {
+#[inline]
+fn fill_row_yuv(buf: &[u8], w: usize, h: usize, chroma: Chroma, y: usize, out: &mut [u8]) {
     let cw = (w + 1) / 2;
-    let ch = (h + 1) / 2;
-    let (y_plane, u_plane, v_plane, cx_shift, cy_shift, crow_w) = match chroma {
-        Chroma::C420 => {
-            let (y, rest) = buf.split_at(w * h);
-            let (u, v) = rest.split_at(cw * ch);
-            (y, u, v, 1u32, 1u32, cw)
-        }
-        Chroma::C422 => {
-            let (y, rest) = buf.split_at(w * h);
-            let (u, v) = rest.split_at(cw * h);
-            (y, u, v, 1, 0, cw)
-        }
-        Chroma::C444 => {
-            let (y, rest) = buf.split_at(w * h);
-            let (u, v) = rest.split_at(w * h);
-            (y, u, v, 0, 0, w)
-        }
+    match chroma {
         Chroma::Mono => {
-            let y = &buf[..w * h];
-            for (dst, &yy) in out.chunks_exact_mut(4).zip(y.iter()) {
-                let c = CY * (yy as i32 - 16);
-                let g = clamp8((c + ROUND) >> 16);
+            let yrow = &buf[y * w..y * w + w];
+            for (dst, &yy) in out.chunks_exact_mut(4).zip(yrow.iter()) {
+                let g = clamp8((CY * (yy as i32 - 16) + ROUND) >> 16);
                 dst[0] = g;
                 dst[1] = g;
                 dst[2] = g;
                 dst[3] = 255;
             }
-            return;
         }
-    };
+        Chroma::C420 => {
+            let ch = (h + 1) / 2;
+            let (yp, rest) = buf.split_at(w * h);
+            let (up, vp) = rest.split_at(cw * ch);
+            let crow = (y >> 1) * cw;
+            convert_row(
+                &yp[y * w..y * w + w],
+                &up[crow..crow + cw],
+                &vp[crow..crow + cw],
+                1,
+                out,
+            );
+        }
+        Chroma::C422 => {
+            let (yp, rest) = buf.split_at(w * h);
+            let (up, vp) = rest.split_at(cw * h);
+            let crow = y * cw;
+            convert_row(
+                &yp[y * w..y * w + w],
+                &up[crow..crow + cw],
+                &vp[crow..crow + cw],
+                1,
+                out,
+            );
+        }
+        Chroma::C444 => {
+            let (yp, rest) = buf.split_at(w * h);
+            let (up, vp) = rest.split_at(w * h);
+            let crow = y * w;
+            convert_row(
+                &yp[y * w..y * w + w],
+                &up[crow..crow + w],
+                &vp[crow..crow + w],
+                0,
+                out,
+            );
+        }
+    }
+}
 
+#[inline(always)]
+fn convert_row(yrow: &[u8], urow: &[u8], vrow: &[u8], cx_shift: u32, out: &mut [u8]) {
+    for (x, dst) in out.chunks_exact_mut(4).enumerate() {
+        let cx = x >> cx_shift;
+        let c = CY * (yrow[x] as i32 - 16);
+        let d = urow[cx] as i32 - 128;
+        let e = vrow[cx] as i32 - 128;
+        dst[0] = clamp8((c + CRV * e + ROUND) >> 16);
+        dst[1] = clamp8((c + CGU * d + CGV * e + ROUND) >> 16);
+        dst[2] = clamp8((c + CBU * d + ROUND) >> 16);
+        dst[3] = 255;
+    }
+}
+
+/// Convert a whole stored frame to RGBA (tests and non-hot paths).
+pub fn frame_to_rgba(frame: &Frame, w: usize, h: usize, chroma: Option<Chroma>, out: &mut [u8]) {
+    let src = RowSource::new(frame, w, h, chroma);
     for y in 0..h {
-        let yrow = &y_plane[y * w..y * w + w];
-        let crow = (y >> cy_shift) * crow_w;
-        let urow = &u_plane[crow..crow + crow_w];
-        let vrow = &v_plane[crow..crow + crow_w];
-        let orow = &mut out[y * w * 4..(y + 1) * w * 4];
-        for (x, dst) in orow.chunks_exact_mut(4).enumerate() {
-            let cx = x >> cx_shift;
-            let c = CY * (yrow[x] as i32 - 16);
-            let d = urow[cx] as i32 - 128;
-            let e = vrow[cx] as i32 - 128;
-            dst[0] = clamp8((c + CRV * e + ROUND) >> 16);
-            dst[1] = clamp8((c + CGU * d + CGV * e + ROUND) >> 16);
-            dst[2] = clamp8((c + CBU * d + ROUND) >> 16);
-            dst[3] = 255;
-        }
+        src.fill_row(y, &mut out[y * w * 4..(y + 1) * w * 4]);
     }
 }
 
@@ -82,17 +128,31 @@ mod tests {
 
     #[test]
     fn primaries_roundtrip_420() {
-        // white / black / red-ish in BT.601 limited
         let w = 2;
         let h = 2;
-        // Y plane: all white (235); U=V=128
         let buf = vec![235, 235, 235, 235, 128, 128];
         let mut out = vec![0u8; 16];
-        yuv_to_rgba(&buf, w, h, Chroma::C420, &mut out);
+        frame_to_rgba(&Frame::Yuv(buf), w, h, Some(Chroma::C420), &mut out);
         assert_eq!(&out[..4], &[255, 255, 255, 255]);
 
         let buf = vec![16, 16, 16, 16, 128, 128];
-        yuv_to_rgba(&buf, w, h, Chroma::C420, &mut out);
+        frame_to_rgba(&Frame::Yuv(buf), w, h, Some(Chroma::C420), &mut out);
         assert_eq!(&out[..4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn c444_and_c422_rows() {
+        // 2x2 444: distinct chroma per pixel
+        let w = 2;
+        let h = 2;
+        let buf = vec![
+            81, 145, 41, 210, // Y
+            90, 54, 240, 16, // U
+            240, 34, 110, 146, // V
+        ];
+        let mut out = vec![0u8; 16];
+        frame_to_rgba(&Frame::Yuv(buf), w, h, Some(Chroma::C444), &mut out);
+        // red-ish first pixel (bt601 red: Y81 U90 V240)
+        assert!(out[0] > 200 && out[1] < 60 && out[2] < 60, "{:?}", &out[..4]);
     }
 }

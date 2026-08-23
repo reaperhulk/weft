@@ -30,40 +30,66 @@ pub struct Quantizer<'a> {
     pub trans_idx: u8,
 }
 
-impl<'a> Quantizer<'a> {
-    #[inline(always)]
-    fn lookup(&self, r: u8, g: u8, b: u8) -> u8 {
-        self.nearest.lookup(r, g, b)
-    }
+/// Per-thread quantization scratch: RGBA row buffer + memo cache.
+pub struct QuantScratch {
+    pub cache: crate::palette::IdxCache,
+    row: Vec<u8>,
+}
 
-    /// Quantize an RGBA frame into palette indices. Returns true if any
-    /// pixel was alpha-transparent.
-    pub fn quantize(&self, rgba: &[u8], w: usize, h: usize, mode: Dither, out: &mut [u8]) -> bool {
+impl QuantScratch {
+    pub fn new(w: usize) -> Self {
+        QuantScratch {
+            cache: crate::palette::IdxCache::default(),
+            row: vec![0u8; w * 4],
+        }
+    }
+}
+
+impl<'a> Quantizer<'a> {
+    /// Quantize a frame (accessed row-by-row via `src`, so YUV conversion
+    /// stays fused and cache-resident) into palette indices. Returns true
+    /// if any pixel was alpha-transparent.
+    pub fn quantize(
+        &self,
+        src: &crate::color::RowSource,
+        w: usize,
+        h: usize,
+        mode: Dither,
+        scratch: &mut QuantScratch,
+        out: &mut [u8],
+    ) -> bool {
         match mode {
-            Dither::None => self.quantize_plain(rgba, out),
-            Dither::Bayer => self.quantize_bayer(rgba, w, h, out),
-            Dither::Sierra2_4a => self.quantize_diffuse(rgba, w, h, out, false),
-            Dither::FloydSteinberg => self.quantize_diffuse(rgba, w, h, out, true),
+            Dither::None => self.quantize_plain(src, w, h, scratch, out),
+            Dither::Bayer => self.quantize_bayer(src, w, h, scratch, out),
+            Dither::Sierra2_4a => self.quantize_diffuse(src, w, h, scratch, out, false),
+            Dither::FloydSteinberg => self.quantize_diffuse(src, w, h, scratch, out, true),
         }
     }
 
-    fn quantize_plain(&self, rgba: &[u8], out: &mut [u8]) -> bool {
+    fn quantize_plain(&self, src: &crate::color::RowSource, w: usize, h: usize, scratch: &mut QuantScratch, out: &mut [u8]) -> bool {
         let mut has_alpha = false;
-        for (px, o) in rgba.chunks_exact(4).zip(out.iter_mut()) {
-            if px[3] < 128 {
-                *o = self.trans_idx;
-                has_alpha = true;
-            } else {
-                *o = self.lookup(px[0], px[1], px[2]);
+        let cache = &mut scratch.cache;
+        for y in 0..h {
+            src.fill_row(y, &mut scratch.row);
+            let orow = &mut out[y * w..(y + 1) * w];
+            for (px, o) in scratch.row.chunks_exact(4).zip(orow.iter_mut()) {
+                if px[3] < 128 {
+                    *o = self.trans_idx;
+                    has_alpha = true;
+                } else {
+                    *o = self.nearest.lookup_cached(cache, px[0], px[1], px[2]);
+                }
             }
         }
         has_alpha
     }
 
-    fn quantize_bayer(&self, rgba: &[u8], w: usize, h: usize, out: &mut [u8]) -> bool {
+    fn quantize_bayer(&self, src: &crate::color::RowSource, w: usize, h: usize, scratch: &mut QuantScratch, out: &mut [u8]) -> bool {
         let mut has_alpha = false;
+        let cache = &mut scratch.cache;
         for y in 0..h {
-            let row = &rgba[y * w * 4..(y + 1) * w * 4];
+            src.fill_row(y, &mut scratch.row);
+            let row = &scratch.row[..];
             let orow = &mut out[y * w..(y + 1) * w];
             let brow = &BAYER8[y & 7];
             for (x, (px, o)) in row.chunks_exact(4).zip(orow.iter_mut()).enumerate() {
@@ -78,21 +104,31 @@ impl<'a> Quantizer<'a> {
                 let r = (px[0] as i32 + t).clamp(0, 255) as u8;
                 let g = (px[1] as i32 + t).clamp(0, 255) as u8;
                 let b = (px[2] as i32 + t).clamp(0, 255) as u8;
-                *o = self.lookup(r, g, b);
+                *o = self.nearest.lookup_cached(cache, r, g, b);
             }
         }
         has_alpha
     }
 
-    fn quantize_diffuse(&self, rgba: &[u8], w: usize, h: usize, out: &mut [u8], fs: bool) -> bool {
+    fn quantize_diffuse(
+        &self,
+        src: &crate::color::RowSource,
+        w: usize,
+        h: usize,
+        scratch: &mut QuantScratch,
+        out: &mut [u8],
+        fs: bool,
+    ) -> bool {
         let mut has_alpha = false;
+        let cache = &mut scratch.cache;
         // next-row error buffer with one pad cell on each side
         let mut next: Vec<[i32; 3]> = vec![[0; 3]; w + 2];
         let mut cur: Vec<[i32; 3]> = vec![[0; 3]; w + 2];
         for y in 0..h {
             std::mem::swap(&mut cur, &mut next);
             next.iter_mut().for_each(|e| *e = [0; 3]);
-            let row = &rgba[y * w * 4..(y + 1) * w * 4];
+            src.fill_row(y, &mut scratch.row);
+            let row = &scratch.row[..];
             let orow = &mut out[y * w..(y + 1) * w];
             let mut carry = [0i32; 3]; // error flowing rightward within the row
             for (x, (px, o)) in row.chunks_exact(4).zip(orow.iter_mut()).enumerate() {
@@ -106,7 +142,7 @@ impl<'a> Quantizer<'a> {
                 let r = (px[0] as i32 + carry[0] + e[0]).clamp(0, 255);
                 let g = (px[1] as i32 + carry[1] + e[1]).clamp(0, 255);
                 let b = (px[2] as i32 + carry[2] + e[2]).clamp(0, 255);
-                let idx = self.lookup(r as u8, g as u8, b as u8);
+                let idx = self.nearest.lookup_cached(cache, r as u8, g as u8, b as u8);
                 *o = idx;
                 let c = &self.colors[idx as usize];
                 let er = r - c[0] as i32;
@@ -159,9 +195,12 @@ mod tests {
         let colors = vec![[0u8, 0, 0], [255, 255, 255], [255, 0, 0]];
         let nm = NearestMap::build(&colors);
         let q = Quantizer { colors: &colors, nearest: &nm, trans_idx: 3 };
-        let rgba = [255u8, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 0];
+        let rgba = vec![255u8, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 0];
+        let frame = crate::input::Frame::Rgba(rgba);
+        let src = crate::color::RowSource::new(&frame, 4, 1, None);
         let mut out = [9u8; 4];
-        let has_alpha = q.quantize(&rgba, 4, 1, Dither::None, &mut out);
+        let mut scratch = QuantScratch::new(4);
+        let has_alpha = q.quantize(&src, 4, 1, Dither::None, &mut scratch, &mut out);
         assert!(has_alpha);
         assert_eq!(out, [2, 0, 1, 3]);
     }
@@ -177,8 +216,12 @@ mod tests {
             let c = &colors[i % 2];
             rgba.extend_from_slice(&[c[0], c[1], c[2], 255]);
         }
+        let rgba = rgba;
         let mut out = vec![0u8; 64];
-        q.quantize(&rgba, 8, 8, Dither::Sierra2_4a, &mut out);
+        let frame = crate::input::Frame::Rgba(rgba);
+        let src = crate::color::RowSource::new(&frame, 8, 8, None);
+        let mut scratch = QuantScratch::new(8);
+        q.quantize(&src, 8, 8, Dither::Sierra2_4a, &mut scratch, &mut out);
         for (i, &o) in out.iter().enumerate() {
             assert_eq!(o as usize, i % 2);
         }
