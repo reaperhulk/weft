@@ -53,7 +53,7 @@ impl<'a> RowSource<'a> {
 
 #[inline]
 fn fill_row_yuv(buf: &[u8], w: usize, h: usize, chroma: Chroma, y: usize, out: &mut [u8]) {
-    let cw = (w + 1) / 2;
+    let cw = w.div_ceil(2);
     match chroma {
         Chroma::Mono => {
             let yrow = &buf[y * w..y * w + w];
@@ -66,7 +66,7 @@ fn fill_row_yuv(buf: &[u8], w: usize, h: usize, chroma: Chroma, y: usize, out: &
             }
         }
         Chroma::C420 => {
-            let ch = (h + 1) / 2;
+            let ch = h.div_ceil(2);
             let (yp, rest) = buf.split_at(w * h);
             let (up, vp) = rest.split_at(cw * ch);
             let crow = (y >> 1) * cw;
@@ -120,6 +120,7 @@ fn convert_row(yrow: &[u8], urow: &[u8], vrow: &[u8], cx_shift: u32, out: &mut [
 }
 
 /// Convert a whole stored frame to RGBA (tests and non-hot paths).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn frame_to_rgba(frame: &Frame, w: usize, h: usize, chroma: Option<Chroma>, out: &mut [u8]) {
     let src = RowSource::new(frame, w, h, chroma);
     for y in 0..h {

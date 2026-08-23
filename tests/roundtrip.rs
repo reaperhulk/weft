@@ -244,7 +244,7 @@ fn roundtrip_exact_with_delta_frames() {
 fn duplicate_frames_fold_delays() {
     let (w, h) = (32usize, 32usize);
     // 3 identical frames then a different one, then identical again
-    let solid = |c: [u8; 4]| -> Vec<u8> { std::iter::repeat(c).take(w * h).flatten().collect() };
+    let solid = |c: [u8; 4]| -> Vec<u8> { std::iter::repeat_n(c, w * h).flatten().collect() };
     let a = solid([10, 200, 10, 255]);
     let b = solid([200, 10, 10, 255]);
     let mut raw = Vec::new();
@@ -263,8 +263,7 @@ fn duplicate_frames_fold_delays() {
 #[test]
 fn no_loop_flag_drops_extension() {
     let (w, h) = (16usize, 16usize);
-    let raw: Vec<u8> = std::iter::repeat([1u8, 2, 3, 255])
-        .take(w * h)
+    let raw: Vec<u8> = std::iter::repeat_n([1u8, 2, 3, 255], w * h)
         .flatten()
         .collect();
     let gif = run_weft(&["--size", "16x16", "--no-loop"], &raw);

@@ -247,7 +247,7 @@ pub mod tests {
         // long runs grow codes to max width without noise
         let mut data = Vec::new();
         for i in 0..64u32 {
-            data.extend(std::iter::repeat((i % 7) as u8).take(10_000));
+            data.extend(std::iter::repeat_n((i % 7) as u8, 10_000));
         }
         roundtrip(&data);
     }

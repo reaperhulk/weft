@@ -157,8 +157,8 @@ fn make_box(bins: &[HBin], start: usize, len: usize) -> Box_ {
     let mut sum = [0f64; 3];
     for b in slice {
         count += b.count as u64;
-        for c in 0..3 {
-            sum[c] += b.count as f64 * b.lab[c] as f64;
+        for (s, &l) in sum.iter_mut().zip(&b.lab) {
+            *s += b.count as f64 * l as f64;
         }
     }
     let mean = [
@@ -241,7 +241,7 @@ pub fn median_cut(entries: &[(u32, u32)], max_colors: usize) -> Vec<[u8; 3]> {
             slice.sort_unstable_by(by_axis);
         }
         // count-weighted median split (>=1 color on each side)
-        let median = (total + 1) / 2;
+        let median = total.div_ceil(2);
         let mut acc = 0u64;
         let mut split = len - 1;
         for (i, b) in slice[..len - 1].iter().enumerate() {
@@ -275,8 +275,8 @@ pub fn median_cut(entries: &[(u32, u32)], max_colors: usize) -> Vec<[u8; 3]> {
                 if b.count > dominant.count {
                     dominant = b;
                 }
-                for c in 0..3 {
-                    sum[c] += b.count as f64 * b.lab[c] as f64;
+                for (s, &l) in sum.iter_mut().zip(&b.lab) {
+                    *s += b.count as f64 * l as f64;
                 }
             }
             // Same reasoning when one color overwhelms the box: the weighted
@@ -393,6 +393,8 @@ impl NearestMap {
         self.cands.len() as f32 / GRID_SIZE as f32
     }
 
+    /// Uncached lookup (tests; `lookup_cached` is the hot path).
+    #[cfg_attr(not(test), allow(dead_code))]
     #[inline(always)]
     pub fn lookup(&self, r: u8, g: u8, b: u8) -> u8 {
         let key = grid_key(r, g, b);

@@ -12,8 +12,8 @@ pub enum Chroma {
 
 impl Chroma {
     pub fn frame_bytes(self, w: usize, h: usize) -> usize {
-        let cw = (w + 1) / 2;
-        let ch = (h + 1) / 2;
+        let cw = w.div_ceil(2);
+        let ch = h.div_ceil(2);
         match self {
             Chroma::C420 => w * h + 2 * cw * ch,
             Chroma::C422 => w * h + 2 * cw * h,

@@ -16,8 +16,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
+      # excessive_precision is allowed via [lints.clippy] in Cargo.toml —
+      # the OkLab coefficients keep their reference-precision digits
+      - run: cargo clippy --release --all-targets -- -D warnings
       - run: cargo test --release
 
   static:

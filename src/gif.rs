@@ -21,6 +21,7 @@ pub const DISPOSAL_BACKGROUND: u8 = 2;
 /// exactly the indexed frame i-1, so the delta for frame i only needs frame
 /// i-1 — every frame can encode in parallel. `prev == None` means keyframe
 /// (first frame, or delta disabled because the source has alpha).
+#[allow(clippy::too_many_arguments)]
 pub fn encode_frame(
     idx: &[u8],
     prev: Option<&[u8]>,
