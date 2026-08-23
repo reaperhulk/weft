@@ -59,6 +59,7 @@ struct Args {
     lossy: u32,
     threads: Option<usize>,
     stats: bool,
+    compress: bool,
 }
 
 #[derive(PartialEq)]
@@ -91,6 +92,9 @@ options:
                      encoding of the quantized frames; ~30 is subtle and
                      much smaller on dithered content)
   --no-loop          play once (no NETSCAPE extension)
+  --no-compress      buffer frames raw in memory instead of LZ4-packing
+                     them between passes (output is identical; raises
+                     peak memory, mainly for benchmarking the tradeoff)
   --threads N        worker threads             (default: all cores)
   --stats            print timing breakdown to stderr
 ";
@@ -106,6 +110,7 @@ fn parse_args() -> Result<Args, String> {
         lossy: 0,
         threads: None,
         stats: false,
+        compress: true,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -165,6 +170,7 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--no-loop" => a.loop_count = None,
+            "--no-compress" => a.compress = false,
             "--threads" => {
                 a.threads = Some(val("--threads")?.parse().map_err(|_| "bad --threads")?)
             }
@@ -346,7 +352,7 @@ fn run(args: &Args) -> io::Result<()> {
                         spilled.lock().unwrap().push(run);
                         hist = palette::ColorHist::new();
                     }
-                    frames.push((i, StoredFrame::pack(f)));
+                    frames.push((i, StoredFrame::pack(f, args.compress)));
                     (hist, frames, row, alpha)
                 },
             )

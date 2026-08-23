@@ -48,19 +48,22 @@ pub struct StoredFrame {
 }
 
 impl StoredFrame {
-    pub fn pack(frame: Frame) -> StoredFrame {
+    /// `compress: false` stores the frame raw (the `--no-compress`
+    /// benchmarking path).
+    pub fn pack(frame: Frame, compress: bool) -> StoredFrame {
         let (Frame::Rgba(raw) | Frame::Yuv(raw)) = frame;
-        let data = lz4_flex::block::compress(&raw);
-        if data.len() < raw.len() {
-            StoredFrame {
-                data,
-                raw_len: raw.len(),
+        if compress {
+            let data = lz4_flex::block::compress(&raw);
+            if data.len() < raw.len() {
+                return StoredFrame {
+                    data,
+                    raw_len: raw.len(),
+                };
             }
-        } else {
-            StoredFrame {
-                raw_len: raw.len(),
-                data: raw,
-            }
+        }
+        StoredFrame {
+            raw_len: raw.len(),
+            data: raw,
         }
     }
 

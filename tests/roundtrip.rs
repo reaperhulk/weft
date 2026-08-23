@@ -243,6 +243,17 @@ fn roundtrip_exact_with_delta_frames() {
 }
 
 #[test]
+fn no_compress_output_identical() {
+    // --no-compress only changes how frames are buffered between passes;
+    // the emitted GIF must be byte-identical.
+    let (w, h, n) = (64usize, 48usize, 12usize);
+    let (raw, _) = synth_frames(w, h, n);
+    let a = run_weft(&["--size", "64x48", "--fps", "20"], &raw);
+    let b = run_weft(&["--size", "64x48", "--fps", "20", "--no-compress"], &raw);
+    assert_eq!(a, b);
+}
+
+#[test]
 fn duplicate_frames_fold_delays() {
     let (w, h) = (32usize, 32usize);
     // 3 identical frames then a different one, then identical again
