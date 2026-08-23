@@ -1,0 +1,16 @@
+[package]
+name = "weft"
+version = "0.1.0"
+edition = "2021"
+description = "Fast parallel GIF encoder: raw RGBA or yuv4mpegpipe on stdin, GIF on stdout"
+
+[dependencies]
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+[profile.bench-fast]
+inherits = "release"
