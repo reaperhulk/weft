@@ -149,6 +149,14 @@ pub struct LzwEncoder {
     table: Vec<u64>,
     gen: u16,
     scratch: Vec<u8>,
+    // Lossy-only: per-prefix-code bitmap of which symbols continue it in
+    // the dictionary (4 x u64 per code), generation-stamped per code so a
+    // dictionary clear costs nothing. Most trie nodes have no or one
+    // child, and most substitution candidates aren't children, so the DFS
+    // tests a bit instead of paying a hash probe (and a diff) per
+    // candidate.
+    child_gen: Vec<u16>,
+    child_bits: Vec<u64>,
 }
 
 impl Default for LzwEncoder {
@@ -157,6 +165,8 @@ impl Default for LzwEncoder {
             table: vec![u64::MAX; TABLE_SIZE],
             gen: 0,
             scratch: Vec::new(),
+            child_gen: vec![0; MAX_CODE as usize],
+            child_bits: vec![0; MAX_CODE as usize * 4],
         }
     }
 }
@@ -196,7 +206,9 @@ impl LzwEncoder {
         self.gen = self.gen.wrapping_add(1);
         if self.gen == 0 {
             // generation counter wrapped: hard reset to avoid stale hits
+            // (gen is never 0 afterwards, so 0 stamps are always stale)
             self.table.iter_mut().for_each(|e| *e = u64::MAX);
+            self.child_gen.iter_mut().for_each(|g| *g = 0);
             self.gen = 1;
         }
     }
@@ -379,6 +391,14 @@ impl LzwEncoder {
                 if let Err(slot) = self.probe(gen, (best.code << 8) | data[pos] as u32) {
                     let key = (best.code << 8) | data[pos] as u32;
                     self.table[slot] = ((gen as u64) << 40) | ((key as u64) << 16) | next as u64;
+                    // mirror the new child link into the DFS bitmap
+                    let p = best.code as usize;
+                    let sym = data[pos] as usize;
+                    if self.child_gen[p] != gen {
+                        self.child_gen[p] = gen;
+                        self.child_bits[p * 4..p * 4 + 4].fill(0);
+                    }
+                    self.child_bits[p * 4 + (sym >> 6)] |= 1u64 << (sym & 63);
                     if next == (1 << width) {
                         width += 1;
                     }
@@ -398,6 +418,10 @@ impl LzwEncoder {
         bw.flush();
     }
 
+    /// Returns true when the search is finished for good: a zero-error
+    /// match reaching the end of the data can't be beaten (nothing is
+    /// longer, and equal length needs strictly lower error), so the whole
+    /// DFS unwinds immediately.
     #[allow(clippy::too_many_arguments)]
     fn lossy_dfs(
         &self,
@@ -410,7 +434,7 @@ impl LzwEncoder {
         visits: &mut u32,
         best: &mut LossyBest,
         map: &LossyMap,
-    ) {
+    ) -> bool {
         // Longest match wins; equal length prefers lower total error.
         if pos > best.end || (pos == best.end && accum < best.diff) {
             *best = LossyBest {
@@ -418,26 +442,44 @@ impl LzwEncoder {
                 end: pos,
                 diff: accum,
             };
+            if pos >= data.len() && accum == 0 {
+                return true;
+            }
         }
         if pos >= data.len() || *visits == 0 {
-            return;
+            return false;
         }
         *visits -= 1;
+        // Leaf cut and bitmap gate: skipping a symbol the node has no
+        // child for is exactly what a missed hash probe would do, minus
+        // the probe (and, for candidates, minus the diff computation).
+        let p = node_code as usize;
+        if self.child_gen[p] != gen {
+            return false;
+        }
+        let cb = &self.child_bits[p * 4..p * 4 + 4];
         let b = data[pos];
         // Exact continuation: zero cost, dither decays.
-        if let Ok(code) = self.probe(gen, (node_code << 8) | b as u32) {
-            let nd = map.next_dither(b, b, &dither);
-            self.lossy_dfs(gen, data, pos + 1, code, nd, accum, visits, best, map);
+        if cb[(b >> 6) as usize] & (1u64 << (b & 63)) != 0 {
+            if let Ok(code) = self.probe(gen, (node_code << 8) | b as u32) {
+                let nd = map.next_dither(b, b, &dither);
+                if self.lossy_dfs(gen, data, pos + 1, code, nd, accum, visits, best, map) {
+                    return true;
+                }
+            }
         }
         if b != map.trans_idx {
             for &b2 in map.candidates(b) {
+                if cb[(b2 >> 6) as usize] & (1u64 << (b2 & 63)) == 0 {
+                    continue;
+                }
                 let d = map.diff(b, b2, &dither);
                 if d > map.max_diff {
                     continue;
                 }
                 if let Ok(code) = self.probe(gen, (node_code << 8) | b2 as u32) {
                     let nd = map.next_dither(b, b2, &dither);
-                    self.lossy_dfs(
+                    if self.lossy_dfs(
                         gen,
                         data,
                         pos + 1,
@@ -447,10 +489,13 @@ impl LzwEncoder {
                         visits,
                         best,
                         map,
-                    );
+                    ) {
+                        return true;
+                    }
                 }
             }
         }
+        false
     }
 }
 
