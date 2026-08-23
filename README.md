@@ -103,6 +103,27 @@ vs 2.65/1.52/1.86 per RGB channel on `testsrc`.
 ³ Sources with ≤255 distinct colors get a bit-exact (lossless) palette
 from both encoders.
 
+### Lossy mode
+
+`weft --lossy 30` against the standard two-tool pipeline — the ffmpeg
+encode above piped through `gifsicle -O3 --lossy=30` (gifsicle 1.94),
+timed as the sum of both stages:
+
+| clip      | pipeline          | time (s) | size (KB) | PSNR (dB) | SSIM  |
+|-----------|-------------------|---------:|----------:|----------:|------:|
+| testsrc   | ffmpeg + gifsicle | 7.9      | 1975      | 39.17     | 0.940 |
+| testsrc   | weft --lossy 30   | **0.29** | 2047      | 38.61²    | 0.874²|
+| big (720p)| ffmpeg + gifsicle | 63.5     | 11854     | 41.02     | 0.974 |
+| big (720p)| weft --lossy 30   | **1.81** | 11932     | 40.55²    | 0.891²|
+| mandel    | ffmpeg + gifsicle | 28.3     | 11734     | 30.91     | 0.854 |
+| mandel    | weft --lossy 30   | **1.42** | 12064     | 30.13     | 0.833 |
+| gradients | ffmpeg + gifsicle | 4.1      | 663       | 47.63     | 0.989 |
+| gradients | weft --lossy 30   | **0.57** | 663       | 42.63²    | 0.990 |
+
+**7–35× faster than the two-tool pipeline**, at sizes within 3% and
+quality within the dither-default and reference-decoder gaps above (the
+weft rows inherit footnote ²).
+
 Reproduce with:
 
 ```sh
