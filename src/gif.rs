@@ -95,16 +95,14 @@ pub fn encode_frame(
             // (gifsicle -O2/-O3 behavior). Transparency-punching wins when
             // changes are sparse; plain opaque wins when punching would
             // shatter smooth runs into fragments (e.g. animated gradients).
-            let mut punched = Vec::with_capacity(sw * sh);
+            let level = crate::simdops::level();
+            let mut punched = vec![0u8; sw * sh];
             let mut plain = Vec::with_capacity(sw * sh);
-            for y in y0..=y1 {
+            let mut trans_count = 0usize;
+            for (orow, y) in punched.chunks_exact_mut(sw).zip(y0..=y1) {
                 let a = &idx[y * w + x0..y * w + x1 + 1];
                 let b = &prev[y * w + x0..y * w + x1 + 1];
-                punched.extend(
-                    a.iter()
-                        .zip(b)
-                        .map(|(&p, &q)| if p == q { trans_idx } else { p }),
-                );
+                trans_count += crate::simdops::punch_row(level, a, b, trans_idx, orow);
                 plain.extend_from_slice(a);
             }
             let descriptor_len = body.len();
@@ -112,7 +110,6 @@ pub fn encode_frame(
             // Skip the opaque attempt when the rect is almost entirely
             // transparent — punching always wins there, and sparse-change
             // frames dominate typical animations.
-            let trans_count = punched.iter().filter(|&&p| p == trans_idx).count();
             if trans_count * 10 < punched.len() * 9 {
                 let mut alt = Vec::new();
                 enc.encode(min_code_size, &plain, lossy, &mut alt);

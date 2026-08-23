@@ -3,7 +3,7 @@
 
 #[allow(unused_imports)]
 use fearless_simd::prelude::*;
-use fearless_simd::{f32x8, i32x8, u32x8, u8x16, Level, Simd};
+use fearless_simd::{f32x16, f32x8, i32x8, u32x8, u8x16, Level, Simd};
 use std::sync::OnceLock;
 
 /// Runtime-detected SIMD level, cached (feature detection once).
@@ -99,11 +99,9 @@ fn convert_group<S: Simd>(
     let g = ((c + d * CGU + e * CGV + ROUND) >> 16u32).max(zero).min(hi);
     let b = ((c + d * CBU + ROUND) >> 16u32).max(zero).min(hi);
     let px = r | (g << 8u32) | (b << 16u32) | ALPHA;
-    let mut tmp = [0i32; 8];
-    px.store_slice(&mut tmp);
-    for (dst, v) in out.as_chunks_mut::<4>().0.iter_mut().zip(tmp) {
-        *dst = v.to_le_bytes();
-    }
+    // lane bytes in LE order are exactly the RGBA byte layout
+    let bytes: fearless_simd::u8x32<S> = px.bitcast();
+    bytes.store_slice(out);
 }
 
 /// Vectorized fast cube root for 8 non-negative lanes: shift-series
@@ -160,6 +158,50 @@ fn corner_rmax2_impl<S: Simd>(
     arr.iter().fold(0f32, |m, &v| m.max(v)) * 1.0002
 }
 
+/// Fill `out` with the transparency-punched delta of one row (`trans`
+/// where cur == prev, else cur) and return how many bytes were punched.
+/// Palette indices never collide with `trans` (it's the reserved slot),
+/// so the punched count equals the equal-byte count.
+pub fn punch_row(level: Level, cur: &[u8], prev: &[u8], trans: u8, out: &mut [u8]) -> usize {
+    fearless_simd::dispatch!(level, simd => punch_row_impl(simd, cur, prev, trans, out))
+}
+
+#[inline(always)]
+fn punch_row_impl<S: Simd>(simd: S, cur: &[u8], prev: &[u8], trans: u8, out: &mut [u8]) -> usize {
+    let n = cur.len();
+    let tv = u8x16::splat(simd, trans);
+    let ones = u8x16::splat(simd, 1);
+    let zeros = u8x16::splat(simd, 0);
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i + 16 <= n {
+        // inner loop bounded so the u8 lane counters can't wrap at 256
+        let mut acc = zeros;
+        let mut blocks = 0u32;
+        while i + 16 <= n && blocks < 128 {
+            let a = u8x16::from_slice(simd, &cur[i..i + 16]);
+            let b = u8x16::from_slice(simd, &prev[i..i + 16]);
+            let m = a.simd_eq(b);
+            m.select(tv, a).store_slice(&mut out[i..i + 16]);
+            acc += m.select(ones, zeros);
+            i += 16;
+            blocks += 1;
+        }
+        let arr: [u8; 16] = acc.into();
+        count += arr.iter().map(|&v| v as usize).sum::<usize>();
+    }
+    while i < n {
+        if cur[i] == prev[i] {
+            out[i] = trans;
+            count += 1;
+        } else {
+            out[i] = cur[i];
+        }
+        i += 1;
+    }
+    count
+}
+
 /// Palette OkLab channels in structure-of-arrays form, padded to a
 /// multiple of 8 lanes with +inf (padding never wins a min and never
 /// passes a <= bound test).
@@ -171,7 +213,7 @@ pub struct PalSoa {
 
 impl PalSoa {
     pub fn new(labs: &[[f32; 3]]) -> Self {
-        let padded = labs.len().div_ceil(8) * 8;
+        let padded = labs.len().div_ceil(16) * 16;
         let mut l = vec![f32::INFINITY; padded];
         let mut a = vec![f32::INFINITY; padded];
         let mut b = vec![f32::INFINITY; padded];
@@ -193,22 +235,22 @@ pub fn cell_distances(level: Level, pal: &PalSoa, q: [f32; 3], dists: &mut [f32]
 
 #[inline(always)]
 fn cell_distances_impl<S: Simd>(simd: S, pal: &PalSoa, q: [f32; 3], dists: &mut [f32]) -> f32 {
-    let ql = f32x8::splat(simd, q[0]);
-    let qa = f32x8::splat(simd, q[1]);
-    let qb = f32x8::splat(simd, q[2]);
-    let mut minv = f32x8::splat(simd, f32::MAX);
+    let ql = f32x16::splat(simd, q[0]);
+    let qa = f32x16::splat(simd, q[1]);
+    let qb = f32x16::splat(simd, q[2]);
+    let mut minv = f32x16::splat(simd, f32::MAX);
     let n = pal.l.len();
     let mut i = 0;
     while i < n {
-        let dl = f32x8::from_slice(simd, &pal.l[i..i + 8]) - ql;
-        let da = f32x8::from_slice(simd, &pal.a[i..i + 8]) - qa;
-        let db = f32x8::from_slice(simd, &pal.b[i..i + 8]) - qb;
+        let dl = f32x16::from_slice(simd, &pal.l[i..i + 16]) - ql;
+        let da = f32x16::from_slice(simd, &pal.a[i..i + 16]) - qa;
+        let db = f32x16::from_slice(simd, &pal.b[i..i + 16]) - qb;
         let d = dl * dl + da * da + db * db;
-        d.store_slice(&mut dists[i..i + 8]);
+        d.store_slice(&mut dists[i..i + 16]);
         minv = minv.min(d);
-        i += 8;
+        i += 16;
     }
-    let arr: [f32; 8] = minv.into();
+    let arr: [f32; 16] = minv.into();
     arr.iter().fold(f32::MAX, |m, &v| m.min(v))
 }
 

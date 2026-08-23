@@ -233,25 +233,135 @@ fn axis_key(b: &HBin, axis: usize) -> u64 {
 /// Find the count-weighted median split of a box without sorting it:
 /// returns (s, k) where s is the smallest prefix length (in key order)
 /// whose count sum exceeds `median`, and k is the s-th smallest key.
-/// Quickselect-style ping-pong partitioning: expected O(len), vs the
-/// O(len log len) comparator sort it replaces.
-type KeyCount = (u64, u32);
+/// Quickselect-style partitioning: expected O(len), vs the O(len log len)
+/// comparator sort it replaces. Keys and counts travel as parallel arrays
+/// so the AVX-512 path can compress-store eight elements per instruction;
+/// elements below the pivot stream into the spare buffer while the rest
+/// compact in place (the write cursor never passes the read cursor). The
+/// result is value-defined — the smallest prefix in key order whose count
+/// sum exceeds `median`, and the key at that boundary — so pivot choices
+/// and intermediate elemenet order never affect the outcome.
+///
+/// One partition round: `< pivot` goes to (ko, co) from index 0, the rest
+/// compacts in place at (kc, cc); returns the left count and its weight.
+fn partition_scalar(
+    kc: &mut [u64],
+    cc: &mut [u32],
+    ko: &mut [u64],
+    co: &mut [u32],
+    pivot: u64,
+) -> (usize, u64) {
+    let n = kc.len();
+    let mut l = 0usize;
+    let mut r = 0usize;
+    let mut wl = 0u64;
+    for i in 0..n {
+        let k = kc[i];
+        let c = cc[i];
+        let less = k < pivot;
+        // cmov-friendly: unconditional store on each side's cursor
+        ko[l] = k;
+        co[l] = c;
+        kc[r] = k;
+        cc[r] = c;
+        l += less as usize;
+        r += !less as usize;
+        wl += c as u64 * less as u64;
+    }
+    (l, wl)
+}
 
-fn weighted_split(pairs: &mut [KeyCount], tmp: &mut [KeyCount], median: u64) -> (usize, u64) {
-    let mut in_cur = true; // current range lives in `pairs` (else `tmp`)
-    let mut start = 0usize;
-    let mut n = pairs.len();
+/// AVX-512 partition round: 8 keys per iteration via masked
+/// compress-stores. Same contract as `partition_scalar`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vl")]
+unsafe fn partition_avx512(
+    kc: &mut [u64],
+    cc: &mut [u32],
+    ko: &mut [u64],
+    co: &mut [u32],
+    pivot: u64,
+) -> (usize, u64) {
+    use std::arch::x86_64::*;
+    let n = kc.len();
+    let kcp = kc.as_mut_ptr();
+    let ccp = cc.as_mut_ptr();
+    let kop = ko.as_mut_ptr();
+    let cop = co.as_mut_ptr();
+    let pv = _mm512_set1_epi64(pivot as i64);
+    let mut l = 0usize;
+    let mut r = 0usize;
+    let mut wacc = _mm512_setzero_si512();
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let kv = _mm512_loadu_si512(kcp.add(i) as *const _);
+        let cv = _mm256_loadu_si256(ccp.add(i) as *const _);
+        let m = _mm512_cmplt_epu64_mask(kv, pv);
+        _mm512_mask_compressstoreu_epi64(kop.add(l) as *mut _, m, kv);
+        _mm256_mask_compressstoreu_epi32(cop.add(l) as *mut _, m, cv);
+        _mm512_mask_compressstoreu_epi64(kcp.add(r) as *mut _, !m, kv);
+        _mm256_mask_compressstoreu_epi32(ccp.add(r) as *mut _, !m, cv);
+        wacc = _mm512_add_epi64(wacc, _mm512_maskz_cvtepu32_epi64(m, cv));
+        let lc = m.count_ones() as usize;
+        l += lc;
+        r += 8 - lc;
+        i += 8;
+    }
+    let mut wl = _mm512_reduce_add_epi64(wacc) as u64;
+    while i < n {
+        let k = *kcp.add(i);
+        let c = *ccp.add(i);
+        if k < pivot {
+            *kop.add(l) = k;
+            *cop.add(l) = c;
+            l += 1;
+            wl += c as u64;
+        } else {
+            *kcp.add(r) = k;
+            *ccp.add(r) = c;
+            r += 1;
+        }
+        i += 1;
+    }
+    (l, wl)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn has_avx512() -> bool {
+    use std::sync::OnceLock;
+    static B: OnceLock<bool> = OnceLock::new();
+    *B.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+    })
+}
+
+fn weighted_split(
+    keys: &mut [u64],
+    counts: &mut [u32],
+    tkeys: &mut [u64],
+    tcounts: &mut [u32],
+    median: u64,
+) -> (usize, u64) {
+    let mut in_cur = true; // current range lives in `keys` (else `tkeys`)
+    let mut n = keys.len();
     let mut base = 0usize; // elements finalized to the left of the range
     let mut acc = 0u64; // their count sum
     loop {
-        // Invariant: acc <= median and the boundary lies inside the range.
-        let (cur, other): (&mut [KeyCount], &mut [KeyCount]) = if in_cur {
-            (&mut *pairs, &mut *tmp)
+        // Invariant: acc <= median and the boundary lies inside the range,
+        // which always starts at index 0 of its buffer (both partition
+        // outputs are written from the front).
+        let (kc, ko, cc, co) = if in_cur {
+            (&mut *keys, &mut *tkeys, &mut *counts, &mut *tcounts)
         } else {
-            (&mut *tmp, &mut *pairs)
+            (&mut *tkeys, &mut *keys, &mut *tcounts, &mut *counts)
         };
         if n <= 64 {
-            let sub = &mut cur[start..start + n];
+            let mut sub = [(0u64, 0u32); 64];
+            for (s, (&k, &c)) in sub.iter_mut().zip(kc[..n].iter().zip(&cc[..n])) {
+                *s = (k, c);
+            }
+            let sub = &mut sub[..n];
             sub.sort_unstable();
             for (i, &(k, c)) in sub.iter().enumerate() {
                 acc += c as u64;
@@ -263,34 +373,48 @@ fn weighted_split(pairs: &mut [KeyCount], tmp: &mut [KeyCount], median: u64) -> 
         }
         // Median-of-3 pivot on unique keys: strictly above the range min,
         // so the left side is never empty and every round shrinks.
-        let a = cur[start].0;
-        let b = cur[start + n / 2].0;
-        let c = cur[start + n - 1].0;
+        let a = kc[0];
+        let b = kc[n / 2];
+        let c = kc[n - 1];
         let pivot = a.max(b).min(a.min(b).max(c));
-        // Branchless two-way partition into the other buffer:
-        // [< pivot | >= pivot]. The destination index is selected with a
-        // cmov, so random keys don't stall the pipeline on mispredicts.
-        let mut l = start;
-        let mut r = start + n;
-        let mut wl = 0u64;
-        for &e in cur.iter().skip(start).take(n) {
-            let less = e.0 < pivot;
-            let dst = if less { l } else { r - 1 };
-            other[dst] = e;
-            l += less as usize;
-            r -= !less as usize;
-            wl += e.1 as u64 * less as u64;
-        }
-        let nleft = l - start;
-        if acc + wl > median {
-            n = nleft;
+        #[cfg(target_arch = "x86_64")]
+        let (nleft, wl) = if has_avx512() {
+            unsafe {
+                partition_avx512(
+                    &mut kc[..n],
+                    &mut cc[..n],
+                    &mut ko[..n],
+                    &mut co[..n],
+                    pivot,
+                )
+            }
         } else {
+            partition_scalar(
+                &mut kc[..n],
+                &mut cc[..n],
+                &mut ko[..n],
+                &mut co[..n],
+                pivot,
+            )
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let (nleft, wl) = partition_scalar(
+            &mut kc[..n],
+            &mut cc[..n],
+            &mut ko[..n],
+            &mut co[..n],
+            pivot,
+        );
+        if acc + wl > median {
+            // left side lives in the other buffer
+            n = nleft;
+            in_cur = !in_cur;
+        } else {
+            // right side compacted in place in the current buffer
             acc += wl;
             base += nleft;
-            start = l;
             n -= nleft;
         }
-        in_cur = !in_cur;
     }
 }
 
@@ -327,8 +451,10 @@ pub fn median_cut(entries: &[(u32, u32)], max_colors: usize) -> Vec<[u8; 3]> {
         .collect();
 
     let n = bins.len();
-    let mut sel_pairs: Vec<(u64, u32)> = vec![(0, 0); n];
-    let mut sel_tmp: Vec<(u64, u32)> = vec![(0, 0); n];
+    let mut sel_keys: Vec<u64> = vec![0; n];
+    let mut sel_counts: Vec<u32> = vec![0; n];
+    let mut tmp_keys: Vec<u64> = vec![0; n];
+    let mut tmp_counts: Vec<u32> = vec![0; n];
     let mut part_scratch: Vec<HBin> = vec![bins[0]; n];
     let mut boxes: Vec<Box_> = vec![make_box(&bins, 0, n)];
     while boxes.len() < max_colors {
@@ -349,10 +475,21 @@ pub fn median_cut(entries: &[(u32, u32)], max_colors: usize) -> Vec<[u8; 3]> {
         // tiebreak in the key gives a total order, so the split set is
         // exactly what the old full sort produced.
         let median = total.div_ceil(2);
-        for (p, b) in sel_pairs[..len].iter_mut().zip(slice.iter()) {
-            *p = (axis_key(b, axis), b.count);
+        for ((k, c), b) in sel_keys[..len]
+            .iter_mut()
+            .zip(&mut sel_counts[..len])
+            .zip(slice.iter())
+        {
+            *k = axis_key(b, axis);
+            *c = b.count;
         }
-        let (s, kbound) = weighted_split(&mut sel_pairs[..len], &mut sel_tmp[..len], median);
+        let (s, kbound) = weighted_split(
+            &mut sel_keys[..len],
+            &mut sel_counts[..len],
+            &mut tmp_keys[..len],
+            &mut tmp_counts[..len],
+            median,
+        );
         let (split, kbound) = if s >= len {
             // Boundary would be the whole box (its max-key color holds half
             // the weight): clamp to len-1 like the sorted scan did, i.e.
@@ -693,6 +830,38 @@ mod tests {
         assert_eq!(e5, 4);
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn partition_impls_agree() {
+        if !has_avx512() {
+            return;
+        }
+        let mut x = 7u32;
+        let mut rng = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for n in [1usize, 7, 8, 9, 64, 65, 200, 513] {
+            let keys: Vec<u64> = (0..n).map(|i| ((rng() as u64) << 20) | i as u64).collect();
+            let counts: Vec<u32> = (0..n).map(|_| 1 + rng() % 100).collect();
+            let pivot = keys[rng() as usize % n];
+            let (mut ka, mut ca) = (keys.clone(), counts.clone());
+            let (mut kb, mut cb) = (keys.clone(), counts.clone());
+            let mut oa = (vec![0u64; n], vec![0u32; n]);
+            let mut ob = (vec![0u64; n], vec![0u32; n]);
+            let (la, wa) = partition_scalar(&mut ka, &mut ca, &mut oa.0, &mut oa.1, pivot);
+            let (lb, wb) =
+                unsafe { partition_avx512(&mut kb, &mut cb, &mut ob.0, &mut ob.1, pivot) };
+            assert_eq!((la, wa), (lb, wb), "n {n}");
+            assert_eq!(oa.0[..la], ob.0[..lb]);
+            assert_eq!(oa.1[..la], ob.1[..lb]);
+            assert_eq!(ka[..n - la], kb[..n - lb]);
+            assert_eq!(ca[..n - la], cb[..n - lb]);
+        }
+    }
+
     #[test]
     fn weighted_split_matches_sorted_scan() {
         let mut x = 42u32;
@@ -725,8 +894,11 @@ mod tests {
                     break;
                 }
             }
-            let mut tmp = vec![(0u64, 0u32); n];
-            let (s, k) = weighted_split(&mut pairs, &mut tmp, median);
+            let mut keys: Vec<u64> = pairs.iter().map(|&(k, _)| k).collect();
+            let mut counts: Vec<u32> = pairs.iter().map(|&(_, c)| c).collect();
+            let mut tkeys = vec![0u64; n];
+            let mut tcounts = vec![0u32; n];
+            let (s, k) = weighted_split(&mut keys, &mut counts, &mut tkeys, &mut tcounts, median);
             assert_eq!(s, want, "case {case} n {n}");
             if s < n {
                 assert_eq!(k, sorted[s - 1].0, "boundary key, case {case}");
