@@ -318,7 +318,9 @@ fn run(args: &Args) -> io::Result<()> {
 
     // ---- palette + nearest-color map --------------------------------------
     let t2 = Instant::now();
+    let n_entries = entries.len();
     let colors = palette::median_cut(&entries, args.colors - 1);
+    let t_mc = t2.elapsed();
     drop(entries);
     let trans_idx = colors.len() as u8;
     let slots = colors.len() + 1;
@@ -328,9 +330,11 @@ fn run(args: &Args) -> io::Result<()> {
     let t_pal = t2.elapsed();
     if args.stats {
         eprintln!(
-            "  palette: {} colors, nearest-map avg candidates/cell {:.2}",
+            "  palette: {} colors from {} entries, nearest-map avg candidates/cell {:.2}, median_cut {:?}",
             colors.len(),
-            nearest.avg_candidates()
+            n_entries,
+            nearest.avg_candidates(),
+            t_mc
         );
     }
 

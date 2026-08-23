@@ -213,6 +213,86 @@ fn make_box(bins: &[HBin], start: usize, len: usize) -> Box_ {
     }
 }
 
+/// Packed split key: sortable-f32 of lab[axis] in the high bits, srgb
+/// tiebreak in the low 24. Unsigned order on the key equals
+/// `lab[axis].partial_cmp(..).then(srgb.cmp(..))` — keys are unique
+/// because srgb values are.
+#[inline(always)]
+fn axis_key(b: &HBin, axis: usize) -> u64 {
+    // +0.0 folds -0.0 onto +0.0 so key order matches partial_cmp, which
+    // treats the two zeros as equal (the srgb tiebreak decides there).
+    let bits = (b.lab[axis] + 0.0).to_bits();
+    let sortable = if bits & 0x8000_0000 != 0 {
+        !bits
+    } else {
+        bits | 0x8000_0000
+    };
+    ((sortable as u64) << 24) | b.srgb as u64
+}
+
+/// Find the count-weighted median split of a box without sorting it:
+/// returns (s, k) where s is the smallest prefix length (in key order)
+/// whose count sum exceeds `median`, and k is the s-th smallest key.
+/// Quickselect-style ping-pong partitioning: expected O(len), vs the
+/// O(len log len) comparator sort it replaces.
+fn weighted_split(pairs: &mut [(u64, u32)], tmp: &mut [(u64, u32)], median: u64) -> (usize, u64) {
+    let mut in_cur = true; // current range lives in `pairs` (else `tmp`)
+    let mut start = 0usize;
+    let mut n = pairs.len();
+    let mut base = 0usize; // elements finalized to the left of the range
+    let mut acc = 0u64; // their count sum
+    loop {
+        // Invariant: acc <= median and the boundary lies inside the range.
+        let (cur, other): (&mut [(u64, u32)], &mut [(u64, u32)]) = if in_cur {
+            (&mut *pairs, &mut *tmp)
+        } else {
+            (&mut *tmp, &mut *pairs)
+        };
+        if n <= 64 {
+            let sub = &mut cur[start..start + n];
+            sub.sort_unstable();
+            for (i, &(k, c)) in sub.iter().enumerate() {
+                acc += c as u64;
+                if acc > median {
+                    return (base + i + 1, k);
+                }
+            }
+            unreachable!("weighted median boundary outside range");
+        }
+        // Median-of-3 pivot on unique keys: strictly above the range min,
+        // so the left side is never empty and every round shrinks.
+        let a = cur[start].0;
+        let b = cur[start + n / 2].0;
+        let c = cur[start + n - 1].0;
+        let pivot = a.max(b).min(a.min(b).max(c));
+        // Branchless two-way partition into the other buffer:
+        // [< pivot | >= pivot]. The destination index is selected with a
+        // cmov, so random keys don't stall the pipeline on mispredicts.
+        let mut l = start;
+        let mut r = start + n;
+        let mut wl = 0u64;
+        for k in start..start + n {
+            let e = cur[k];
+            let less = e.0 < pivot;
+            let dst = if less { l } else { r - 1 };
+            other[dst] = e;
+            l += less as usize;
+            r -= !less as usize;
+            wl += e.1 as u64 * less as u64;
+        }
+        let nleft = l - start;
+        if acc + wl > median {
+            n = nleft;
+        } else {
+            acc += wl;
+            base += nleft;
+            start = l;
+            n -= nleft;
+        }
+        in_cur = !in_cur;
+    }
+}
+
 /// Variance median cut over exact colors. Returns at most `max_colors`.
 pub fn median_cut(entries: &[(u32, u32)], max_colors: usize) -> Vec<[u8; 3]> {
     if entries.is_empty() {
@@ -226,6 +306,16 @@ pub fn median_cut(entries: &[(u32, u32)], max_colors: usize) -> Vec<[u8; 3]> {
             .collect();
     }
     let cv = LabConverter::new();
+    // Canonicalize the entries order (histogram layout depends on merge
+    // order): boxes are only partitioned below, never sorted, so this
+    // initial srgb order is what makes every later float sum — and thus
+    // the palette — independent of thread scheduling.
+    let mut entries = entries.to_vec();
+    if entries.len() > 16384 {
+        entries.par_sort_unstable();
+    } else {
+        entries.sort_unstable();
+    }
     let mut bins: Vec<HBin> = entries
         .par_iter()
         .map(|&(c, n)| HBin {
@@ -236,6 +326,9 @@ pub fn median_cut(entries: &[(u32, u32)], max_colors: usize) -> Vec<[u8; 3]> {
         .collect();
 
     let n = bins.len();
+    let mut sel_pairs: Vec<(u64, u32)> = vec![(0, 0); n];
+    let mut sel_tmp: Vec<(u64, u32)> = vec![(0, 0); n];
+    let mut part_scratch: Vec<HBin> = vec![bins[0]; n];
     let mut boxes: Vec<Box_> = vec![make_box(&bins, 0, n)];
     while boxes.len() < max_colors {
         let mut best: Option<usize> = None;
@@ -250,30 +343,48 @@ pub fn median_cut(entries: &[(u32, u32)], max_colors: usize) -> Vec<[u8; 3]> {
             (b.start, b.len, b.cut_axis, b.count)
         };
         let slice = &mut bins[start..start + len];
-        // srgb tiebreak gives a total order: the split (and thus the final
-        // palette) never depends on input or thread-scheduling order
-        let by_axis = |a: &HBin, b: &HBin| {
-            a.lab[axis]
-                .partial_cmp(&b.lab[axis])
-                .unwrap()
-                .then(a.srgb.cmp(&b.srgb))
-        };
-        if len > 16384 {
-            slice.par_sort_unstable_by(by_axis);
-        } else {
-            slice.sort_unstable_by(by_axis);
-        }
-        // count-weighted median split (>=1 color on each side)
+        // Count-weighted median split (>=1 color on each side), located by
+        // selection over packed keys instead of sorting the box. The srgb
+        // tiebreak in the key gives a total order, so the split set is
+        // exactly what the old full sort produced.
         let median = total.div_ceil(2);
-        let mut acc = 0u64;
-        let mut split = len - 1;
-        for (i, b) in slice[..len - 1].iter().enumerate() {
-            acc += b.count as u64;
-            if acc > median {
-                split = (i + 1).max(1);
-                break;
-            }
+        for (p, b) in sel_pairs[..len].iter_mut().zip(slice.iter()) {
+            *p = (axis_key(b, axis), b.count);
         }
+        let (s, kbound) = weighted_split(&mut sel_pairs[..len], &mut sel_tmp[..len], median);
+        let (split, kbound) = if s >= len {
+            // Boundary would be the whole box (its max-key color holds half
+            // the weight): clamp to len-1 like the sorted scan did, i.e.
+            // split just below the maximum key (= at the second-largest).
+            let mut k1 = 0u64;
+            let mut k2 = 0u64;
+            for b in slice.iter() {
+                let k = axis_key(b, axis);
+                if k > k1 {
+                    k2 = k1;
+                    k1 = k;
+                } else if k > k2 {
+                    k2 = k;
+                }
+            }
+            (len - 1, k2)
+        } else {
+            (s, kbound)
+        };
+        // Stable partition around the boundary key: both halves keep the
+        // canonical srgb order, so downstream sums stay deterministic.
+        let scratch = &mut part_scratch[..len];
+        let mut lo = 0usize;
+        let mut hi = split;
+        for b in slice.iter() {
+            let left = axis_key(b, axis) <= kbound;
+            let dst = if left { lo } else { hi };
+            scratch[dst] = *b;
+            lo += left as usize;
+            hi += !left as usize;
+        }
+        debug_assert_eq!(lo, split);
+        slice.copy_from_slice(scratch);
         let right = make_box(&bins, start + split, len - split);
         boxes[bi] = make_box(&bins, start, split);
         boxes.push(right);
@@ -436,14 +547,35 @@ impl NearestMap {
             return d;
         }
         let color = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
-        let slot = (color.wrapping_mul(0x9E37_79B1) >> 16) as usize;
-        if cache.keys[slot] == color {
-            return cache.vals[slot];
+        let slot = (color.wrapping_mul(0x9E37_79B1) >> 18) as usize;
+        let e = cache.slots[slot];
+        // the e != MAX guard keeps the empty sentinel (color 0xFFFFFF,
+        // index 0xFF) from false-hitting on white
+        if e >> 8 == color && e != u32::MAX {
+            return e as u8;
         }
         let idx = self.resolve_cell(key, r, g, b);
-        cache.keys[slot] = color;
-        cache.vals[slot] = idx;
+        cache.slots[slot] = (color << 8) | idx as u32;
         idx
+    }
+
+    /// Prefetch the fast-path cell for a color a few pixels ahead of the
+    /// current one: the direct[] table is 256KB, and on colorful content
+    /// the dependent load is what stalls the quantize loops. The raw
+    /// (pre-dither) color is close enough to the adjusted one to land on
+    /// the right cache line almost always.
+    #[inline(always)]
+    pub fn prefetch(&self, r: u8, g: u8, b: u8) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let key = grid_key(r, g, b);
+            _mm_prefetch(self.direct.as_ptr().add(key) as *const i8, _MM_HINT_T0);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (r, g, b);
+        }
     }
 
     #[inline(never)]
@@ -455,7 +587,7 @@ impl NearestMap {
 
     #[inline(always)]
     fn resolve(&self, cands: &[u8], r: u8, g: u8, b: u8) -> u8 {
-        let q = self.cv.srgb_to_oklab(r, g, b);
+        let q = self.cv.srgb_to_oklab_fast(r, g, b);
         let mut best = cands[0];
         let mut best_d = f32::MAX;
         for &i in cands {
@@ -469,17 +601,18 @@ impl NearestMap {
     }
 }
 
-/// Direct-mapped memo cache for multi-candidate nearest lookups (64K slots).
+/// Direct-mapped memo cache for multi-candidate nearest lookups (64K
+/// slots). Key and value share one u32 (color << 8 | palette index) so a
+/// probe touches a single cache line: palettes cap at 255 colors, so a
+/// real index never exceeds 254 and u32::MAX can mark empty slots.
 pub struct IdxCache {
-    keys: Vec<u32>,
-    vals: Vec<u8>,
+    slots: Vec<u32>,
 }
 
 impl Default for IdxCache {
     fn default() -> Self {
         IdxCache {
-            keys: vec![u32::MAX; 1 << 16],
-            vals: vec![0; 1 << 16],
+            slots: vec![u32::MAX; 1 << 14],
         }
     }
 }
@@ -555,6 +688,47 @@ mod tests {
         h.add(5, 3);
         let e5 = h.entries().iter().find(|&&(k, _)| k == 5).unwrap().1;
         assert_eq!(e5, 4);
+    }
+
+    #[test]
+    fn weighted_split_matches_sorted_scan() {
+        let mut x = 42u32;
+        let mut rng = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for case in 0..200 {
+            let n = 2 + (rng() % 500) as usize;
+            let mut pairs: Vec<(u64, u32)> = (0..n)
+                .map(|i| {
+                    let heavy = case % 3 == 0 && i == n - 1;
+                    let w = if heavy { 1_000_000 } else { 1 + rng() % 50 };
+                    ((rng() as u64) << 20 | i as u64, w) // unique keys
+                })
+                .collect();
+            let total: u64 = pairs.iter().map(|&(_, c)| c as u64).sum();
+            let median = total.div_ceil(2);
+            // reference: sort + prefix scan
+            let mut sorted = pairs.clone();
+            sorted.sort_unstable();
+            let mut acc = 0u64;
+            let mut want = n;
+            for (i, &(_, c)) in sorted.iter().enumerate() {
+                acc += c as u64;
+                if acc > median {
+                    want = i + 1;
+                    break;
+                }
+            }
+            let mut tmp = vec![(0u64, 0u32); n];
+            let (s, k) = weighted_split(&mut pairs, &mut tmp, median);
+            assert_eq!(s, want, "case {case} n {n}");
+            if s < n {
+                assert_eq!(k, sorted[s - 1].0, "boundary key, case {case}");
+            }
+        }
     }
 
     #[test]

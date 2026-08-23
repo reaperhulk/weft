@@ -31,21 +31,49 @@ impl LabConverter {
 
     #[inline(always)]
     pub fn srgb_to_oklab(&self, r: u8, g: u8, b: u8) -> [f32; 3] {
+        self.srgb_to_oklab_with(r, g, b, f32::cbrt)
+    }
+
+    /// `srgb_to_oklab` with the fast cube root — for per-pixel hot paths.
+    #[inline(always)]
+    pub fn srgb_to_oklab_fast(&self, r: u8, g: u8, b: u8) -> [f32; 3] {
+        self.srgb_to_oklab_with(r, g, b, cbrt_fast)
+    }
+
+    #[inline(always)]
+    fn srgb_to_oklab_with(&self, r: u8, g: u8, b: u8, cbrt: impl Fn(f32) -> f32) -> [f32; 3] {
         let lr = self.lut[r as usize];
         let lg = self.lut[g as usize];
         let lb = self.lut[b as usize];
         let l = 0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb;
         let m = 0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb;
         let s = 0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb;
-        let l_ = l.cbrt();
-        let m_ = m.cbrt();
-        let s_ = s.cbrt();
+        let l_ = cbrt(l);
+        let m_ = cbrt(m);
+        let s_ = cbrt(s);
         [
             0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
             1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
             0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,
         ]
     }
+}
+
+/// Fast cube root for non-negative finite f32: Kahan-style bit-trick seed
+/// plus two Halley iterations (cubic convergence), landing within a couple
+/// of ULPs of libm's cbrtf at a fraction of the cost. Used on hot paths
+/// where the OkLab *geometry* matters but correctly-rounded rounding does
+/// not (nearest-color argmins; candidate bounds carry an explicit margin).
+#[inline(always)]
+pub fn cbrt_fast(x: f32) -> f32 {
+    let mut y = f32::from_bits(x.to_bits() / 3 + 709_921_077);
+    // Halley: y <- y * (y^3 + 2x) / (2y^3 + x); at x == 0 this decays y
+    // toward zero, so no special case is needed.
+    let y3 = y * y * y;
+    y *= (y3 + 2.0 * x) / (2.0 * y3 + x);
+    let y3 = y * y * y;
+    y *= (y3 + 2.0 * x) / (2.0 * y3 + x);
+    y
 }
 
 pub fn oklab_to_srgb(lab: [f32; 3]) -> [u8; 3] {
@@ -94,6 +122,20 @@ mod tests {
                     "{c:?} -> {back:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn cbrt_fast_accuracy() {
+        // seed quality + two Halley steps must land within a few ULPs
+        for i in 0..=100_000u32 {
+            let x = i as f32 / 100_000.0;
+            let got = cbrt_fast(x);
+            let want = x.cbrt();
+            assert!(
+                (got - want).abs() <= want * 1e-6 + 1e-9,
+                "cbrt_fast({x}) = {got}, libm {want}"
+            );
         }
     }
 

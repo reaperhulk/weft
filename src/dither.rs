@@ -34,10 +34,11 @@ pub struct Quantizer<'a> {
     pub trans_idx: u8,
 }
 
-/// Per-thread quantization scratch: RGBA row buffer + memo cache.
+/// Per-thread quantization scratch: RGBA row buffers + memo cache.
 pub struct QuantScratch {
     pub cache: crate::palette::IdxCache,
     row: Vec<u8>,
+    row2: Vec<u8>,
 }
 
 impl QuantScratch {
@@ -45,6 +46,7 @@ impl QuantScratch {
         QuantScratch {
             cache: crate::palette::IdxCache::default(),
             row: vec![0u8; w * 4],
+            row2: vec![0u8; w * 4],
         }
     }
 }
@@ -93,13 +95,11 @@ impl<'a> Quantizer<'a> {
             let row = &scratch.row[..];
             let orow = &mut out[y * w..(y + 1) * w];
             let mrow = &mask[(y & 63) << 6..((y & 63) << 6) + 64];
-            for (x, (px, o)) in row
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(orow.iter_mut())
-                .enumerate()
-            {
+            let pixels = row.as_chunks::<4>().0;
+            for (x, (px, o)) in pixels.iter().zip(orow.iter_mut()).enumerate() {
+                if let Some(pf) = pixels.get(x + 8) {
+                    self.nearest.prefetch(pf[0], pf[1], pf[2]);
+                }
                 if px[3] < 128 {
                     *o = self.trans_idx;
                     has_alpha = true;
@@ -151,7 +151,11 @@ impl<'a> Quantizer<'a> {
         for y in 0..h {
             src.fill_row(y, &mut scratch.row);
             let orow = &mut out[y * w..(y + 1) * w];
-            for (px, o) in scratch.row.as_chunks::<4>().0.iter().zip(orow.iter_mut()) {
+            let pixels = scratch.row.as_chunks::<4>().0;
+            for (x, (px, o)) in pixels.iter().zip(orow.iter_mut()).enumerate() {
+                if let Some(pf) = pixels.get(x + 8) {
+                    self.nearest.prefetch(pf[0], pf[1], pf[2]);
+                }
                 if px[3] < 128 {
                     *o = self.trans_idx;
                     has_alpha = true;
@@ -178,13 +182,11 @@ impl<'a> Quantizer<'a> {
             let row = &scratch.row[..];
             let orow = &mut out[y * w..(y + 1) * w];
             let brow = &BAYER8[y & 7];
-            for (x, (px, o)) in row
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(orow.iter_mut())
-                .enumerate()
-            {
+            let pixels = row.as_chunks::<4>().0;
+            for (x, (px, o)) in pixels.iter().zip(orow.iter_mut()).enumerate() {
+                if let Some(pf) = pixels.get(x + 8) {
+                    self.nearest.prefetch(pf[0], pf[1], pf[2]);
+                }
                 if px[3] < 128 {
                     *o = self.trans_idx;
                     has_alpha = true;
@@ -213,72 +215,121 @@ impl<'a> Quantizer<'a> {
     ) -> bool {
         let mut has_alpha = false;
         let cache = &mut scratch.cache;
-        // next-row error buffer with one pad cell on each side
-        let mut next: Vec<[i32; 3]> = vec![[0; 3]; w + 2];
-        let mut cur: Vec<[i32; 3]> = vec![[0; 3]; w + 2];
-        for y in 0..h {
-            std::mem::swap(&mut cur, &mut next);
-            next.iter_mut().for_each(|e| *e = [0; 3]);
-            src.fill_row(y, &mut scratch.row);
-            let row = &scratch.row[..];
-            let orow = &mut out[y * w..(y + 1) * w];
-            let mut carry = [0i32; 3]; // error flowing rightward within the row
-            for (x, (px, o)) in row
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(orow.iter_mut())
-                .enumerate()
-            {
+        // Error buffers flowing into rows y, y+1, y+2 (one pad cell each
+        // side). Rows are processed in stripes of two, interleaved with the
+        // lower row trailing the upper by two columns: pixel (x, y+1) only
+        // depends on row-y pixels up to column x+1 (both Sierra-2-4A and
+        // Floyd-Steinberg reach at most one column right on the row below),
+        // so the lag keeps the arithmetic — and thus the output — exactly
+        // the row-serial result while giving the CPU two independent
+        // dependency chains to overlap. Error diffusion's serial chain
+        // (clamp -> table lookup -> error -> next pixel) is what bounds
+        // this stage, so the second in-flight chain is nearly free.
+        let mut err_a: Vec<[i32; 3]> = vec![[0; 3]; w + 2];
+        let mut err_b: Vec<[i32; 3]> = vec![[0; 3]; w + 2];
+        let mut err_c: Vec<[i32; 3]> = vec![[0; 3]; w + 2];
+        let mut row_a = std::mem::take(&mut scratch.row);
+        let mut row_b = std::mem::take(&mut scratch.row2);
+
+        macro_rules! step {
+            ($x:expr, $pixels:expr, $carry:expr, $cur:ident, $next:ident, $o:expr) => {{
+                let x: usize = $x;
+                let px = &$pixels[x];
+                if let Some(pf) = $pixels.get(x + 8) {
+                    self.nearest.prefetch(pf[0], pf[1], pf[2]);
+                }
                 if px[3] < 128 {
-                    *o = self.trans_idx;
+                    $o = self.trans_idx;
                     has_alpha = true;
-                    carry = [0; 3];
-                    continue;
-                }
-                let e = &cur[x + 1];
-                let r = (px[0] as i32 + carry[0] + e[0]).clamp(0, 255);
-                let g = (px[1] as i32 + carry[1] + e[1]).clamp(0, 255);
-                let b = (px[2] as i32 + carry[2] + e[2]).clamp(0, 255);
-                let idx = self.nearest.lookup_cached(cache, r as u8, g as u8, b as u8);
-                *o = idx;
-                let c = &self.colors[idx as usize];
-                let er = r - c[0] as i32;
-                let eg = g - c[1] as i32;
-                let eb = b - c[2] as i32;
-                if fs {
-                    // Floyd–Steinberg: 7/16 right, 3/16 down-left, 5/16 down, 1/16 down-right
-                    carry = [er * 7 / 16, eg * 7 / 16, eb * 7 / 16];
-                    let dl = &mut next[x];
-                    dl[0] += er * 3 / 16;
-                    dl[1] += eg * 3 / 16;
-                    dl[2] += eb * 3 / 16;
-                    let d = &mut next[x + 1];
-                    d[0] += er * 5 / 16;
-                    d[1] += eg * 5 / 16;
-                    d[2] += eb * 5 / 16;
-                    let dr = &mut next[x + 2];
-                    dr[0] += er / 16;
-                    dr[1] += eg / 16;
-                    dr[2] += eb / 16;
+                    $carry = [0; 3];
                 } else {
-                    // Sierra-2-4A: 2/4 right, 1/4 down-left, 1/4 down.
-                    // Truncating division (like ffmpeg's `err*scale/(1<<n)`)
-                    // — an arithmetic shift would round negative errors
-                    // toward -inf and diffuse more than 100% of the error,
-                    // which diverges into noise.
-                    carry = [er / 2, eg / 2, eb / 2];
-                    let dl = &mut next[x];
-                    dl[0] += er / 4;
-                    dl[1] += eg / 4;
-                    dl[2] += eb / 4;
-                    let d = &mut next[x + 1];
-                    d[0] += er / 4;
-                    d[1] += eg / 4;
-                    d[2] += eb / 4;
+                    let e = &$cur[x + 1];
+                    let r = (px[0] as i32 + $carry[0] + e[0]).clamp(0, 255);
+                    let g = (px[1] as i32 + $carry[1] + e[1]).clamp(0, 255);
+                    let b = (px[2] as i32 + $carry[2] + e[2]).clamp(0, 255);
+                    let idx = self.nearest.lookup_cached(cache, r as u8, g as u8, b as u8);
+                    $o = idx;
+                    let c = &self.colors[idx as usize];
+                    let er = r - c[0] as i32;
+                    let eg = g - c[1] as i32;
+                    let eb = b - c[2] as i32;
+                    if fs {
+                        // Floyd–Steinberg: 7/16 right, 3/16 down-left,
+                        // 5/16 down, 1/16 down-right
+                        $carry = [er * 7 / 16, eg * 7 / 16, eb * 7 / 16];
+                        let dl = &mut $next[x];
+                        dl[0] += er * 3 / 16;
+                        dl[1] += eg * 3 / 16;
+                        dl[2] += eb * 3 / 16;
+                        let d = &mut $next[x + 1];
+                        d[0] += er * 5 / 16;
+                        d[1] += eg * 5 / 16;
+                        d[2] += eb * 5 / 16;
+                        let dr = &mut $next[x + 2];
+                        dr[0] += er / 16;
+                        dr[1] += eg / 16;
+                        dr[2] += eb / 16;
+                    } else {
+                        // Sierra-2-4A: 2/4 right, 1/4 down-left, 1/4 down.
+                        // Truncating division (like ffmpeg's
+                        // `err*scale/(1<<n)`) — an arithmetic shift would
+                        // round negative errors toward -inf and diffuse
+                        // more than 100% of the error, which diverges
+                        // into noise.
+                        $carry = [er / 2, eg / 2, eb / 2];
+                        let dl = &mut $next[x];
+                        dl[0] += er / 4;
+                        dl[1] += eg / 4;
+                        dl[2] += eb / 4;
+                        let d = &mut $next[x + 1];
+                        d[0] += er / 4;
+                        d[1] += eg / 4;
+                        d[2] += eb / 4;
+                    }
                 }
+            }};
+        }
+
+        let mut y = 0usize;
+        while y < h {
+            if y + 1 < h {
+                // stripe of two rows, interleaved at a two-column lag
+                err_b.iter_mut().for_each(|e| *e = [0; 3]);
+                err_c.iter_mut().for_each(|e| *e = [0; 3]);
+                src.fill_row(y, &mut row_a);
+                src.fill_row(y + 1, &mut row_b);
+                let pa = row_a.as_chunks::<4>().0;
+                let pb = row_b.as_chunks::<4>().0;
+                let (oa, ob) = out[y * w..(y + 2) * w].split_at_mut(w);
+                let mut carry_a = [0i32; 3];
+                let mut carry_b = [0i32; 3];
+                for xa in 0..w + 2 {
+                    if xa < w {
+                        step!(xa, pa, carry_a, err_a, err_b, oa[xa]);
+                    }
+                    if xa >= 2 {
+                        let xb = xa - 2;
+                        step!(xb, pb, carry_b, err_b, err_c, ob[xb]);
+                    }
+                }
+                // errors into row y+2 become the next stripe's incoming set
+                std::mem::swap(&mut err_a, &mut err_c);
+                y += 2;
+            } else {
+                // odd final row: plain serial pass
+                err_b.iter_mut().for_each(|e| *e = [0; 3]);
+                src.fill_row(y, &mut row_a);
+                let pa = row_a.as_chunks::<4>().0;
+                let orow = &mut out[y * w..(y + 1) * w];
+                let mut carry = [0i32; 3];
+                for x in 0..w {
+                    step!(x, pa, carry, err_a, err_b, orow[x]);
+                }
+                y += 1;
             }
         }
+        scratch.row = row_a;
+        scratch.row2 = row_b;
         has_alpha
     }
 }
