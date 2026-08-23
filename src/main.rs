@@ -54,10 +54,11 @@ options:
   --format F         auto | rgba | y4m          (default: auto)
   --colors N         max palette colors, 2-256  (default: 256; one slot is
                      reserved for transparency, so 256 means 255 colors)
-  --dither D         sierra2 | fs | bluenoise | bayer | none
-                     (default: sierra2; bluenoise is faster, temporally
-                     stable, and compresses better at slightly lower
-                     visual quality)
+  --dither D         bluenoise | sierra2 | fs | bayer | none
+                     (default: bluenoise: fast, temporally stable, and
+                     compresses well; sierra2 error diffusion trades
+                     speed and stability for slightly higher visual
+                     quality)
   --loop N           loop count, 0 = forever    (default: 0)
   --lossy N          lossy LZW compression, 0-200 (default: 0 = lossless
                      encoding of the quantized frames; ~30 is subtle and
@@ -73,7 +74,7 @@ fn parse_args() -> Result<Args, String> {
         fps: None,
         format: Format::Auto,
         colors: 256,
-        dither: Dither::Sierra2_4a,
+        dither: Dither::BlueNoise,
         loop_count: Some(0),
         lossy: 0,
         threads: None,
