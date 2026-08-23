@@ -445,7 +445,6 @@ fn run(args: &Args) -> io::Result<()> {
     // restore-to-background disposal (any_alpha comes from pass 1).
     let t3 = Instant::now();
     let quant = Quantizer {
-        colors: &colors,
         nearest: &nearest,
         trans_idx,
     };
