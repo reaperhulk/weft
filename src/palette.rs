@@ -113,7 +113,7 @@ impl ColorHist {
 pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8]) {
     let mut last: u32 = u32::MAX;
     let mut run: u32 = 0;
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         if px[3] < 128 {
             continue;
         }

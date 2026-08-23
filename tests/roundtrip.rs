@@ -214,7 +214,9 @@ fn synth_frames(w: usize, h: usize, n: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
         }
         rgbs.push(
             frame
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .flat_map(|p| [p[0], p[1], p[2]])
                 .collect(),
         );

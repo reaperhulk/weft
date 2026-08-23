@@ -79,7 +79,7 @@ impl<'a> Quantizer<'a> {
         for y in 0..h {
             src.fill_row(y, &mut scratch.row);
             let orow = &mut out[y * w..(y + 1) * w];
-            for (px, o) in scratch.row.chunks_exact(4).zip(orow.iter_mut()) {
+            for (px, o) in scratch.row.as_chunks::<4>().0.iter().zip(orow.iter_mut()) {
                 if px[3] < 128 {
                     *o = self.trans_idx;
                     has_alpha = true;
@@ -106,7 +106,13 @@ impl<'a> Quantizer<'a> {
             let row = &scratch.row[..];
             let orow = &mut out[y * w..(y + 1) * w];
             let brow = &BAYER8[y & 7];
-            for (x, (px, o)) in row.chunks_exact(4).zip(orow.iter_mut()).enumerate() {
+            for (x, (px, o)) in row
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(orow.iter_mut())
+                .enumerate()
+            {
                 if px[3] < 128 {
                     *o = self.trans_idx;
                     has_alpha = true;
@@ -145,7 +151,13 @@ impl<'a> Quantizer<'a> {
             let row = &scratch.row[..];
             let orow = &mut out[y * w..(y + 1) * w];
             let mut carry = [0i32; 3]; // error flowing rightward within the row
-            for (x, (px, o)) in row.chunks_exact(4).zip(orow.iter_mut()).enumerate() {
+            for (x, (px, o)) in row
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(orow.iter_mut())
+                .enumerate()
+            {
                 if px[3] < 128 {
                     *o = self.trans_idx;
                     has_alpha = true;

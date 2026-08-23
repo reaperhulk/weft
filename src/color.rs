@@ -57,7 +57,7 @@ fn fill_row_yuv(buf: &[u8], w: usize, h: usize, chroma: Chroma, y: usize, out: &
     match chroma {
         Chroma::Mono => {
             let yrow = &buf[y * w..y * w + w];
-            for (dst, &yy) in out.chunks_exact_mut(4).zip(yrow.iter()) {
+            for (dst, &yy) in out.as_chunks_mut::<4>().0.iter_mut().zip(yrow.iter()) {
                 let g = clamp8((CY * (yy as i32 - 16) + ROUND) >> 16);
                 dst[0] = g;
                 dst[1] = g;
@@ -107,7 +107,7 @@ fn fill_row_yuv(buf: &[u8], w: usize, h: usize, chroma: Chroma, y: usize, out: &
 
 #[inline(always)]
 fn convert_row(yrow: &[u8], urow: &[u8], vrow: &[u8], cx_shift: u32, out: &mut [u8]) {
-    for (x, dst) in out.chunks_exact_mut(4).enumerate() {
+    for (x, dst) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let cx = x >> cx_shift;
         let c = CY * (yrow[x] as i32 - 16);
         let d = urow[cx] as i32 - 128;
