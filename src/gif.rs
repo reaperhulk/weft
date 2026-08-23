@@ -2,6 +2,7 @@
 //! per-frame body encoding, and the sequential muxer.
 
 use crate::lzw::{LossyMap, LzwEncoder};
+use std::io::{self, Write};
 
 pub struct EncodedFrame {
     /// Delay in centiseconds (patched at mux time when duplicate frames merge).
@@ -141,31 +142,31 @@ pub struct MuxParams<'a> {
     pub loop_count: Option<u16>,
 }
 
-/// Write the full GIF stream. Consecutive empty-body frames fold their
-/// delays into the previous visible frame.
-pub fn mux(params: &MuxParams, frames: &[EncodedFrame], out: &mut Vec<u8>) {
-    // exact preallocation: header+GCT+loop ext, then per visible frame an
-    // 8-byte graphic control extension plus its body, and the trailer
-    let fixed = 13 + 3 * (1 << params.gct_bits) + 19 + 1;
-    out.reserve(fixed + frames.iter().map(|f| 8 + f.body.len()).sum::<usize>());
-    out.extend_from_slice(b"GIF89a");
-    out.extend_from_slice(&(params.width as u16).to_le_bytes());
-    out.extend_from_slice(&(params.height as u16).to_le_bytes());
-    out.push(0x80 | 0x70 | (params.gct_bits - 1)); // GCT flag, 8-bit color res, size
-    out.push(0); // background color index
-    out.push(0); // aspect
+/// Write the full GIF stream directly to `out` (frame bodies are already
+/// LZW-compressed, so streaming them avoids holding a second full copy of
+/// the output). Consecutive empty-body frames fold their delays into the
+/// previous visible frame.
+pub fn mux<W: Write>(params: &MuxParams, frames: &[EncodedFrame], out: &mut W) -> io::Result<()> {
+    let mut head = Vec::with_capacity(13 + 3 * (1 << params.gct_bits) + 19);
+    head.extend_from_slice(b"GIF89a");
+    head.extend_from_slice(&(params.width as u16).to_le_bytes());
+    head.extend_from_slice(&(params.height as u16).to_le_bytes());
+    head.push(0x80 | 0x70 | (params.gct_bits - 1)); // GCT flag, 8-bit color res, size
+    head.push(0); // background color index
+    head.push(0); // aspect
     let gct_len = 1usize << params.gct_bits;
     for i in 0..gct_len {
         let c = params.colors.get(i).copied().unwrap_or([0, 0, 0]);
-        out.extend_from_slice(&c);
+        head.extend_from_slice(&c);
     }
     if let Some(loops) = params.loop_count {
-        out.extend_from_slice(&[0x21, 0xFF, 0x0B]);
-        out.extend_from_slice(b"NETSCAPE2.0");
-        out.extend_from_slice(&[0x03, 0x01]);
-        out.extend_from_slice(&loops.to_le_bytes());
-        out.push(0);
+        head.extend_from_slice(&[0x21, 0xFF, 0x0B]);
+        head.extend_from_slice(b"NETSCAPE2.0");
+        head.extend_from_slice(&[0x03, 0x01]);
+        head.extend_from_slice(&loops.to_le_bytes());
+        head.push(0);
     }
+    out.write_all(&head)?;
 
     // Fold empty frames' delays forward into the previous visible frame.
     let mut delays: Vec<u32> = Vec::with_capacity(frames.len());
@@ -187,13 +188,21 @@ pub fn mux(params: &MuxParams, frames: &[EncodedFrame], out: &mut Vec<u8>) {
             continue;
         }
         // graphic control extension
-        out.extend_from_slice(&[0x21, 0xF9, 0x04, (f.disposal << 2) | 0x01]);
-        out.extend_from_slice(&(delay as u16).to_le_bytes());
-        out.push(params.trans_idx);
-        out.push(0);
-        out.extend_from_slice(&f.body);
+        let d = (delay as u16).to_le_bytes();
+        let gce = [
+            0x21,
+            0xF9,
+            0x04,
+            (f.disposal << 2) | 0x01,
+            d[0],
+            d[1],
+            params.trans_idx,
+            0,
+        ];
+        out.write_all(&gce)?;
+        out.write_all(&f.body)?;
     }
-    out.push(0x3B);
+    out.write_all(&[0x3B])
 }
 
 /// Per-frame delay in centiseconds via error-free accumulation:

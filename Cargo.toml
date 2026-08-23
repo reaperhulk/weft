@@ -7,12 +7,17 @@ license = "Apache-2.0"
 
 [dependencies]
 fearless_simd = "0.7.0"
+lz4_flex = { version = "0.14.0", default-features = false, features = ["std"] }
 rayon = "1.10"
 
 # musl's malloc is slow under multithreaded allocation; swap it out so the
-# static binary matches the glibc build's speed
+# static binary matches the glibc build's speed. The sys crate's `extended`
+# feature exposes mi_option_set, used at startup to make mimalloc return
+# freed memory promptly (see main.rs) — without it the static binary's peak
+# RSS runs far above the glibc build's.
 [target.'cfg(target_env = "musl")'.dependencies]
-mimalloc = { version = "0.1", default-features = false }
+mimalloc = { version = "0.1", default-features = false, features = ["extended"] }
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
 
 [lints.clippy]
 # The OkLab coefficients deliberately carry the reference implementation's

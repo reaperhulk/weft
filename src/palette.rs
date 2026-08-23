@@ -90,12 +90,9 @@ impl ColorHist {
         }
     }
 
-    pub fn merge(&mut self, other: &ColorHist) {
-        for (&k, &c) in other.keys.iter().zip(other.counts.iter()) {
-            if k != EMPTY {
-                self.add(k, c);
-            }
-        }
+    /// Number of distinct colors held.
+    pub fn len(&self) -> usize {
+        self.len
     }
 
     pub fn entries(&self) -> Vec<(u32, u32)> {
@@ -108,17 +105,21 @@ impl ColorHist {
     }
 }
 
-/// Accumulate one RGBA frame. Pixels with alpha < 128 are skipped.
+/// Accumulate one RGBA frame. Pixels with alpha < 128 are skipped; returns
+/// true when any were, so the pipeline knows the disposal mode (and thus
+/// whether delta encoding is possible) before quantization starts.
 /// Run-length batching keeps hash traffic low on flat content.
-pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8]) {
+pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8]) -> bool {
     let pixels = rgba.as_chunks::<4>().0;
     let n = pixels.len();
+    let mut has_alpha = false;
     let mut last: u32 = u32::MAX;
     let mut run: u32 = 0;
     let mut i = 0usize;
     while i < n {
         let px = pixels[i];
         if px[3] < 128 {
+            has_alpha = true;
             i += 1;
             continue;
         }
@@ -154,6 +155,7 @@ pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8]) {
     if run > 0 {
         hist.add(last, run);
     }
+    has_alpha
 }
 
 // ---------------------------------------------------------------------------
