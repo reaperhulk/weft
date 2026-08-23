@@ -1,7 +1,7 @@
 //! GIF stream assembly: inter-frame delta (transparency + bbox crop),
 //! per-frame body encoding, and the sequential muxer.
 
-use crate::lzw::LzwEncoder;
+use crate::lzw::{LossyMap, LzwEncoder};
 
 pub struct EncodedFrame {
     /// Delay in centiseconds (patched at mux time when duplicate frames merge).
@@ -31,6 +31,7 @@ pub fn encode_frame(
     min_code_size: u8,
     delay_cs: u32,
     disposal: u8,
+    lossy: Option<&LossyMap>,
     enc: &mut LzwEncoder,
 ) -> EncodedFrame {
     let mut body = Vec::new();
@@ -74,20 +75,7 @@ pub fn encode_frame(
                     x1 = x1.max(last);
                 }
             }
-            // Build sub-image with unchanged pixels replaced by transparency.
-            let sw = x1 - x0 + 1;
-            let sh = y1 - y0 + 1;
-            let mut sub = Vec::with_capacity(sw * sh);
-            for y in y0..=y1 {
-                let a = &idx[y * w + x0..y * w + x1 + 1];
-                let b = &prev[y * w + x0..y * w + x1 + 1];
-                sub.extend(
-                    a.iter()
-                        .zip(b)
-                        .map(|(&p, &q)| if p == q { trans_idx } else { p }),
-                );
-            }
-            (x0, y0, x1, y1, Some(sub))
+            (x0, y0, x1, y1, Some(prev))
         }
     };
 
@@ -101,9 +89,35 @@ pub fn encode_frame(
     body.extend_from_slice(&(sh as u16).to_le_bytes());
     body.push(0); // no local color table, not interlaced
 
-    match &sub {
-        Some(s) => enc.encode(min_code_size, s, &mut body),
-        None => enc.encode(min_code_size, idx, &mut body),
+    match sub {
+        Some(prev) => {
+            // Encode the changed rect both ways and keep the smaller
+            // (gifsicle -O2/-O3 behavior). Transparency-punching wins when
+            // changes are sparse; plain opaque wins when punching would
+            // shatter smooth runs into fragments (e.g. animated gradients).
+            let mut punched = Vec::with_capacity(sw * sh);
+            let mut plain = Vec::with_capacity(sw * sh);
+            for y in y0..=y1 {
+                let a = &idx[y * w + x0..y * w + x1 + 1];
+                let b = &prev[y * w + x0..y * w + x1 + 1];
+                punched.extend(
+                    a.iter()
+                        .zip(b)
+                        .map(|(&p, &q)| if p == q { trans_idx } else { p }),
+                );
+                plain.extend_from_slice(a);
+            }
+            let descriptor_len = body.len();
+            let mut alt = Vec::new();
+            enc.encode(min_code_size, &punched, lossy, &mut body);
+            enc.encode(min_code_size, &plain, lossy, &mut alt);
+            if alt.len() < body.len() - descriptor_len {
+                // the opaque encoding won: swap it in after the descriptor
+                body.truncate(descriptor_len);
+                body.extend_from_slice(&alt);
+            }
+        }
+        None => enc.encode(min_code_size, idx, lossy, &mut body),
     }
 
     EncodedFrame {
@@ -203,7 +217,7 @@ mod tests {
     fn identical_frame_returns_empty_body() {
         let a = vec![5u8; 16];
         let mut enc = LzwEncoder::default();
-        let f = encode_frame(&a, Some(&a), 4, 4, 255, 8, 3, DISPOSAL_NONE, &mut enc);
+        let f = encode_frame(&a, Some(&a), 4, 4, 255, 8, 3, DISPOSAL_NONE, None, &mut enc);
         assert!(f.body.is_empty());
         assert_eq!(f.delay_cs, 3);
     }
@@ -216,7 +230,7 @@ mod tests {
         let mut cur = prev.clone();
         cur[3 * w + 2] = 9; // single changed pixel at (2,3)
         let mut enc = LzwEncoder::default();
-        let f = encode_frame(&cur, Some(&prev), w, h, 255, 8, 3, DISPOSAL_NONE, &mut enc);
+        let f = encode_frame(&cur, Some(&prev), w, h, 255, 8, 3, DISPOSAL_NONE, None, &mut enc);
         // descriptor: 2C x0 y0 w h
         assert_eq!(f.body[0], 0x2C);
         assert_eq!(u16::from_le_bytes([f.body[1], f.body[2]]), 2);

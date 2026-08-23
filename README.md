@@ -40,6 +40,9 @@ weft --colors 64 --dither none --no-loop < input.y4m > out.gif
                    reserved for transparency, so 256 means 255 colors)
 --dither D         sierra2 | fs | bayer | none (default: sierra2)
 --loop N           loop count, 0 = forever    (default: 0)
+--lossy N          lossy LZW compression, 0-200 (default: 0 = lossless
+                   encoding of the quantized frames; ~30 is subtle and
+                   much smaller on dithered content)
 --no-loop          play once (no NETSCAPE extension)
 --threads N        worker threads             (default: all cores)
 --stats            print timing breakdown to stderr
@@ -99,6 +102,33 @@ bench/gen_inputs.sh   # synthesize test clips (needs ffmpeg)
 bench/run.sh          # full comparison table
 ```
 
+## Lossy compression
+
+`--lossy N` ports gifsicle's `--lossy` algorithm: a DFS over the LZW
+dictionary trie finds the longest match whose per-pixel color error stays
+under N*10 (squared RGB, gifsicle's scale), with each substitution's
+signed error fed forward into the next pixel's comparison at 3/4 decay so
+errors cancel instead of accumulating. Dithered content — full of visually
+interchangeable palette indices that break long runs — compresses
+dramatically better. Measured at `--lossy 30` (same clips as above):
+
+| clip      | lossless | --lossy 30 | Δ size | Δ PSNR | gifsicle --lossy=30¹ |
+|-----------|---------:|-----------:|-------:|-------:|---------------------:|
+| gradients | 2136 KB  | **680 KB** | −68%   | −1.3 dB| 681 KB               |
+| mandel    | 16358 KB | **11656 KB**| −29%  | −0.4 dB| 11614 KB             |
+| testsrc   | 2280 KB  | **2084 KB**| −9%    | −0.8 dB| 1944 KB              |
+| big (720p)| 13738 KB | **12096 KB**| −12%  |        |                      |
+
+¹ gifsicle 1.94 `-O3 --lossy=30` applied to weft's lossless output.
+
+Two structural pieces land alongside it (and improve lossless output too):
+each delta frame is encoded both transparency-punched and plain-opaque and
+the smaller wins — sparse changes favor punching, while smooth animated
+gradients compress far better opaque (this alone took the gradients clip
+from 2555 KB to 2136 KB lossless) — and the encoder defers LZW dictionary
+clears, keeping a full dictionary alive while its average match length
+holds up (gifsicle's EWMA heuristic) instead of resetting at 4096 codes.
+
 ## Design
 
 Every heavy stage is embarrassingly parallel across frames (rayon):
@@ -124,13 +154,15 @@ Every heavy stage is embarrassingly parallel across frames (rayon):
    truncating division (an arithmetic shift would diffuse >100% of
    negative error and explode into noise). YUV→RGB conversion is fused
    row-by-row into this pass — full RGBA frames never materialize.
-5. **Delta + LZW, parallel per frame.** Unchanged pixels become
-   transparent, frames crop to the changed bounding box, identical frames
-   fold their delay into the predecessor. With disposal "none" the decoded
-   canvas after frame *i−1* equals indexed frame *i−1*, so frame *i*'s
-   delta needs only its neighbor — no serial canvas walk. LZW uses a
-   generation-stamped open-addressed table (no per-clear reset) and a
-   64-bit bit accumulator.
+5. **Delta + LZW, parallel per frame.** Frames crop to the changed
+   bounding box; the rect is encoded both transparency-punched and plain
+   opaque, keeping whichever is smaller; identical frames fold their delay
+   into the predecessor. With disposal "none" the decoded canvas after
+   frame *i−1* equals indexed frame *i−1*, so frame *i*'s delta needs only
+   its neighbor — no serial canvas walk. LZW uses a generation-stamped
+   open-addressed table (no per-clear reset), a 64-bit bit accumulator,
+   and gifsicle-style deferred dictionary clears; `--lossy` adds the
+   error-bounded match search described above.
 6. **Mux.** Single sequential write of pre-encoded chunks.
 
 Correctness is pinned by unit tests (LZW roundtrip incl. forced clears,

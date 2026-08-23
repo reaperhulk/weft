@@ -27,6 +27,7 @@ struct Args {
     colors: usize,
     dither: Dither,
     loop_count: Option<u16>,
+    lossy: u32,
     threads: Option<usize>,
     stats: bool,
 }
@@ -53,6 +54,9 @@ options:
                      reserved for transparency, so 256 means 255 colors)
   --dither D         sierra2 | fs | bayer | none (default: sierra2)
   --loop N           loop count, 0 = forever    (default: 0)
+  --lossy N          lossy LZW compression, 0-200 (default: 0 = lossless
+                     encoding of the quantized frames; ~30 is subtle and
+                     much smaller on dithered content)
   --no-loop          play once (no NETSCAPE extension)
   --threads N        worker threads             (default: all cores)
   --stats            print timing breakdown to stderr
@@ -66,6 +70,7 @@ fn parse_args() -> Result<Args, String> {
         colors: 256,
         dither: Dither::Sierra2_4a,
         loop_count: Some(0),
+        lossy: 0,
         threads: None,
         stats: false,
     };
@@ -119,6 +124,12 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--loop" => a.loop_count = Some(val("--loop")?.parse().map_err(|_| "bad --loop")?),
+            "--lossy" => {
+                a.lossy = val("--lossy")?.parse().map_err(|_| "bad --lossy")?;
+                if a.lossy > 200 {
+                    return Err("--lossy must be 0-200".into());
+                }
+            }
             "--no-loop" => a.loop_count = None,
             "--threads" => {
                 a.threads = Some(val("--threads")?.parse().map_err(|_| "bad --threads")?)
@@ -351,6 +362,7 @@ fn run(args: &Args) -> io::Result<()> {
     } else {
         gif::DISPOSAL_NONE
     };
+    let lossy_map = (args.lossy > 0).then(|| lzw::LossyMap::build(&colors, trans_idx, args.lossy));
     let encoded: Vec<gif::EncodedFrame> = (0..indexed.len())
         .into_par_iter()
         .map_init(LzwEncoder::default, |enc, i| {
@@ -368,6 +380,7 @@ fn run(args: &Args) -> io::Result<()> {
                 min_code_size,
                 delays[i],
                 disposal,
+                lossy_map.as_ref(),
                 enc,
             )
         })
