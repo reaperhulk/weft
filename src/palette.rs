@@ -819,41 +819,66 @@ impl NearestMap {
         // over candidates exact for every p in the cell.
         let soa = crate::simdops::PalSoa::new(&pal_lab);
         let level = fearless_simd::Level::new();
-        let cell_lists: Vec<Vec<u8>> = (0..GRID_SIZE)
+        // Build candidate lists into one arena per parallel chunk instead
+        // of allocating a Vec for every one of the 262,144 cells. Cell
+        // metadata retains grid order, so the later interning pass emits
+        // byte-for-byte the same `direct` and `cands` tables.
+        const CELL_CHUNK: usize = 1024;
+        #[derive(Clone, Copy)]
+        struct CellRef {
+            off: u32,
+            len: u16,
+        }
+        struct CellChunk {
+            refs: Vec<CellRef>,
+            arena: Vec<u8>,
+        }
+        let nchunks = GRID_SIZE.div_ceil(CELL_CHUNK);
+        let cell_chunks: Vec<CellChunk> = (0..nchunks)
             .into_par_iter()
             .map_init(
                 || (LabConverter::new(), vec![0f32; soa.l.len()]),
-                |(cv, dists), key| {
-                    let rb = (((key >> (2 * GRID_BITS)) & 63) as u8) << 2;
-                    let gb = (((key >> GRID_BITS) & 63) as u8) << 2;
-                    let bb = ((key & 63) as u8) << 2;
-                    let q = cv.srgb_to_oklab(rb + 2, gb + 2, bb + 2);
-                    // All 8 corners in SIMD lanes (slightly inflated to
-                    // stay an upper bound): candidate lists built from it
-                    // are supersets of the exact-rmax lists, so lookups
-                    // still return the true nearest.
-                    let mut lr = [0f32; 8];
-                    let mut lg = [0f32; 8];
-                    let mut lb = [0f32; 8];
-                    for corner in 0..8 {
-                        lr[corner] = cv.linear(rb + if corner & 1 != 0 { 3 } else { 0 });
-                        lg[corner] = cv.linear(gb + if corner & 2 != 0 { 3 } else { 0 });
-                        lb[corner] = cv.linear(bb + if corner & 4 != 0 { 3 } else { 0 });
-                    }
-                    let rmax2 = crate::simdops::corner_rmax2(level, &lr, &lg, &lb, q);
-                    let rmax = rmax2.sqrt();
-                    // one SIMD distance pass, buffered, shared by the dmin
-                    // scan and the candidate filter
-                    let dmin2 = crate::simdops::cell_distances(level, &soa, q, dists);
-                    let bound = dmin2.sqrt() + 2.0 * rmax + 1e-6;
-                    let bound2 = bound * bound;
-                    let mut list = Vec::new();
-                    for (i, &d) in dists[..pal_lab.len()].iter().enumerate() {
-                        if d <= bound2 {
-                            list.push(i as u8);
+                |(cv, dists), chunk| {
+                    let start = chunk * CELL_CHUNK;
+                    let end = (start + CELL_CHUNK).min(GRID_SIZE);
+                    let mut refs = Vec::with_capacity(end - start);
+                    let mut arena = Vec::with_capacity((end - start) * colors.len().min(8));
+                    for key in start..end {
+                        let rb = (((key >> (2 * GRID_BITS)) & 63) as u8) << 2;
+                        let gb = (((key >> GRID_BITS) & 63) as u8) << 2;
+                        let bb = ((key & 63) as u8) << 2;
+                        let q = cv.srgb_to_oklab(rb + 2, gb + 2, bb + 2);
+                        // All 8 corners in SIMD lanes (slightly inflated to
+                        // stay an upper bound): candidate lists built from it
+                        // are supersets of the exact-rmax lists, so lookups
+                        // still return the true nearest.
+                        let mut lr = [0f32; 8];
+                        let mut lg = [0f32; 8];
+                        let mut lb = [0f32; 8];
+                        for corner in 0..8 {
+                            lr[corner] = cv.linear(rb + if corner & 1 != 0 { 3 } else { 0 });
+                            lg[corner] = cv.linear(gb + if corner & 2 != 0 { 3 } else { 0 });
+                            lb[corner] = cv.linear(bb + if corner & 4 != 0 { 3 } else { 0 });
                         }
+                        let rmax2 = crate::simdops::corner_rmax2(level, &lr, &lg, &lb, q);
+                        let rmax = rmax2.sqrt();
+                        // one SIMD distance pass, buffered, shared by the dmin
+                        // scan and the candidate filter
+                        let dmin2 = crate::simdops::cell_distances(level, &soa, q, dists);
+                        let bound = dmin2.sqrt() + 2.0 * rmax + 1e-6;
+                        let bound2 = bound * bound;
+                        let off = arena.len();
+                        for (i, &d) in dists[..pal_lab.len()].iter().enumerate() {
+                            if d <= bound2 {
+                                arena.push(i as u8);
+                            }
+                        }
+                        refs.push(CellRef {
+                            off: off as u32,
+                            len: (arena.len() - off) as u16,
+                        });
                     }
-                    list
+                    CellChunk { refs, arena }
                 },
             )
             .collect();
@@ -874,38 +899,43 @@ impl NearestMap {
         // skip the hashing.
         const INTERN_MIN: usize = 16;
         let mut interned: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
-        for l in &cell_lists {
-            direct.push(if l.len() == 1 {
-                (pal_rgb[l[0] as usize] << 8) | l[0] as u32
-            } else {
-                // Short lists never touch the map: on real content
-                // cells average a handful of candidates, and hashing
-                // every one of them costs more than the sharing saves.
-                let long = l.len() >= INTERN_MIN;
-                let off = match long.then(|| interned.get(l.as_slice())).flatten() {
-                    Some(&off) => off,
-                    // A list needs its own copy. It only fits if the
-                    // offset is addressable and the terminator lands
-                    // inside the reserved range; otherwise the cell falls
-                    // back to scanning the whole palette, which is slower
-                    // but always the correct answer, so the packing
-                    // invariant holds for any palette whatsoever.
-                    None if cands.len() + l.len() + 1 < SCAN_ALL as usize => {
-                        let off = cands.len() as u32;
-                        cands.extend_from_slice(l);
-                        cands.push(MULTI); // terminator
-                        if long {
-                            interned.insert(l.as_slice(), off);
+        let mut total = 0usize;
+        for chunk in &cell_chunks {
+            for cell in &chunk.refs {
+                let off = cell.off as usize;
+                let l = &chunk.arena[off..off + cell.len as usize];
+                total += l.len();
+                direct.push(if l.len() == 1 {
+                    (pal_rgb[l[0] as usize] << 8) | l[0] as u32
+                } else {
+                    // Short lists never touch the map: on real content
+                    // cells average a handful of candidates, and hashing
+                    // every one of them costs more than the sharing saves.
+                    let long = l.len() >= INTERN_MIN;
+                    let off = match long.then(|| interned.get(l)).flatten() {
+                        Some(&off) => off,
+                        // A list needs its own copy. It only fits if the
+                        // offset is addressable and the terminator lands
+                        // inside the reserved range; otherwise the cell falls
+                        // back to scanning the whole palette, which is slower
+                        // but always the correct answer, so the packing
+                        // invariant holds for any palette whatsoever.
+                        None if cands.len() + l.len() + 1 < SCAN_ALL as usize => {
+                            let off = cands.len() as u32;
+                            cands.extend_from_slice(l);
+                            cands.push(MULTI); // terminator
+                            if long {
+                                interned.insert(l, off);
+                            }
+                            off
                         }
-                        off
-                    }
-                    None => SCAN_ALL,
-                };
-                (off << 8) | MULTI as u32
-            });
+                        None => SCAN_ALL,
+                    };
+                    (off << 8) | MULTI as u32
+                });
+            }
         }
         drop(interned);
-        let total: usize = cell_lists.iter().map(Vec::len).sum();
         NearestMap {
             direct,
             cands,
