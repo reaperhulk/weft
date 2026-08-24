@@ -1,9 +1,9 @@
 //! GIF-flavor LZW encoder, tuned for throughput: open-addressed hash table
-//! with generation stamps (no per-clear memset), 64-bit bit accumulator,
-//! sub-block chunking done in a single trailing pass.
+//! packed into 32-bit entries small enough to stay L1-resident, 64-bit bit
+//! accumulator, sub-block chunking done in a single trailing pass.
 
 const MAX_CODE: u32 = 4096;
-const TABLE_BITS: u32 = 15;
+const TABLE_BITS: u32 = 13;
 const TABLE_SIZE: usize = 1 << TABLE_BITS;
 
 // Deferred-clear policy (ported from gifsicle): when the dictionary fills,
@@ -144,9 +144,12 @@ struct LossyBest {
 /// Reusable encoder state so per-frame allocations amortize away when a
 /// thread encodes many frames.
 pub struct LzwEncoder {
-    // entry: [gen:16 | key:24 | code:16] packed into u64 (key is 12-bit
-    // prefix code + 8-bit appended byte = 20 bits)
-    table: Vec<u64>,
+    // entry: [key:20 | code:12] packed into u32 (key is 12-bit prefix code
+    // + 8-bit appended byte). Codes handed out start at eoi+1 >= 3, so a
+    // zero code field marks an empty slot and a clear is one 32KB memset —
+    // the whole table stays L1-resident, where the previous generation-
+    // stamped u64 table (256KB) bounced through L2 on every probe.
+    table: Vec<u32>,
     gen: u16,
     scratch: Vec<u8>,
     // Lossy-only: per-prefix-code bitmap of which symbols continue it in
@@ -162,7 +165,7 @@ pub struct LzwEncoder {
 impl Default for LzwEncoder {
     fn default() -> Self {
         Self {
-            table: vec![u64::MAX; TABLE_SIZE],
+            table: vec![0; TABLE_SIZE],
             gen: 0,
             scratch: Vec::new(),
             child_gen: vec![0; MAX_CODE as usize],
@@ -201,30 +204,32 @@ impl<'a> BitWriter<'a> {
 }
 
 impl LzwEncoder {
+    /// Reset the dictionary table (one L1-sized memset) and advance the
+    /// generation stamp used by the lossy path's child bitmaps.
     #[inline(always)]
     fn bump_gen(&mut self) {
+        self.table.fill(0);
         self.gen = self.gen.wrapping_add(1);
         if self.gen == 0 {
-            // generation counter wrapped: hard reset to avoid stale hits
-            // (gen is never 0 afterwards, so 0 stamps are always stale)
-            self.table.iter_mut().for_each(|e| *e = u64::MAX);
+            // generation counter wrapped: reset the child stamps so stale
+            // bitmaps can't hit (gen is never 0 afterwards)
             self.child_gen.iter_mut().for_each(|g| *g = 0);
             self.gen = 1;
         }
     }
 
-    /// Probe for `key` in the current generation: the code if present,
-    /// else the slot where it should be inserted.
+    /// Probe for `key`: the code if present, else the slot where it
+    /// should be inserted.
     #[inline(always)]
-    fn probe(&self, gen: u16, key: u32) -> Result<u32, usize> {
+    fn probe(&self, key: u32) -> Result<u32, usize> {
         let mut slot = ((key.wrapping_mul(0x9E37_79B1)) >> (32 - TABLE_BITS)) as usize;
         loop {
             let e = self.table[slot];
-            if (e >> 40) as u16 != gen {
-                return Err(slot); // empty (stale generation)
+            if e == 0 {
+                return Err(slot); // empty
             }
-            if ((e >> 16) as u32 & 0xFF_FFFF) == key {
-                return Ok((e & 0xFFFF) as u32);
+            if (e >> 12) == key {
+                return Ok(e & 0xFFF);
             }
             slot = (slot + 1) & (TABLE_SIZE - 1);
         }
@@ -284,12 +289,11 @@ impl LzwEncoder {
         self.bump_gen();
         let mut next = eoi + 1;
         let mut cur = data[0] as u32;
-        let mut gen = self.gen;
         let mut run = 1u32;
         let mut run_ewma = 1u32 << RUN_EWMA_SCALE;
 
         for (i, &b) in data[1..].iter().enumerate() {
-            match self.probe(gen, (cur << 8) | b as u32) {
+            match self.probe((cur << 8) | b as u32) {
                 Ok(code) => {
                     cur = code;
                     run += 1;
@@ -300,8 +304,7 @@ impl LzwEncoder {
                     run = 1;
                     if next < MAX_CODE {
                         let key = (cur << 8) | b as u32;
-                        self.table[slot] =
-                            ((gen as u64) << 40) | ((key as u64) << 16) | next as u64;
+                        self.table[slot] = (key << 12) | next;
                         if next == (1 << width) {
                             width += 1;
                         }
@@ -312,7 +315,6 @@ impl LzwEncoder {
                         next = eoi + 1;
                         run_ewma = 1 << RUN_EWMA_SCALE;
                         self.bump_gen();
-                        gen = self.gen;
                     }
                     // else: dictionary frozen — keep matching against it
                     cur = b as u32;
@@ -388,9 +390,9 @@ impl LzwEncoder {
             if next < MAX_CODE {
                 // Define (emitted code, actual next pixel). The entry can
                 // already exist if the visit budget cut the DFS short.
-                if let Err(slot) = self.probe(gen, (best.code << 8) | data[pos] as u32) {
+                if let Err(slot) = self.probe((best.code << 8) | data[pos] as u32) {
                     let key = (best.code << 8) | data[pos] as u32;
-                    self.table[slot] = ((gen as u64) << 40) | ((key as u64) << 16) | next as u64;
+                    self.table[slot] = (key << 12) | next;
                     // mirror the new child link into the DFS bitmap
                     let p = best.code as usize;
                     let sym = data[pos] as usize;
@@ -461,7 +463,7 @@ impl LzwEncoder {
         let b = data[pos];
         // Exact continuation: zero cost, dither decays.
         if cb[(b >> 6) as usize] & (1u64 << (b & 63)) != 0 {
-            if let Ok(code) = self.probe(gen, (node_code << 8) | b as u32) {
+            if let Ok(code) = self.probe((node_code << 8) | b as u32) {
                 let nd = map.next_dither(b, b, &dither);
                 if self.lossy_dfs(gen, data, pos + 1, code, nd, accum, visits, best, map) {
                     return true;
@@ -477,7 +479,7 @@ impl LzwEncoder {
                 if d > map.max_diff {
                     continue;
                 }
-                if let Ok(code) = self.probe(gen, (node_code << 8) | b2 as u32) {
+                if let Ok(code) = self.probe((node_code << 8) | b2 as u32) {
                     let nd = map.next_dither(b, b2, &dither);
                     if self.lossy_dfs(
                         gen,
