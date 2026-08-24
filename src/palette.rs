@@ -378,7 +378,7 @@ fn scan_runs_with(rgba: &[u8], mut add: impl FnMut(u32, u32)) -> bool {
             }
             let bytes = &rgba[i * 4..];
             let mut off = 0usize;
-            while off + 32 <= bytes.len() && bytes[off..off + 32] == pattern {
+            while off + 32 <= bytes.len() && eq32(&bytes[off..off + 32], &pattern) {
                 off += 32;
             }
             run += (off / 4) as u32;
@@ -389,6 +389,21 @@ fn scan_runs_with(rgba: &[u8], mut add: impl FnMut(u32, u32)) -> bool {
         add(last, run);
     }
     has_alpha
+}
+
+/// 32-byte equality via four u64 loads. Slice `==` lowers to libc
+/// `memcmp`, which musl implements as a byte loop; this stays fast on
+/// every target.
+#[inline]
+fn eq32(a: &[u8], b: &[u8; 32]) -> bool {
+    debug_assert_eq!(a.len(), 32);
+    let mut acc = 0u64;
+    for k in 0..4 {
+        let x = u64::from_ne_bytes(a[k * 8..k * 8 + 8].try_into().unwrap());
+        let y = u64::from_ne_bytes(b[k * 8..k * 8 + 8].try_into().unwrap());
+        acc |= x ^ y;
+    }
+    acc == 0
 }
 
 // ---------------------------------------------------------------------------
