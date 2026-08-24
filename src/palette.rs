@@ -267,7 +267,11 @@ pub fn scan_rgb_key_runs_with(keys: &[u32], mut add: impl FnMut(u32, u32)) {
 /// pass's main memory traffic; packing halves it against `(u32, u32)`.
 /// A run longer than 256 pixels is emitted as several entries — the
 /// consumer sums are the same, and adding one color twice in a row
-/// leaves a table in the same state as adding it once.
+/// leaves a table in the same state as adding it once. That costs bytes
+/// on flat, wide content (a 1920-pixel flat row is eight entries, 32
+/// bytes, where one 8-byte pair used to do), but such rows are exactly
+/// the ones with almost no runs: the stream is negligible there either
+/// way, and the packing wins where the stream is large.
 pub type PackedRun = u32;
 
 const PACKED_RUN_MAX: u32 = 256;
