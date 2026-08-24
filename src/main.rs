@@ -354,8 +354,16 @@ fn run(args: &Args) -> io::Result<()> {
             };
             let (btx, brx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
             let prefault = std::thread::spawn(move || loop {
-                let mut v: Vec<u8> = Vec::with_capacity(fsize);
-                v.resize(fsize, 0);
+                // Deliberately not `vec![0; fsize]`: that is calloc, whose
+                // pages stay unmapped until first written, i.e. the fault
+                // would land on the reader after all. resize() stores the
+                // zeros itself, which is the first touch we want here.
+                #[allow(clippy::slow_vector_initialization)]
+                let v: Vec<u8> = {
+                    let mut v = Vec::with_capacity(fsize);
+                    v.resize(fsize, 0);
+                    v
+                };
                 if btx.send(v).is_err() {
                     break;
                 }
