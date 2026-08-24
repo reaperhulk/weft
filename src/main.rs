@@ -55,7 +55,7 @@ options:
   --format F         auto | rgba | y4m          (default: auto)
   --colors N         max palette colors, 2-256  (default: 256; one slot is
                      reserved for transparency, so 256 means 255 colors)
-  --dither D         bluenoise | sierra2 | fs | bayer | none
+  --dither D         bluenoise | sierra2 | bayer | none
                      (default: bluenoise, which is fast, temporally
                      stable, and compresses well; sierra2 error diffusion
                      has slightly higher visual quality but is slower and
@@ -130,7 +130,6 @@ fn parse_args() -> Result<Args, String> {
             "--dither" => {
                 a.dither = match val("--dither")?.as_str() {
                     "sierra2" | "sierra2_4a" => Dither::Sierra2_4a,
-                    "fs" | "floyd_steinberg" => Dither::FloydSteinberg,
                     "bayer" => Dither::Bayer,
                     "bluenoise" | "bn" => Dither::BlueNoise,
                     "none" => Dither::None,
