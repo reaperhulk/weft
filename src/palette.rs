@@ -294,7 +294,11 @@ pub fn scan_rgba_runs_counted(
 
 /// Scatter a frame's runs by red byte into `sorted` (reused; overwritten)
 /// given their per-bucket counts. Returns the 257 bucket boundaries.
-pub fn bucket_runs(runs: &[(u32, u32)], counts: &[u32; 256], sorted: &mut Vec<(u32, u32)>) -> Vec<u32> {
+pub fn bucket_runs(
+    runs: &[(u32, u32)],
+    counts: &[u32; 256],
+    sorted: &mut Vec<(u32, u32)>,
+) -> Vec<u32> {
     let mut offs = vec![0u32; 257];
     for b in 0..256 {
         offs[b + 1] = offs[b] + counts[b];
