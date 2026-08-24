@@ -787,6 +787,8 @@ pub struct NearestMap {
     pal_rgb: Vec<u32>,
     pal_lab: Vec<[f32; 3]>,
     cv: LabConverter,
+    /// Mean candidates per cell before interning — perf diagnostic.
+    avg_cands: f32,
 }
 
 /// A packed lookup result: `r<<24 | g<<16 | b<<8 | idx`.
@@ -853,39 +855,53 @@ impl NearestMap {
             .collect();
         let mut direct = Vec::with_capacity(GRID_SIZE);
         let mut cands = Vec::new();
+        // Long lists are interned: when the palette is a tight cluster in
+        // Lab (few distinct source colors), the triangle bound admits
+        // nearly every color for the vast majority of cells, and those
+        // cells all end up with the *same* list. Storing one copy keeps
+        // `cands` small (it would otherwise reach 67MB and blow the
+        // 24-bit offset packing) and keeps the shared list hot in cache.
+        // Short lists — the overwhelming majority on real content — skip
+        // the hashing entirely.
+        const INTERN_MIN: usize = 16;
+        let mut interned: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
         for l in &cell_lists {
             direct.push(if l.len() == 1 {
                 (pal_rgb[l[0] as usize] << 8) | l[0] as u32
             } else {
-                let off = cands.len() as u32;
-                // 24-bit offset: total list bytes stay far below 16M for
-                // any 255-color palette (avg candidates/cell is single
-                // digits), but guard the packing invariant regardless
-                assert!(off < (1 << 24), "candidate lists exceed 24-bit offsets");
-                cands.extend_from_slice(l);
-                cands.push(MULTI); // terminator
+                let off = match interned.get(l.as_slice()) {
+                    Some(&off) => off,
+                    None => {
+                        let off = cands.len() as u32;
+                        // 24-bit offset: with interning the total stays
+                        // far below 16M, but guard the packing invariant
+                        assert!(off < (1 << 24), "candidate lists exceed 24-bit offsets");
+                        cands.extend_from_slice(l);
+                        cands.push(MULTI); // terminator
+                        if l.len() >= INTERN_MIN {
+                            interned.insert(l.as_slice(), off);
+                        }
+                        off
+                    }
+                };
                 (off << 8) | MULTI as u32
             });
         }
+        drop(interned);
+        let total: usize = cell_lists.iter().map(Vec::len).sum();
         NearestMap {
             direct,
             cands,
             pal_rgb,
             pal_lab,
             cv,
+            avg_cands: total as f32 / GRID_SIZE as f32,
         }
     }
 
     /// Average candidates per cell — perf diagnostic.
     pub fn avg_candidates(&self) -> f32 {
-        let multi = self
-            .direct
-            .iter()
-            .filter(|&&d| (d & 0xFF) == MULTI as u32)
-            .count();
-        // cands holds one terminator per multi-candidate cell; every other
-        // cell has exactly one candidate.
-        (self.cands.len() - 2 * multi + GRID_SIZE) as f32 / GRID_SIZE as f32
+        self.avg_cands
     }
 
     /// Uncached lookup (tests; `lookup_packed` is the hot path).
