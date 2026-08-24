@@ -920,6 +920,43 @@ fn cell_candidates<const SPAN: u8>(
 /// A packed lookup result: `r<<24 | g<<16 | b<<8 | idx`.
 pub type PackedNearest = u32;
 
+/// FxHash: the multiply-xor-fold rustc uses. SipHash's quality buys
+/// nothing for interning candidate lists — the keys are short byte
+/// strings compared in full on every hit — and its cost shows up
+/// directly, since a degenerate palette hashes megabytes of them.
+#[derive(Default)]
+struct FxHasher(u64);
+
+type BuildFx = std::hash::BuildHasherDefault<FxHasher>;
+
+impl FxHasher {
+    #[inline(always)]
+    fn add(&mut self, w: u64) {
+        const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(SEED);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for c in chunks {
+            self.add(u64::from_le_bytes(*c));
+        }
+        if !rest.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(buf));
+        }
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 impl NearestMap {
     pub fn build(colors: &[[u8; 3]]) -> Self {
         let cv = LabConverter::new();
@@ -1064,26 +1101,37 @@ impl NearestMap {
         // Short lists — the overwhelming majority on real content — skip
         // the hashing entirely.
         const INTERN_MIN: usize = 16;
-        let mut interned: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
+        let mut interned: std::collections::HashMap<&[u8], u32, BuildFx> = Default::default();
+        // Neighbouring cells usually carry the identical list, so check
+        // the last one first and skip the hash entirely on a hit.
+        let mut last: (&[u8], u32) = (&[], 0);
         for (m, l) in cell_lists.iter().enumerate() {
             direct[cell_key(m)] = if l.len() == 1 {
                 (pal_rgb[l[0] as usize] << 8) | l[0] as u32
             } else {
-                let off = match interned.get(l.as_slice()) {
-                    Some(&off) => off,
-                    None => {
-                        let off = cands.len() as u32;
-                        // 24-bit offset: with interning the total stays
-                        // far below 16M, but guard the packing invariant
-                        assert!(off < (1 << 24), "candidate lists exceed 24-bit offsets");
-                        cands.extend_from_slice(l);
-                        cands.push(MULTI); // terminator
-                        if l.len() >= INTERN_MIN {
-                            interned.insert(l.as_slice(), off);
+                let off = if !last.0.is_empty() && last.0 == l.as_slice() {
+                    last.1
+                } else {
+                    match interned.get(l.as_slice()) {
+                        Some(&off) => off,
+                        None => {
+                            let off = cands.len() as u32;
+                            // 24-bit offset: with interning the total
+                            // stays far below 16M, but guard the packing
+                            // invariant
+                            assert!(off < (1 << 24), "candidate lists exceed 24-bit offsets");
+                            cands.extend_from_slice(l);
+                            cands.push(MULTI); // terminator
+                            if l.len() >= INTERN_MIN {
+                                interned.insert(l.as_slice(), off);
+                            }
+                            off
                         }
-                        off
                     }
                 };
+                if l.len() >= INTERN_MIN {
+                    last = (l.as_slice(), off);
+                }
                 (off << 8) | MULTI as u32
             };
         }
