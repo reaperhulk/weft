@@ -190,9 +190,9 @@ impl<'a> Quantizer<'a> {
                         self.nearest.prefetch_cache_slot(cache, p[0], p[1], p[2]);
                     }
                     let p = &row[i * 4..i * 4 + 4];
-                    scratch.pk1[i] =
-                        self.nearest
-                            .lookup_cache_first(cache, keys[i], p[0], p[1], p[2]);
+                    scratch.pk1[i] = self
+                        .nearest
+                        .lookup_cache_first(cache, keys[i], p[0], p[1], p[2]);
                 }
 
                 // A fully attenuated tile can't flip any pixel to c2, so
