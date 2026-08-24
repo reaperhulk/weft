@@ -170,8 +170,11 @@ impl Default for LzwEncoder {
             table: vec![0; TABLE_SIZE],
             gen: 0,
             scratch: Vec::new(),
-            child_gen: vec![0; MAX_CODE as usize],
-            child_bits: vec![0; MAX_CODE as usize * 4],
+            // The default encoder is lossless. Avoid allocating and
+            // zeroing the lossy DFS's 136 KiB of child metadata until a
+            // lossy encode actually needs it.
+            child_gen: Vec::new(),
+            child_bits: Vec::new(),
         }
     }
 }
@@ -206,6 +209,13 @@ impl<'a> BitWriter<'a> {
 }
 
 impl LzwEncoder {
+    fn ensure_lossy_scratch(&mut self) {
+        if self.child_gen.is_empty() {
+            self.child_gen.resize(MAX_CODE as usize, 0);
+            self.child_bits.resize(MAX_CODE as usize * 4, 0);
+        }
+    }
+
     /// Reset the dictionary table (one L1-sized memset) and advance the
     /// generation stamp used by the lossy path's child bitmaps.
     #[inline(always)]
@@ -350,6 +360,7 @@ impl LzwEncoder {
         map: &LossyMap,
         out: &mut Vec<u8>,
     ) {
+        self.ensure_lossy_scratch();
         let clear = 1u32 << min_code_size;
         let eoi = clear + 1;
         let mut bw = BitWriter {

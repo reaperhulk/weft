@@ -146,6 +146,20 @@ pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8], runs: &mut Vec<(u32, 
     has_alpha
 }
 
+/// Accumulate an intrinsically opaque row already expressed as canonical
+/// `0xRRGGBB` keys. YUV conversion can produce these lanes directly,
+/// avoiding an RGBA store followed immediately by another RGB unpack.
+pub fn accumulate_rgb_keys(hist: &mut ColorHist, keys: &[u32], runs: &mut Vec<(u32, u32)>) {
+    scan_rgb_key_runs(keys, runs);
+    for j in 0..runs.len() {
+        if let Some(&(c, _)) = runs.get(j + 8) {
+            hist.prefetch(c);
+        }
+        let (c, n) = runs[j];
+        hist.add(c, n);
+    }
+}
+
 /// Accumulate one RGBA frame directly into 6-bit/channel bins (the coarse
 /// mode workers switch to once their exact table outgrows the spill
 /// threshold — see `maybe_fold` for why the grid is quality-sufficient).
@@ -174,6 +188,45 @@ pub fn accumulate_frame_coarse(
         bin_add(bins, c, n);
     }
     has_alpha
+}
+
+/// Coarse-bin counterpart of `accumulate_rgb_keys`.
+pub fn accumulate_rgb_keys_coarse(bins: &mut [[u64; 4]], keys: &[u32], runs: &mut Vec<(u32, u32)>) {
+    scan_rgb_key_runs(keys, runs);
+    for j in 0..runs.len() {
+        if let Some(&(c, _)) = runs.get(j + 8) {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                let key = grid_key((c >> 16) as u8, (c >> 8) as u8, c as u8);
+                _mm_prefetch(bins.as_ptr().add(key) as *const i8, _MM_HINT_T0);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            let _ = c;
+        }
+        let (c, n) = runs[j];
+        bin_add(bins, c, n);
+    }
+}
+
+#[inline(always)]
+fn scan_rgb_key_runs(keys: &[u32], runs: &mut Vec<(u32, u32)>) {
+    runs.clear();
+    if keys.is_empty() {
+        return;
+    }
+    let mut last = keys[0];
+    let mut run = 1u32;
+    for &key in &keys[1..] {
+        if key == last {
+            run += 1;
+        } else {
+            runs.push((last, run));
+            last = key;
+            run = 1;
+        }
+    }
+    runs.push((last, run));
 }
 
 /// Shared RLE scan into `runs` (cleared first): run-length batching keeps
@@ -313,6 +366,8 @@ struct Box_ {
     start: usize,
     len: usize,
     count: u64,
+    sum: [f64; 3],
+    dominant: HBin,
     cut_score: f64,
     cut_axis: usize,
 }
@@ -327,67 +382,56 @@ const BOX_CHUNK: usize = 8192;
 
 fn make_box(bins: &[HBin], start: usize, len: usize) -> Box_ {
     let slice = &bins[start..start + len];
-    let (count, sum) = if len >= PAR_BOX {
-        slice
-            .par_chunks(BOX_CHUNK)
-            .map(|ch| {
-                let mut count = 0u64;
-                let mut sum = [0f64; 3];
-                for b in ch {
-                    count += b.count as u64;
-                    for (s, &l) in sum.iter_mut().zip(&b.lab) {
-                        *s += b.count as f64 * l as f64;
-                    }
-                }
-                (count, sum)
-            })
-            .collect::<Vec<_>>()
-            .iter()
-            .fold((0u64, [0f64; 3]), |(ac, asum), &(c, s)| {
-                (ac + c, [asum[0] + s[0], asum[1] + s[1], asum[2] + s[2]])
-            })
-    } else {
-        let mut count = 0u64;
-        let mut sum = [0f64; 3];
-        for b in slice {
-            count += b.count as u64;
-            for (s, &l) in sum.iter_mut().zip(&b.lab) {
-                *s += b.count as f64 * l as f64;
+    #[derive(Clone, Copy)]
+    struct Moments {
+        count: u64,
+        sum: [f64; 3],
+        sum2: [f64; 3],
+        dominant: HBin,
+    }
+    let accumulate = |ch: &[HBin]| {
+        let mut moments = Moments {
+            count: 0,
+            sum: [0.0; 3],
+            sum2: [0.0; 3],
+            dominant: ch[0],
+        };
+        for b in ch {
+            moments.count += b.count as u64;
+            if b.count > moments.dominant.count {
+                moments.dominant = *b;
             }
-        }
-        (count, sum)
-    };
-    let mean = [
-        sum[0] / count as f64,
-        sum[1] / count as f64,
-        sum[2] / count as f64,
-    ];
-    let er2 = if len >= PAR_BOX {
-        slice
-            .par_chunks(BOX_CHUNK)
-            .map(|ch| {
-                let mut er2 = [0f64; 3];
-                for b in ch {
-                    for c in 0..3 {
-                        let d = b.lab[c] as f64 - mean[c];
-                        er2[c] += b.count as f64 * d * d;
-                    }
-                }
-                er2
-            })
-            .collect::<Vec<_>>()
-            .iter()
-            .fold([0f64; 3], |a, e| [a[0] + e[0], a[1] + e[1], a[2] + e[2]])
-    } else {
-        let mut er2 = [0f64; 3];
-        for b in slice {
             for c in 0..3 {
-                let d = b.lab[c] as f64 - mean[c];
-                er2[c] += b.count as f64 * d * d;
+                let v = b.lab[c] as f64;
+                let w = b.count as f64;
+                moments.sum[c] += w * v;
+                moments.sum2[c] += w * v * v;
             }
         }
-        er2
+        moments
     };
+    let moments = if len >= PAR_BOX {
+        let parts: Vec<Moments> = slice.par_chunks(BOX_CHUNK).map(accumulate).collect();
+        let mut parts = parts.into_iter();
+        let mut total = parts.next().unwrap();
+        for b in parts {
+            total.count += b.count;
+            for c in 0..3 {
+                total.sum[c] += b.sum[c];
+                total.sum2[c] += b.sum2[c];
+            }
+            if b.dominant.count > total.dominant.count {
+                total.dominant = b.dominant;
+            }
+        }
+        total
+    } else {
+        accumulate(slice)
+    };
+    let mut er2 = [0.0; 3];
+    for (c, e) in er2.iter_mut().enumerate() {
+        *e = (moments.sum2[c] - moments.sum[c] * moments.sum[c] / moments.count as f64).max(0.0);
+    }
     // palettegen: split axis and box choice both follow the single largest
     // per-channel squared error
     let mut cut_axis = 0;
@@ -399,7 +443,9 @@ fn make_box(bins: &[HBin], start: usize, len: usize) -> Box_ {
     Box_ {
         start,
         len,
-        count,
+        count: moments.count,
+        sum: moments.sum,
+        dominant: moments.dominant,
         cut_score: er2[cut_axis],
         cut_axis,
     }
@@ -731,28 +777,16 @@ pub fn median_cut(mut entries: Vec<(u32, u32)>, max_colors: usize) -> Vec<[u8; 3
                 let c = slice[0].srgb;
                 return [(c >> 16) as u8, (c >> 8) as u8, c as u8];
             }
-            let mut count = 0u64;
-            let mut sum = [0f64; 3];
-            let mut dominant = &slice[0];
-            for b in slice {
-                count += b.count as u64;
-                if b.count > dominant.count {
-                    dominant = b;
-                }
-                for (s, &l) in sum.iter_mut().zip(&b.lab) {
-                    *s += b.count as f64 * l as f64;
-                }
-            }
             // Same reasoning when one color overwhelms the box: the weighted
             // average is that color, so snap to its exact sRGB.
-            if dominant.count as u64 * 100 >= count * 99 {
-                let c = dominant.srgb;
+            if bx.dominant.count as u64 * 100 >= bx.count * 99 {
+                let c = bx.dominant.srgb;
                 return [(c >> 16) as u8, (c >> 8) as u8, c as u8];
             }
             oklab_to_srgb([
-                (sum[0] / count as f64) as f32,
-                (sum[1] / count as f64) as f32,
-                (sum[2] / count as f64) as f32,
+                (bx.sum[0] / bx.count as f64) as f32,
+                (bx.sum[1] / bx.count as f64) as f32,
+                (bx.sum[2] / bx.count as f64) as f32,
             ])
         })
         .collect()
@@ -819,41 +853,66 @@ impl NearestMap {
         // over candidates exact for every p in the cell.
         let soa = crate::simdops::PalSoa::new(&pal_lab);
         let level = fearless_simd::Level::new();
-        let cell_lists: Vec<Vec<u8>> = (0..GRID_SIZE)
+        // Build candidate lists into one arena per parallel chunk instead
+        // of allocating a Vec for every one of the 262,144 cells. Cell
+        // metadata retains grid order, so the later interning pass emits
+        // byte-for-byte the same `direct` and `cands` tables.
+        const CELL_CHUNK: usize = 1024;
+        #[derive(Clone, Copy)]
+        struct CellRef {
+            off: u32,
+            len: u16,
+        }
+        struct CellChunk {
+            refs: Vec<CellRef>,
+            arena: Vec<u8>,
+        }
+        let nchunks = GRID_SIZE.div_ceil(CELL_CHUNK);
+        let cell_chunks: Vec<CellChunk> = (0..nchunks)
             .into_par_iter()
             .map_init(
                 || (LabConverter::new(), vec![0f32; soa.l.len()]),
-                |(cv, dists), key| {
-                    let rb = (((key >> (2 * GRID_BITS)) & 63) as u8) << 2;
-                    let gb = (((key >> GRID_BITS) & 63) as u8) << 2;
-                    let bb = ((key & 63) as u8) << 2;
-                    let q = cv.srgb_to_oklab(rb + 2, gb + 2, bb + 2);
-                    // All 8 corners in SIMD lanes (slightly inflated to
-                    // stay an upper bound): candidate lists built from it
-                    // are supersets of the exact-rmax lists, so lookups
-                    // still return the true nearest.
-                    let mut lr = [0f32; 8];
-                    let mut lg = [0f32; 8];
-                    let mut lb = [0f32; 8];
-                    for corner in 0..8 {
-                        lr[corner] = cv.linear(rb + if corner & 1 != 0 { 3 } else { 0 });
-                        lg[corner] = cv.linear(gb + if corner & 2 != 0 { 3 } else { 0 });
-                        lb[corner] = cv.linear(bb + if corner & 4 != 0 { 3 } else { 0 });
-                    }
-                    let rmax2 = crate::simdops::corner_rmax2(level, &lr, &lg, &lb, q);
-                    let rmax = rmax2.sqrt();
-                    // one SIMD distance pass, buffered, shared by the dmin
-                    // scan and the candidate filter
-                    let dmin2 = crate::simdops::cell_distances(level, &soa, q, dists);
-                    let bound = dmin2.sqrt() + 2.0 * rmax + 1e-6;
-                    let bound2 = bound * bound;
-                    let mut list = Vec::new();
-                    for (i, &d) in dists[..pal_lab.len()].iter().enumerate() {
-                        if d <= bound2 {
-                            list.push(i as u8);
+                |(cv, dists), chunk| {
+                    let start = chunk * CELL_CHUNK;
+                    let end = (start + CELL_CHUNK).min(GRID_SIZE);
+                    let mut refs = Vec::with_capacity(end - start);
+                    let mut arena = Vec::with_capacity((end - start) * colors.len().min(8));
+                    for key in start..end {
+                        let rb = (((key >> (2 * GRID_BITS)) & 63) as u8) << 2;
+                        let gb = (((key >> GRID_BITS) & 63) as u8) << 2;
+                        let bb = ((key & 63) as u8) << 2;
+                        let q = cv.srgb_to_oklab(rb + 2, gb + 2, bb + 2);
+                        // All 8 corners in SIMD lanes (slightly inflated to
+                        // stay an upper bound): candidate lists built from it
+                        // are supersets of the exact-rmax lists, so lookups
+                        // still return the true nearest.
+                        let mut lr = [0f32; 8];
+                        let mut lg = [0f32; 8];
+                        let mut lb = [0f32; 8];
+                        for corner in 0..8 {
+                            lr[corner] = cv.linear(rb + if corner & 1 != 0 { 3 } else { 0 });
+                            lg[corner] = cv.linear(gb + if corner & 2 != 0 { 3 } else { 0 });
+                            lb[corner] = cv.linear(bb + if corner & 4 != 0 { 3 } else { 0 });
                         }
+                        let rmax2 = crate::simdops::corner_rmax2(level, &lr, &lg, &lb, q);
+                        let rmax = rmax2.sqrt();
+                        // one SIMD distance pass, buffered, shared by the dmin
+                        // scan and the candidate filter
+                        let dmin2 = crate::simdops::cell_distances(level, &soa, q, dists);
+                        let bound = dmin2.sqrt() + 2.0 * rmax + 1e-6;
+                        let bound2 = bound * bound;
+                        let off = arena.len();
+                        for (i, &d) in dists[..pal_lab.len()].iter().enumerate() {
+                            if d <= bound2 {
+                                arena.push(i as u8);
+                            }
+                        }
+                        refs.push(CellRef {
+                            off: off as u32,
+                            len: (arena.len() - off) as u16,
+                        });
                     }
-                    list
+                    CellChunk { refs, arena }
                 },
             )
             .collect();
@@ -874,38 +933,43 @@ impl NearestMap {
         // skip the hashing.
         const INTERN_MIN: usize = 16;
         let mut interned: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
-        for l in &cell_lists {
-            direct.push(if l.len() == 1 {
-                (pal_rgb[l[0] as usize] << 8) | l[0] as u32
-            } else {
-                // Short lists never touch the map: on real content
-                // cells average a handful of candidates, and hashing
-                // every one of them costs more than the sharing saves.
-                let long = l.len() >= INTERN_MIN;
-                let off = match long.then(|| interned.get(l.as_slice())).flatten() {
-                    Some(&off) => off,
-                    // A list needs its own copy. It only fits if the
-                    // offset is addressable and the terminator lands
-                    // inside the reserved range; otherwise the cell falls
-                    // back to scanning the whole palette, which is slower
-                    // but always the correct answer, so the packing
-                    // invariant holds for any palette whatsoever.
-                    None if cands.len() + l.len() + 1 < SCAN_ALL as usize => {
-                        let off = cands.len() as u32;
-                        cands.extend_from_slice(l);
-                        cands.push(MULTI); // terminator
-                        if long {
-                            interned.insert(l.as_slice(), off);
+        let mut total = 0usize;
+        for chunk in &cell_chunks {
+            for cell in &chunk.refs {
+                let off = cell.off as usize;
+                let l = &chunk.arena[off..off + cell.len as usize];
+                total += l.len();
+                direct.push(if l.len() == 1 {
+                    (pal_rgb[l[0] as usize] << 8) | l[0] as u32
+                } else {
+                    // Short lists never touch the map: on real content
+                    // cells average a handful of candidates, and hashing
+                    // every one of them costs more than the sharing saves.
+                    let long = l.len() >= INTERN_MIN;
+                    let off = match long.then(|| interned.get(l)).flatten() {
+                        Some(&off) => off,
+                        // A list needs its own copy. It only fits if the
+                        // offset is addressable and the terminator lands
+                        // inside the reserved range; otherwise the cell falls
+                        // back to scanning the whole palette, which is slower
+                        // but always the correct answer, so the packing
+                        // invariant holds for any palette whatsoever.
+                        None if cands.len() + l.len() + 1 < SCAN_ALL as usize => {
+                            let off = cands.len() as u32;
+                            cands.extend_from_slice(l);
+                            cands.push(MULTI); // terminator
+                            if long {
+                                interned.insert(l, off);
+                            }
+                            off
                         }
-                        off
-                    }
-                    None => SCAN_ALL,
-                };
-                (off << 8) | MULTI as u32
-            });
+                        None => SCAN_ALL,
+                    };
+                    (off << 8) | MULTI as u32
+                });
+            }
         }
         drop(interned);
-        let total: usize = cell_lists.iter().map(Vec::len).sum();
         NearestMap {
             direct,
             cands,

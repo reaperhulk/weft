@@ -372,13 +372,13 @@ fn run(args: &Args) -> io::Result<()> {
                             palette::ColorHist::new(),
                             None::<Vec<[u64; 4]>>,
                             Vec::new(),
-                            (vec![0u8; w * 4], Vec::new()),
+                            (vec![0u8; w * 4], vec![0u32; w], Vec::new()),
                             false,
                         )
                     },
                     |(mut hist, mut coarse, mut frames, mut scratch, mut alpha), (i, f)| {
                         use std::sync::atomic::Ordering;
-                        let (row, runs) = &mut scratch;
+                        let (row, rgb_keys, runs) = &mut scratch;
                         if coarse.is_none() && go_coarse.load(Ordering::Relaxed) {
                             let mut bins = palette::new_fold_bins();
                             palette::fold_into_bins(&mut bins, &hist.entries());
@@ -390,21 +390,37 @@ fn run(args: &Args) -> io::Result<()> {
                             let src = color::RowSource::new(&f, w, h, meta_ref.chroma);
                             match &mut coarse {
                                 Some(bins) => {
-                                    for y in 0..h {
-                                        frame_alpha |= palette::accumulate_frame_coarse(
-                                            bins,
-                                            rgba_row(&src, y, row),
-                                            runs,
-                                        );
+                                    if src.has_direct_rgb_keys() {
+                                        for y in 0..h {
+                                            src.fill_rgb_keys(y, rgb_keys);
+                                            palette::accumulate_rgb_keys_coarse(
+                                                bins, rgb_keys, runs,
+                                            );
+                                        }
+                                    } else {
+                                        for y in 0..h {
+                                            frame_alpha |= palette::accumulate_frame_coarse(
+                                                bins,
+                                                rgba_row(&src, y, row),
+                                                runs,
+                                            );
+                                        }
                                     }
                                 }
                                 None => {
-                                    for y in 0..h {
-                                        frame_alpha |= palette::accumulate_frame(
-                                            &mut hist,
-                                            rgba_row(&src, y, row),
-                                            runs,
-                                        );
+                                    if src.has_direct_rgb_keys() {
+                                        for y in 0..h {
+                                            src.fill_rgb_keys(y, rgb_keys);
+                                            palette::accumulate_rgb_keys(&mut hist, rgb_keys, runs);
+                                        }
+                                    } else {
+                                        for y in 0..h {
+                                            frame_alpha |= palette::accumulate_frame(
+                                                &mut hist,
+                                                rgba_row(&src, y, row),
+                                                runs,
+                                            );
+                                        }
                                     }
                                     if hist.len() > palette::GRID_SIZE {
                                         go_coarse.store(true, Ordering::Relaxed);
@@ -588,6 +604,28 @@ fn run(args: &Args) -> io::Result<()> {
     // faults each buffer's pages once instead of allocating, zeroing, and
     // freeing ~w*h bytes per frame.
     let mut idx_block: Vec<Vec<u8>> = Vec::new();
+    // `for_each_init`/`map_init` state lives for only one parallel
+    // operation. Since the block loop launches two new operations per
+    // block, using them here would repeatedly allocate and zero the 512 KiB
+    // nearest-color cache and recreate the encoder buffers. Keep one state
+    // bundle per Rayon worker for the whole clip instead. A worker executes
+    // only one closure at a time, so these locks are uncontended; they just
+    // provide safe indexed ownership across independent parallel calls.
+    struct WorkerCtx {
+        quant: dither::QuantScratch,
+        encode: gif::EncodeCtx,
+    }
+    // The extra slot covers Rayon's single-item/sequential fast path, which
+    // can execute the closure on the calling thread (and therefore has no
+    // Rayon worker index).
+    let worker_ctx: Vec<Mutex<WorkerCtx>> = (0..=nthreads)
+        .map(|_| {
+            Mutex::new(WorkerCtx {
+                quant: dither::QuantScratch::new(w),
+                encode: gif::EncodeCtx::default(),
+            })
+        })
+        .collect();
     while start < nread {
         let chunk: Vec<Frame> = frames_it.by_ref().take(block).collect();
         let cn = chunk.len();
@@ -597,39 +635,36 @@ fn run(args: &Args) -> io::Result<()> {
         chunk
             .into_par_iter()
             .zip(idx_block[..cn].par_iter_mut())
-            .for_each_init(
-                || dither::QuantScratch::new(w),
-                |scratch, (f, idx)| {
-                    let src = color::RowSource::new(&f, w, h, meta.chroma);
-                    quant.quantize(&src, w, h, args.dither, scratch, idx);
-                },
-            );
-        encoded.par_extend(
-            (0..cn)
-                .into_par_iter()
-                .map_init(gif::EncodeCtx::default, |ctx, j| {
-                    let i = start + j;
-                    let prev = if any_alpha || i == 0 {
-                        None
-                    } else if j == 0 {
-                        prev_last.as_deref()
-                    } else {
-                        Some(idx_block[j - 1].as_slice())
-                    };
-                    gif::encode_frame(
-                        &idx_block[j],
-                        prev,
-                        w,
-                        h,
-                        trans_idx,
-                        min_code_size,
-                        delays[i],
-                        disposal,
-                        lossy_map.as_ref(),
-                        ctx,
-                    )
-                }),
-        );
+            .for_each(|(f, idx)| {
+                let wi = rayon::current_thread_index().unwrap_or(nthreads);
+                let mut ctx = worker_ctx[wi].lock().unwrap();
+                let src = color::RowSource::new(&f, w, h, meta.chroma);
+                quant.quantize(&src, w, h, args.dither, &mut ctx.quant, idx);
+            });
+        encoded.par_extend((0..cn).into_par_iter().map(|j| {
+            let wi = rayon::current_thread_index().unwrap_or(nthreads);
+            let mut ctx = worker_ctx[wi].lock().unwrap();
+            let i = start + j;
+            let prev = if any_alpha || i == 0 {
+                None
+            } else if j == 0 {
+                prev_last.as_deref()
+            } else {
+                Some(idx_block[j - 1].as_slice())
+            };
+            gif::encode_frame(
+                &idx_block[j],
+                prev,
+                w,
+                h,
+                trans_idx,
+                min_code_size,
+                delays[i],
+                disposal,
+                lossy_map.as_ref(),
+                &mut ctx.encode,
+            )
+        }));
         // The block's last indexed frame seeds the next block's first
         // delta; swap keeps both buffers in the recycled pool.
         match prev_last.as_mut() {
