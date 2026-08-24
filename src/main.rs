@@ -556,6 +556,9 @@ fn run(args: &Args) -> io::Result<()> {
     let block = 4 * nthreads;
     // Interleaving factor for the quantize passes (see below).
     const WAVE: usize = 4;
+    // Bands shorter than this cost more in per-band setup (one extra row
+    // of conversion and change detection) than they buy in balance.
+    const MIN_BAND_ROWS: usize = 64;
     let mut encoded: Vec<gif::EncodedFrame> = Vec::with_capacity(nread);
     let mut prev_last: Option<Vec<u8>> = None;
     // Source frame matching `prev_last`, so a block's first frame can
@@ -616,13 +619,30 @@ fn run(args: &Args) -> io::Result<()> {
                 .step_by(waves)
                 .map(|j| (j, std::mem::take(&mut idx_block[j])))
                 .collect();
+            // Split each frame into row bands so the pass has several
+            // times more tasks than workers: with one task per frame a
+            // wave holds only a handful, and the slowest one leaves every
+            // other worker idle at the barrier.
+            let band_rows = if quant.bandable(args.dither) {
+                h.div_ceil((4 * nthreads).div_ceil(taken.len().max(1)))
+                    .max(MIN_BAND_ROWS)
+                    .min(h.max(1))
+            } else {
+                h.max(1)
+            };
+            let mut bands: Vec<(usize, usize, &mut [u8])> = Vec::new();
+            for (j, buf) in taken.iter_mut() {
+                for (b, seg) in buf.chunks_mut(band_rows * w).enumerate() {
+                    bands.push((*j, b * band_rows, seg));
+                }
+            }
             let idx_ref = &idx_block;
             let chunk_ref = &chunk;
             let prev_frame_ref = prev_frame.as_ref();
             let prev_last_ref = prev_last.as_deref();
             let scratches = &scratches;
-            taken.par_iter_mut().for_each(|(j, idx)| {
-                let j = *j;
+            bands.par_iter_mut().for_each(|(j, y0, seg)| {
+                let (j, y0) = (*j, *y0);
                 // one slot per worker: rayon runs a single task per
                 // thread at a time, so the lock is never contended
                 let mut scratch = scratches
@@ -648,8 +668,10 @@ fn run(args: &Args) -> io::Result<()> {
                     None
                 };
                 let src = color::RowSource::new(&chunk_ref[j], w, h, meta.chroma);
-                quant.quantize(&src, w, h, args.dither, scratch, idx, reuse);
+                let y1 = (y0 + seg.len() / w).min(h);
+                quant.quantize_band(&src, w, h, y0..y1, args.dither, scratch, seg, reuse);
             });
+            drop(bands);
             for (j, buf) in taken {
                 idx_block[j] = buf;
             }

@@ -132,6 +132,7 @@ impl<'a> Quantizer<'a> {
     /// stays fused and cache-resident) into palette indices. Returns true
     /// if any pixel was alpha-transparent.
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn quantize(
         &self,
         src: &crate::color::RowSource,
@@ -142,10 +143,38 @@ impl<'a> Quantizer<'a> {
         out: &mut [u8],
         reuse: Option<Reuse>,
     ) -> bool {
+        self.quantize_band(src, w, h, 0..h, mode, scratch, out, reuse)
+    }
+
+    /// Whether `quantize_band` can be given a partial row range for this
+    /// mode. Error diffusion carries state along the whole frame, and the
+    /// exact-palette and undithered modes have no row structure to split.
+    pub fn bandable(&self, mode: Dither) -> bool {
+        mode == Dither::BlueNoise && !self.exact_palette
+    }
+
+    /// `quantize`, restricted to rows `rows` (the full frame unless
+    /// `bandable`); `out` covers just those rows. Bands of one frame are independent — the blue-noise mode's
+    /// only cross-row input is the row above, which a band re-derives for
+    /// its first row — so this is the unit the quantize passes
+    /// parallelize over: whole frames leave workers idle at each wave
+    /// boundary (measured 65-92% efficiency), bands do not.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantize_band(
+        &self,
+        src: &crate::color::RowSource,
+        w: usize,
+        h: usize,
+        rows: std::ops::Range<usize>,
+        mode: Dither,
+        scratch: &mut QuantScratch,
+        out: &mut [u8],
+        reuse: Option<Reuse>,
+    ) -> bool {
         match mode {
             Dither::None => self.quantize_plain(src, w, h, scratch, out),
             Dither::Bayer => self.quantize_bayer(src, w, h, scratch, out),
-            Dither::BlueNoise => self.quantize_bluenoise(src, w, h, scratch, out, reuse),
+            Dither::BlueNoise => self.quantize_bluenoise(src, w, h, rows, scratch, out, reuse),
             Dither::Sierra2_4a => self.quantize_diffuse(src, w, h, scratch, out, false),
             Dither::FloydSteinberg => self.quantize_diffuse(src, w, h, scratch, out, true),
         }
@@ -173,11 +202,13 @@ impl<'a> Quantizer<'a> {
     // the gather loops index several parallel stage arrays plus a
     // compacting worklist cursor; an iterator form would obscure that
     #[allow(clippy::needless_range_loop)]
+    #[allow(clippy::too_many_arguments)]
     fn quantize_bluenoise(
         &self,
         src: &crate::color::RowSource,
         w: usize,
         h: usize,
+        rows: std::ops::Range<usize>,
         scratch: &mut QuantScratch,
         out: &mut [u8],
         reuse: Option<Reuse>,
@@ -185,6 +216,7 @@ impl<'a> Quantizer<'a> {
         if self.exact_palette {
             return self.quantize_bluenoise_scalar(src, w, h, scratch, out);
         }
+        let y_first = rows.start;
         // Tile width: multiple of 64 so the blue-noise mask stays aligned
         // to tile starts, small enough that a tile's stage arrays (~28
         // bytes per pixel) stay L1-resident between passes.
@@ -210,7 +242,25 @@ impl<'a> Quantizer<'a> {
             // across frames in the shared scratch
             scratch.sf.fill(0);
         }
-        for y in 0..h {
+        // A band picks up where the row above it left off: the activity
+        // gate reads the previous row's pixels, and the reuse test reads
+        // its change mask, so both are re-derived once at the band's top
+        // edge (row 0 gates against itself and needs neither).
+        if y_first > 0 {
+            src.fill_row(y_first - 1, &mut scratch.row2);
+            if let Some(r) = reuse {
+                crate::color::changed_row(
+                    r.prev_src,
+                    src.frame(),
+                    w,
+                    h,
+                    src.chroma(),
+                    y_first - 1,
+                    &mut scratch.chg,
+                );
+            }
+        }
+        for y in rows {
             // Which pixels of this row differ from the previous frame's.
             // A pixel whose own source colour, its left neighbour and the
             // pixel above it are all unchanged quantizes to exactly the
@@ -282,7 +332,7 @@ impl<'a> Quantizer<'a> {
             while x0 < w {
                 let tw = TILE.min(w - x0);
                 let row = &scratch.row[x0 * 4..(x0 + tw) * 4];
-                let orow = &mut out[y * w + x0..y * w + x0 + tw];
+                let orow = &mut out[(y - y_first) * w + x0..(y - y_first) * w + x0 + tw];
                 let keys = &scratch.keys[x0..];
                 let att = &scratch.att[x0..x0 + tw];
                 let sf = &scratch.sf[..];
