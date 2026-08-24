@@ -289,14 +289,19 @@ fn run(args: &Args) -> io::Result<()> {
     let t1 = Instant::now();
     let nthreads = rayon::current_num_threads().max(1);
     let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(2 * nthreads);
-    // Worker-local histograms flush to a shared list of entry runs once
-    // they exceed this many distinct colors. This bounds each worker's
-    // open-addressed table to a few MB — on true-color content the tables
-    // otherwise balloon to hundreds of MB per thread — while keeping the
-    // lock trivially cheap: a flush converts the table to a plain entry
-    // vector (linear scan, done outside any lock) and the critical section
-    // is a single Vec push. Colors counted by several runs are summed by
-    // one parallel sort + adjacent-merge afterwards.
+    // Once a worker's exact table exceeds this many distinct colors, the
+    // content is true-color (far past any lossless-palette case) and the
+    // worker switches to coarse 6-bit binning: it folds its table into a
+    // per-worker bin array and every later add is a direct indexed sum —
+    // no probing, no growth, no giant tables. Workers that never cross the
+    // threshold keep exact tables; whatever exact entries remain (worker
+    // tables flushed at reduce time) are folded into the bins at the end
+    // if anyone went coarse, or sorted + deduped exactly as before if not.
+    // Bin sums are commutative integers, so the folded result is identical
+    // however frames are scheduled — and identical to folding the full
+    // exact histogram after the fact (what maybe_fold does when the total
+    // crosses the grid size without any single worker crossing the spill
+    // threshold).
     const HIST_SPILL: usize = 1 << 20;
     let spilled: Mutex<Vec<Vec<(u32, u32)>>> = Mutex::new(Vec::new());
     let (read_res, acc) = std::thread::scope(|scope| {
@@ -327,42 +332,63 @@ fn run(args: &Args) -> io::Result<()> {
                 || {
                     (
                         palette::ColorHist::new(),
+                        None::<Vec<[u64; 4]>>,
                         Vec::new(),
                         vec![0u8; w * 4],
                         false,
                     )
                 },
-                |(mut hist, mut frames, mut row, mut alpha), (i, f)| {
+                |(mut hist, mut coarse, mut frames, mut row, mut alpha), (i, f)| {
                     let src = color::RowSource::new(&f, w, h, meta_ref.chroma);
-                    for y in 0..h {
-                        src.fill_row(y, &mut row);
-                        alpha |= palette::accumulate_frame(&mut hist, &row);
-                    }
-                    if hist.len() > HIST_SPILL {
-                        let run = hist.entries();
-                        spilled.lock().unwrap().push(run);
-                        hist = palette::ColorHist::new();
+                    match &mut coarse {
+                        Some(bins) => {
+                            for y in 0..h {
+                                src.fill_row(y, &mut row);
+                                alpha |= palette::accumulate_frame_coarse(bins, &row);
+                            }
+                        }
+                        None => {
+                            for y in 0..h {
+                                src.fill_row(y, &mut row);
+                                alpha |= palette::accumulate_frame(&mut hist, &row);
+                            }
+                            if hist.len() > HIST_SPILL {
+                                let mut bins = palette::new_fold_bins();
+                                palette::fold_into_bins(&mut bins, &hist.entries());
+                                hist = palette::ColorHist::new();
+                                coarse = Some(bins);
+                            }
+                        }
                     }
                     frames.push((i, f));
-                    (hist, frames, row, alpha)
+                    (hist, coarse, frames, row, alpha)
                 },
             )
-            .reduce_with(|(ha, mut fa, row, aa), (hb, fb, _, ab)| {
+            .reduce_with(|(ha, ca, mut fa, row, aa), (hb, cb, fb, _, ab)| {
                 // Flush instead of hash-merging: reductions run while other
                 // workers still accumulate, and a table-into-table merge of
                 // millions of colors would serialize them behind cache-miss
-                // heavy rehashing. The sort below dedups across runs.
+                // heavy rehashing. The final sort (or bin fold) dedups
+                // across runs. Bin arrays do merge here — a fixed 262144
+                // integer adds, cheap and allocation-free.
                 let run = hb.entries();
                 if !run.is_empty() {
                     spilled.lock().unwrap().push(run);
                 }
+                let coarse = match (ca, cb) {
+                    (Some(mut a), Some(b)) => {
+                        palette::merge_bins(&mut a, &b);
+                        Some(a)
+                    }
+                    (a, b) => a.or(b),
+                };
                 fa.extend(fb);
-                (ha, fa, row, aa | ab)
+                (ha, coarse, fa, row, aa | ab)
             });
         (reader_handle.join().expect("reader thread panicked"), acc)
     });
     let nread = read_res?;
-    let Some((hist, mut indexed_frames, _, any_alpha)) = acc else {
+    let Some((hist, coarse, mut indexed_frames, _, any_alpha)) = acc else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "no frames in input",
@@ -371,43 +397,58 @@ fn run(args: &Args) -> io::Result<()> {
     debug_assert_eq!(indexed_frames.len(), nread);
     indexed_frames.sort_unstable_by_key(|(i, _)| *i);
     let frames: Vec<Frame> = indexed_frames.into_iter().map(|(_, f)| f).collect();
-    // Concatenate all flushed runs plus the surviving accumulator, then sum
-    // duplicate colors with one parallel sort + adjacent merge. median_cut
-    // canonicalizes its input by the same sort, so this costs nothing extra
-    // beyond the (already tight) concatenated allocation.
     let mut runs = spilled.into_inner().unwrap();
     runs.push(hist.entries());
     drop(hist);
-    let mut entries = Vec::with_capacity(runs.iter().map(Vec::len).sum());
-    while let Some(r) = runs.pop() {
-        entries.extend_from_slice(&r); // pop + drop each run: concat never
-                                       // holds two full copies
-    }
-    drop(runs);
-    if entries.len() > 16384 {
-        entries.par_sort_unstable();
-    } else {
-        entries.sort_unstable();
-    }
-    entries.dedup_by(|cur, prev| {
-        if cur.0 == prev.0 {
-            prev.1 = prev.1.saturating_add(cur.1);
-            true
-        } else {
-            false
+    let coarse_binned = coarse.is_some();
+    let entries = if let Some(mut bins) = coarse {
+        // Coarse mode: exact leftovers (flushed worker tables) fold into
+        // the bins, which dedup by construction — no sort needed, and the
+        // result matches folding the full exact histogram.
+        for r in &runs {
+            palette::fold_into_bins(&mut bins, r);
         }
-    });
-    entries.shrink_to_fit(); // drops the duplicates' share before the
-                             // palette build allocates its scratch
+        drop(runs);
+        palette::fold_bins_to_entries(&bins)
+    } else {
+        // Concatenate all flushed runs plus the surviving accumulator,
+        // then sum duplicate colors with one parallel sort + adjacent
+        // merge. median_cut canonicalizes its input by the same sort, so
+        // this costs nothing extra beyond the (already tight)
+        // concatenated allocation.
+        let mut entries = Vec::with_capacity(runs.iter().map(Vec::len).sum());
+        while let Some(r) = runs.pop() {
+            entries.extend_from_slice(&r); // pop + drop each run: concat
+                                           // never holds two full copies
+        }
+        drop(runs);
+        if entries.len() > 16384 {
+            entries.par_sort_unstable();
+        } else {
+            entries.sort_unstable();
+        }
+        entries.dedup_by(|cur, prev| {
+            if cur.0 == prev.0 {
+                prev.1 = prev.1.saturating_add(cur.1);
+                true
+            } else {
+                false
+            }
+        });
+        entries.shrink_to_fit(); // drops the duplicates' share before the
+                                 // palette build allocates its scratch
+        entries
+    };
     let t_read = t0.elapsed();
     let t_hist = t1.elapsed();
 
     // ---- palette + nearest-color map --------------------------------------
     let t2 = Instant::now();
     let n_entries = entries.len();
-    let colors = palette::median_cut(&entries, args.colors - 1);
+    let entries = palette::maybe_fold(entries);
+    let n_folded = entries.len();
+    let colors = palette::median_cut(entries, args.colors - 1);
     let t_mc = t2.elapsed();
-    drop(entries);
     let trans_idx = colors.len() as u8;
     let slots = colors.len() + 1;
     let gct_bits = (usize::BITS - (slots - 1).leading_zeros()).max(1) as u8;
@@ -415,10 +456,18 @@ fn run(args: &Args) -> io::Result<()> {
     let nearest = palette::NearestMap::build(&colors);
     let t_pal = t2.elapsed();
     if args.stats {
+        let folded = if coarse_binned {
+            " (coarse-binned)".into()
+        } else if n_folded != n_entries {
+            format!(" (folded to {n_folded})")
+        } else {
+            String::new()
+        };
         eprintln!(
-            "  palette: {} colors from {} entries, nearest-map avg candidates/cell {:.2}, median_cut {:?}",
+            "  palette: {} colors from {} entries{}, nearest-map avg candidates/cell {:.2}, median_cut {:?}",
             colors.len(),
             n_entries,
+            folded,
             nearest.avg_candidates(),
             t_mc
         );

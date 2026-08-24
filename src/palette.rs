@@ -2,7 +2,11 @@
 //! in OkLab space to match ffmpeg's palettegen/paletteuse (ffmpeg >= 5.x).
 //!
 //! - Histogram: open-addressed hash keyed by exact 24-bit color, so sources
-//!   with few distinct colors get a lossless palette.
+//!   with few distinct colors get a lossless palette. When the deduped
+//!   histogram outgrows the 6-bit/channel bin count (true-color content),
+//!   it is folded to one count-weighted mean color per bin before median
+//!   cut — a 255-color palette can't resolve finer than that, and median
+//!   cut's cost is linear in distinct colors.
 //! - Median cut: variance-based (Heckbert), palettegen-style — the box with
 //!   the largest single-channel squared error (in Lab) is split at its
 //!   count-weighted median along that channel; each box yields the Lab
@@ -105,11 +109,28 @@ impl ColorHist {
     }
 }
 
-/// Accumulate one RGBA frame. Pixels with alpha < 128 are skipped; returns
-/// true when any were, so the pipeline knows the disposal mode (and thus
-/// whether delta encoding is possible) before quantization starts.
-/// Run-length batching keeps hash traffic low on flat content.
+/// Accumulate one RGBA frame into the exact-color histogram. Pixels with
+/// alpha < 128 are skipped; returns true when any were, so the pipeline
+/// knows the disposal mode (and thus whether delta encoding is possible)
+/// before quantization starts.
 pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8]) -> bool {
+    accumulate_frame_with(rgba, |c, n| hist.add(c, n))
+}
+
+/// Accumulate one RGBA frame directly into 6-bit/channel bins (the coarse
+/// mode workers switch to once their exact table outgrows the spill
+/// threshold — see `maybe_fold` for why the grid is quality-sufficient).
+/// A binned add is a key computation plus four u64 adds, with no probing
+/// and no table growth, and bin sums are commutative, so the result is
+/// independent of how frames are scheduled across workers.
+pub fn accumulate_frame_coarse(bins: &mut [[u64; 4]], rgba: &[u8]) -> bool {
+    accumulate_frame_with(rgba, |c, n| bin_add(bins, c, n))
+}
+
+/// Shared RLE scan: run-length batching keeps sink traffic low on flat
+/// content.
+#[inline(always)]
+fn accumulate_frame_with(rgba: &[u8], mut add: impl FnMut(u32, u32)) -> bool {
     let pixels = rgba.as_chunks::<4>().0;
     let n = pixels.len();
     let mut has_alpha = false;
@@ -128,7 +149,7 @@ pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8]) -> bool {
             run += 1;
         } else {
             if run > 0 {
-                hist.add(last, run);
+                add(last, run);
             }
             last = c;
             run = 1;
@@ -153,9 +174,74 @@ pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8]) -> bool {
         }
     }
     if run > 0 {
-        hist.add(last, run);
+        add(last, run);
     }
     has_alpha
+}
+
+// ---------------------------------------------------------------------------
+// Histogram folding
+
+/// Fold an exact-color histogram into `GRID_BITS`-per-channel bins, each
+/// represented by the count-weighted mean of its colors, when it holds more
+/// entries than there are bins (so folding always shrinks). Means stay
+/// within their (4-wide) cell, so output colors remain unique — a property
+/// `median_cut`'s tie-breaking relies on.
+pub fn maybe_fold(entries: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    if entries.len() <= GRID_SIZE {
+        return entries;
+    }
+    let mut bins = new_fold_bins();
+    fold_into_bins(&mut bins, &entries);
+    fold_bins_to_entries(&bins)
+}
+
+/// A zeroed bin array: `[count, r_sum, g_sum, b_sum]` per grid cell.
+pub fn new_fold_bins() -> Vec<[u64; 4]> {
+    vec![[0u64; 4]; GRID_SIZE]
+}
+
+#[inline(always)]
+fn bin_add(bins: &mut [[u64; 4]], c: u32, n: u32) {
+    let (r, g, b) = (c >> 16, (c >> 8) & 255, c & 255);
+    let bin = &mut bins[grid_key(r as u8, g as u8, b as u8)];
+    let n = n as u64;
+    bin[0] += n;
+    bin[1] += n * r as u64;
+    bin[2] += n * g as u64;
+    bin[3] += n * b as u64;
+}
+
+/// Sum exact-color entries into the bin array.
+pub fn fold_into_bins(bins: &mut [[u64; 4]], entries: &[(u32, u32)]) {
+    for &(c, n) in entries {
+        bin_add(bins, c, n);
+    }
+}
+
+/// Merge `src`'s sums into `dst` (worker bin arrays at reduce time).
+pub fn merge_bins(dst: &mut [[u64; 4]], src: &[[u64; 4]]) {
+    for (d, s) in dst.iter_mut().zip(src) {
+        for c in 0..4 {
+            d[c] += s[c];
+        }
+    }
+}
+
+/// Emit one (mean color, count) entry per populated bin, in bin order.
+pub fn fold_bins_to_entries(bins: &[[u64; 4]]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    for bin in bins {
+        let n = bin[0];
+        if n == 0 {
+            continue;
+        }
+        let r = ((bin[1] + n / 2) / n) as u32;
+        let g = ((bin[2] + n / 2) / n) as u32;
+        let b = ((bin[3] + n / 2) / n) as u32;
+        out.push(((r << 16) | (g << 8) | b, n.min(u32::MAX as u64) as u32));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -176,28 +262,77 @@ struct Box_ {
     cut_axis: usize,
 }
 
+/// Boxes at least this long compute their sums with parallel fixed-size
+/// chunks (only the first few splits of a large histogram qualify). The
+/// per-chunk partials combine sequentially in chunk order, so the result
+/// is independent of thread scheduling — it differs from the serial
+/// left-fold only in rounding grouping, which is equally arbitrary.
+const PAR_BOX: usize = 1 << 16;
+const BOX_CHUNK: usize = 8192;
+
 fn make_box(bins: &[HBin], start: usize, len: usize) -> Box_ {
     let slice = &bins[start..start + len];
-    let mut count = 0u64;
-    let mut sum = [0f64; 3];
-    for b in slice {
-        count += b.count as u64;
-        for (s, &l) in sum.iter_mut().zip(&b.lab) {
-            *s += b.count as f64 * l as f64;
+    let (count, sum) = if len >= PAR_BOX {
+        slice
+            .par_chunks(BOX_CHUNK)
+            .map(|ch| {
+                let mut count = 0u64;
+                let mut sum = [0f64; 3];
+                for b in ch {
+                    count += b.count as u64;
+                    for (s, &l) in sum.iter_mut().zip(&b.lab) {
+                        *s += b.count as f64 * l as f64;
+                    }
+                }
+                (count, sum)
+            })
+            .collect::<Vec<_>>()
+            .iter()
+            .fold((0u64, [0f64; 3]), |(ac, asum), &(c, s)| {
+                (ac + c, [asum[0] + s[0], asum[1] + s[1], asum[2] + s[2]])
+            })
+    } else {
+        let mut count = 0u64;
+        let mut sum = [0f64; 3];
+        for b in slice {
+            count += b.count as u64;
+            for (s, &l) in sum.iter_mut().zip(&b.lab) {
+                *s += b.count as f64 * l as f64;
+            }
         }
-    }
+        (count, sum)
+    };
     let mean = [
         sum[0] / count as f64,
         sum[1] / count as f64,
         sum[2] / count as f64,
     ];
-    let mut er2 = [0f64; 3];
-    for b in slice {
-        for c in 0..3 {
-            let d = b.lab[c] as f64 - mean[c];
-            er2[c] += b.count as f64 * d * d;
+    let er2 = if len >= PAR_BOX {
+        slice
+            .par_chunks(BOX_CHUNK)
+            .map(|ch| {
+                let mut er2 = [0f64; 3];
+                for b in ch {
+                    for c in 0..3 {
+                        let d = b.lab[c] as f64 - mean[c];
+                        er2[c] += b.count as f64 * d * d;
+                    }
+                }
+                er2
+            })
+            .collect::<Vec<_>>()
+            .iter()
+            .fold([0f64; 3], |a, e| [a[0] + e[0], a[1] + e[1], a[2] + e[2]])
+    } else {
+        let mut er2 = [0f64; 3];
+        for b in slice {
+            for c in 0..3 {
+                let d = b.lab[c] as f64 - mean[c];
+                er2[c] += b.count as f64 * d * d;
+            }
         }
-    }
+        er2
+    };
     // palettegen: split axis and box choice both follow the single largest
     // per-channel squared error
     let mut cut_axis = 0;
@@ -421,7 +556,7 @@ fn weighted_split(
 }
 
 /// Variance median cut over exact colors. Returns at most `max_colors`.
-pub fn median_cut(entries: &[(u32, u32)], max_colors: usize) -> Vec<[u8; 3]> {
+pub fn median_cut(mut entries: Vec<(u32, u32)>, max_colors: usize) -> Vec<[u8; 3]> {
     if entries.is_empty() {
         return vec![[0, 0, 0]];
     }
@@ -436,8 +571,8 @@ pub fn median_cut(entries: &[(u32, u32)], max_colors: usize) -> Vec<[u8; 3]> {
     // Canonicalize the entries order (histogram layout depends on merge
     // order): boxes are only partitioned below, never sorted, so this
     // initial srgb order is what makes every later float sum — and thus
-    // the palette — independent of thread scheduling.
-    let mut entries = entries.to_vec();
+    // the palette — independent of thread scheduling. (A no-op-cost sort
+    // for callers that already sorted, e.g. the exact histogram path.)
     if entries.len() > 16384 {
         entries.par_sort_unstable();
     } else {
@@ -829,7 +964,7 @@ mod tests {
         .iter()
         .flat_map(|p| p.iter().copied())
         .collect();
-        let mut pal = median_cut(&hist_from_frame(&frame), 255);
+        let mut pal = median_cut(hist_from_frame(&frame), 255);
         pal.sort();
         assert_eq!(pal, vec![[0, 0, 255], [0, 255, 0], [255, 0, 0]]);
     }
@@ -841,7 +976,7 @@ mod tests {
             .iter()
             .flat_map(|p| p.iter().copied())
             .collect();
-        let pal = median_cut(&hist_from_frame(&frame), 255);
+        let pal = median_cut(hist_from_frame(&frame), 255);
         assert_eq!(pal.len(), 2);
         let nm = NearestMap::build(&pal);
         assert_ne!(nm.lookup(10, 10, 10), nm.lookup(11, 11, 11));
@@ -855,7 +990,7 @@ mod tests {
             let g = (i / 64 * 4 % 256) as u8;
             frame.extend_from_slice(&[r, g, (i % 251) as u8, 255]);
         }
-        let pal = median_cut(&hist_from_frame(&frame), 255);
+        let pal = median_cut(hist_from_frame(&frame), 255);
         assert_eq!(pal.len(), 255);
     }
 
@@ -947,6 +1082,108 @@ mod tests {
                 assert_eq!(k, sorted[s - 1].0, "boundary key, case {case}");
             }
         }
+    }
+
+    #[test]
+    fn fold_is_identity_when_small() {
+        let entries = vec![(0x102030u32, 5u32), (0xFFFFFF, 1)];
+        assert_eq!(maybe_fold(entries.clone()), entries);
+    }
+
+    #[test]
+    fn fold_means_and_counts() {
+        // More entries than bins forces a fold; verify against a brute-force
+        // per-cell weighted mean.
+        let mut entries = Vec::new();
+        let mut x = 1234567u32;
+        let mut rng = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let mut seen = std::collections::HashSet::new();
+        while entries.len() <= GRID_SIZE {
+            let c = rng() & 0xFF_FFFF;
+            if seen.insert(c) {
+                entries.push((c, 1 + rng() % 1000));
+            }
+        }
+        let folded = maybe_fold(entries.clone());
+        assert!(folded.len() <= GRID_SIZE);
+        let total_in: u64 = entries.iter().map(|&(_, n)| n as u64).sum();
+        let total_out: u64 = folded.iter().map(|&(_, n)| n as u64).sum();
+        assert_eq!(total_in, total_out);
+        // reference: one-pass weighted sums per cell
+        let mut expect: std::collections::HashMap<usize, (u64, [u64; 3])> =
+            std::collections::HashMap::new();
+        for &(ec, en) in &entries {
+            let (r, g, b) = (
+                (ec >> 16) as u64,
+                ((ec >> 8) & 255) as u64,
+                (ec & 255) as u64,
+            );
+            let e = expect
+                .entry(grid_key(r as u8, g as u8, b as u8))
+                .or_default();
+            e.0 += en as u64;
+            e.1[0] += en as u64 * r;
+            e.1[1] += en as u64 * g;
+            e.1[2] += en as u64 * b;
+        }
+        assert_eq!(folded.len(), expect.len());
+        for &(c, n) in &folded {
+            let (r, g, b) = ((c >> 16) as u8, (c >> 8) as u8, c as u8);
+            let (cnt, sum) = expect.remove(&grid_key(r, g, b)).expect("cell");
+            assert_eq!(n as u64, cnt);
+            assert_eq!(r as u64, (sum[0] + cnt / 2) / cnt);
+            assert_eq!(g as u64, (sum[1] + cnt / 2) / cnt);
+            assert_eq!(b as u64, (sum[2] + cnt / 2) / cnt);
+        }
+    }
+
+    #[test]
+    fn coarse_accumulate_matches_exact_fold() {
+        // Random rows with runs and transparency: binning while
+        // accumulating must equal folding the exact histogram afterwards.
+        let mut x = 99u32;
+        let mut rng = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let mut rows = Vec::new();
+        for _ in 0..64 {
+            let mut row = Vec::new();
+            let mut i = 0;
+            while i < 512 {
+                let run = 1 + (rng() % 9) as usize;
+                let px = [
+                    (rng() % 256) as u8,
+                    (rng() % 256) as u8,
+                    (rng() % 256) as u8,
+                    if rng() % 11 == 0 { 0 } else { 255 },
+                ];
+                for _ in 0..run.min(512 - i) {
+                    row.extend_from_slice(&px);
+                }
+                i += run;
+            }
+            rows.push(row);
+        }
+        let mut hist = ColorHist::new();
+        let mut bins = new_fold_bins();
+        let mut alpha_exact = false;
+        let mut alpha_coarse = false;
+        for row in &rows {
+            alpha_exact |= accumulate_frame(&mut hist, row);
+            alpha_coarse |= accumulate_frame_coarse(&mut bins, row);
+        }
+        assert_eq!(alpha_exact, alpha_coarse);
+        let mut expect = new_fold_bins();
+        fold_into_bins(&mut expect, &hist.entries());
+        assert_eq!(fold_bins_to_entries(&bins), fold_bins_to_entries(&expect));
     }
 
     #[test]
