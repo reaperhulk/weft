@@ -372,13 +372,13 @@ fn run(args: &Args) -> io::Result<()> {
                             palette::ColorHist::new(),
                             None::<Vec<[u64; 4]>>,
                             Vec::new(),
-                            (vec![0u8; w * 4], Vec::new()),
+                            (vec![0u8; w * 4], vec![0u32; w], Vec::new()),
                             false,
                         )
                     },
                     |(mut hist, mut coarse, mut frames, mut scratch, mut alpha), (i, f)| {
                         use std::sync::atomic::Ordering;
-                        let (row, runs) = &mut scratch;
+                        let (row, rgb_keys, runs) = &mut scratch;
                         if coarse.is_none() && go_coarse.load(Ordering::Relaxed) {
                             let mut bins = palette::new_fold_bins();
                             palette::fold_into_bins(&mut bins, &hist.entries());
@@ -390,21 +390,37 @@ fn run(args: &Args) -> io::Result<()> {
                             let src = color::RowSource::new(&f, w, h, meta_ref.chroma);
                             match &mut coarse {
                                 Some(bins) => {
-                                    for y in 0..h {
-                                        frame_alpha |= palette::accumulate_frame_coarse(
-                                            bins,
-                                            rgba_row(&src, y, row),
-                                            runs,
-                                        );
+                                    if src.has_direct_rgb_keys() {
+                                        for y in 0..h {
+                                            src.fill_rgb_keys(y, rgb_keys);
+                                            palette::accumulate_rgb_keys_coarse(
+                                                bins, rgb_keys, runs,
+                                            );
+                                        }
+                                    } else {
+                                        for y in 0..h {
+                                            frame_alpha |= palette::accumulate_frame_coarse(
+                                                bins,
+                                                rgba_row(&src, y, row),
+                                                runs,
+                                            );
+                                        }
                                     }
                                 }
                                 None => {
-                                    for y in 0..h {
-                                        frame_alpha |= palette::accumulate_frame(
-                                            &mut hist,
-                                            rgba_row(&src, y, row),
-                                            runs,
-                                        );
+                                    if src.has_direct_rgb_keys() {
+                                        for y in 0..h {
+                                            src.fill_rgb_keys(y, rgb_keys);
+                                            palette::accumulate_rgb_keys(&mut hist, rgb_keys, runs);
+                                        }
+                                    } else {
+                                        for y in 0..h {
+                                            frame_alpha |= palette::accumulate_frame(
+                                                &mut hist,
+                                                rgba_row(&src, y, row),
+                                                runs,
+                                            );
+                                        }
                                     }
                                     if hist.len() > palette::GRID_SIZE {
                                         go_coarse.store(true, Ordering::Relaxed);

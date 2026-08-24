@@ -146,6 +146,20 @@ pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8], runs: &mut Vec<(u32, 
     has_alpha
 }
 
+/// Accumulate an intrinsically opaque row already expressed as canonical
+/// `0xRRGGBB` keys. YUV conversion can produce these lanes directly,
+/// avoiding an RGBA store followed immediately by another RGB unpack.
+pub fn accumulate_rgb_keys(hist: &mut ColorHist, keys: &[u32], runs: &mut Vec<(u32, u32)>) {
+    scan_rgb_key_runs(keys, runs);
+    for j in 0..runs.len() {
+        if let Some(&(c, _)) = runs.get(j + 8) {
+            hist.prefetch(c);
+        }
+        let (c, n) = runs[j];
+        hist.add(c, n);
+    }
+}
+
 /// Accumulate one RGBA frame directly into 6-bit/channel bins (the coarse
 /// mode workers switch to once their exact table outgrows the spill
 /// threshold — see `maybe_fold` for why the grid is quality-sufficient).
@@ -174,6 +188,45 @@ pub fn accumulate_frame_coarse(
         bin_add(bins, c, n);
     }
     has_alpha
+}
+
+/// Coarse-bin counterpart of `accumulate_rgb_keys`.
+pub fn accumulate_rgb_keys_coarse(bins: &mut [[u64; 4]], keys: &[u32], runs: &mut Vec<(u32, u32)>) {
+    scan_rgb_key_runs(keys, runs);
+    for j in 0..runs.len() {
+        if let Some(&(c, _)) = runs.get(j + 8) {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                let key = grid_key((c >> 16) as u8, (c >> 8) as u8, c as u8);
+                _mm_prefetch(bins.as_ptr().add(key) as *const i8, _MM_HINT_T0);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            let _ = c;
+        }
+        let (c, n) = runs[j];
+        bin_add(bins, c, n);
+    }
+}
+
+#[inline(always)]
+fn scan_rgb_key_runs(keys: &[u32], runs: &mut Vec<(u32, u32)>) {
+    runs.clear();
+    if keys.is_empty() {
+        return;
+    }
+    let mut last = keys[0];
+    let mut run = 1u32;
+    for &key in &keys[1..] {
+        if key == last {
+            run += 1;
+        } else {
+            runs.push((last, run));
+            last = key;
+            run = 1;
+        }
+    }
+    runs.push((last, run));
 }
 
 /// Shared RLE scan into `runs` (cleared first): run-length batching keeps

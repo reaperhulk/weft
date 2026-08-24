@@ -62,6 +62,47 @@ impl<'a> RowSource<'a> {
             Frame::Yuv(buf) => fill_row_yuv(buf, w, self.h, self.chroma.unwrap(), y, out),
         }
     }
+
+    /// Fill an RGBA row and, when the source is intrinsically opaque,
+    /// emit its blue-noise grid keys as part of the same conversion pass.
+    /// Returns whether `keys` was filled.
+    #[inline]
+    pub fn fill_row_with_grid_keys(&self, y: usize, out: &mut [u8], keys: &mut [u32]) -> bool {
+        let w = self.w;
+        match self.frame {
+            Frame::Rgba(buf) => {
+                out.copy_from_slice(&buf[y * w * 4..(y + 1) * w * 4]);
+                false
+            }
+            Frame::Rgb(buf) => {
+                expand_row_rgb_with_keys(&buf[y * w * 3..(y + 1) * w * 3], out, keys);
+                true
+            }
+            Frame::Yuv(buf) => {
+                fill_row_yuv_with_keys(buf, w, self.h, self.chroma.unwrap(), y, out, keys);
+                true
+            }
+        }
+    }
+
+    /// Whether histogram rows can be converted straight to canonical
+    /// `0xRRGGBB` keys without first materializing RGBA.
+    #[inline]
+    pub fn has_direct_rgb_keys(&self) -> bool {
+        matches!(self.frame, Frame::Yuv(_))
+    }
+
+    /// Fill canonical `0xRRGGBB` histogram keys. Call only when
+    /// `has_direct_rgb_keys` is true.
+    #[inline]
+    pub fn fill_rgb_keys(&self, y: usize, keys: &mut [u32]) {
+        match self.frame {
+            Frame::Yuv(buf) => {
+                fill_row_yuv_rgb_keys(buf, self.w, self.h, self.chroma.unwrap(), y, keys)
+            }
+            Frame::Rgba(_) | Frame::Rgb(_) => unreachable!("source has no direct RGB-key path"),
+        }
+    }
 }
 
 /// Re-expand a packed RGB row to RGBA. Frames are only stored as RGB when
@@ -76,6 +117,25 @@ fn expand_row_rgb(row: &[u8], out: &mut [u8]) {
     {
         *dst = [src[0], src[1], src[2], 255];
     }
+}
+
+#[inline]
+fn expand_row_rgb_with_keys(row: &[u8], out: &mut [u8], keys: &mut [u32]) {
+    for ((dst, key), src) in out
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(keys)
+        .zip(row.as_chunks::<3>().0)
+    {
+        *dst = [src[0], src[1], src[2], 255];
+        *key = grid_key(src[0], src[1], src[2]);
+    }
+}
+
+#[inline(always)]
+fn grid_key(r: u8, g: u8, b: u8) -> u32 {
+    (((r as u32) >> 2) << 12) | (((g as u32) >> 2) << 6) | ((b as u32) >> 2)
 }
 
 /// Pack an all-opaque RGBA frame down to RGB, dropping the alpha byte.
@@ -144,6 +204,126 @@ fn fill_row_yuv(buf: &[u8], w: usize, h: usize, chroma: Chroma, y: usize, out: &
     }
 }
 
+#[inline]
+fn fill_row_yuv_with_keys(
+    buf: &[u8],
+    w: usize,
+    h: usize,
+    chroma: Chroma,
+    y: usize,
+    out: &mut [u8],
+    keys: &mut [u32],
+) {
+    let cw = w.div_ceil(2);
+    match chroma {
+        Chroma::Mono => {
+            let yrow = &buf[y * w..y * w + w];
+            for ((dst, key), &yy) in out.as_chunks_mut::<4>().0.iter_mut().zip(keys).zip(yrow) {
+                let g = clamp8((CY * (yy as i32 - 16) + ROUND) >> 16);
+                *dst = [g, g, g, 255];
+                *key = grid_key(g, g, g);
+            }
+        }
+        Chroma::C420 => {
+            let ch = h.div_ceil(2);
+            let (yp, rest) = buf.split_at(w * h);
+            let (up, vp) = rest.split_at(cw * ch);
+            let crow = (y >> 1) * cw;
+            convert_row_with_keys(
+                &yp[y * w..y * w + w],
+                &up[crow..crow + cw],
+                &vp[crow..crow + cw],
+                1,
+                out,
+                keys,
+            );
+        }
+        Chroma::C422 => {
+            let (yp, rest) = buf.split_at(w * h);
+            let (up, vp) = rest.split_at(cw * h);
+            let crow = y * cw;
+            convert_row_with_keys(
+                &yp[y * w..y * w + w],
+                &up[crow..crow + cw],
+                &vp[crow..crow + cw],
+                1,
+                out,
+                keys,
+            );
+        }
+        Chroma::C444 => {
+            let (yp, rest) = buf.split_at(w * h);
+            let (up, vp) = rest.split_at(w * h);
+            let crow = y * w;
+            convert_row_with_keys(
+                &yp[y * w..y * w + w],
+                &up[crow..crow + w],
+                &vp[crow..crow + w],
+                0,
+                out,
+                keys,
+            );
+        }
+    }
+}
+
+#[inline]
+fn fill_row_yuv_rgb_keys(
+    buf: &[u8],
+    w: usize,
+    h: usize,
+    chroma: Chroma,
+    y: usize,
+    keys: &mut [u32],
+) {
+    let cw = w.div_ceil(2);
+    match chroma {
+        Chroma::Mono => {
+            for (key, &yy) in keys.iter_mut().zip(&buf[y * w..y * w + w]) {
+                let g = clamp8((CY * (yy as i32 - 16) + ROUND) >> 16);
+                *key = ((g as u32) << 16) | ((g as u32) << 8) | g as u32;
+            }
+        }
+        Chroma::C420 => {
+            let ch = h.div_ceil(2);
+            let (yp, rest) = buf.split_at(w * h);
+            let (up, vp) = rest.split_at(cw * ch);
+            let crow = (y >> 1) * cw;
+            convert_row_to_rgb_keys(
+                &yp[y * w..y * w + w],
+                &up[crow..crow + cw],
+                &vp[crow..crow + cw],
+                1,
+                keys,
+            );
+        }
+        Chroma::C422 => {
+            let (yp, rest) = buf.split_at(w * h);
+            let (up, vp) = rest.split_at(cw * h);
+            let crow = y * cw;
+            convert_row_to_rgb_keys(
+                &yp[y * w..y * w + w],
+                &up[crow..crow + cw],
+                &vp[crow..crow + cw],
+                1,
+                keys,
+            );
+        }
+        Chroma::C444 => {
+            let (yp, rest) = buf.split_at(w * h);
+            let (up, vp) = rest.split_at(w * h);
+            let crow = y * w;
+            convert_row_to_rgb_keys(
+                &yp[y * w..y * w + w],
+                &up[crow..crow + w],
+                &vp[crow..crow + w],
+                0,
+                keys,
+            );
+        }
+    }
+}
+
 #[inline(always)]
 fn convert_row(yrow: &[u8], urow: &[u8], vrow: &[u8], cx_shift: u32, out: &mut [u8]) {
     // SIMD main blocks (byte-identical math), scalar tail.
@@ -158,6 +338,59 @@ fn convert_row(yrow: &[u8], urow: &[u8], vrow: &[u8], cx_shift: u32, out: &mut [
         dst[1] = clamp8((c + CGU * d + CGV * e + ROUND) >> 16);
         dst[2] = clamp8((c + CBU * d + ROUND) >> 16);
         dst[3] = 255;
+    }
+}
+
+#[inline(always)]
+fn convert_row_with_keys(
+    yrow: &[u8],
+    urow: &[u8],
+    vrow: &[u8],
+    cx_shift: u32,
+    out: &mut [u8],
+    keys: &mut [u32],
+) {
+    let done = crate::simdops::convert_row_with_keys(
+        crate::simdops::level(),
+        yrow,
+        urow,
+        vrow,
+        cx_shift,
+        out,
+        keys,
+    );
+    for x in done..yrow.len() {
+        let cx = x >> cx_shift;
+        let c = CY * (yrow[x] as i32 - 16);
+        let d = urow[cx] as i32 - 128;
+        let e = vrow[cx] as i32 - 128;
+        let r = clamp8((c + CRV * e + ROUND) >> 16);
+        let g = clamp8((c + CGU * d + CGV * e + ROUND) >> 16);
+        let b = clamp8((c + CBU * d + ROUND) >> 16);
+        out[x * 4..x * 4 + 4].copy_from_slice(&[r, g, b, 255]);
+        keys[x] = grid_key(r, g, b);
+    }
+}
+
+#[inline(always)]
+fn convert_row_to_rgb_keys(yrow: &[u8], urow: &[u8], vrow: &[u8], cx_shift: u32, keys: &mut [u32]) {
+    let done = crate::simdops::convert_row_to_rgb_keys(
+        crate::simdops::level(),
+        yrow,
+        urow,
+        vrow,
+        cx_shift,
+        keys,
+    );
+    for x in done..yrow.len() {
+        let cx = x >> cx_shift;
+        let c = CY * (yrow[x] as i32 - 16);
+        let d = urow[cx] as i32 - 128;
+        let e = vrow[cx] as i32 - 128;
+        let r = clamp8((c + CRV * e + ROUND) >> 16);
+        let g = clamp8((c + CGU * d + CGV * e + ROUND) >> 16);
+        let b = clamp8((c + CBU * d + ROUND) >> 16);
+        keys[x] = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
     }
 }
 
@@ -216,6 +449,43 @@ mod tests {
                 .rgba_row(0)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn fused_yuv_keys_match_rgba_conversion() {
+        for chroma in [Chroma::Mono, Chroma::C420, Chroma::C422, Chroma::C444] {
+            let w = 33usize;
+            let h = 3usize;
+            let cw = w.div_ceil(2);
+            let len = match chroma {
+                Chroma::Mono => w * h,
+                Chroma::C420 => w * h + 2 * cw * h.div_ceil(2),
+                Chroma::C422 => w * h + 2 * cw * h,
+                Chroma::C444 => 3 * w * h,
+            };
+            let buf: Vec<u8> = (0..len)
+                .map(|i| ((i * 73 + i / 7 * 29 + 17) & 0xff) as u8)
+                .collect();
+            let frame = Frame::Yuv(buf);
+            let src = RowSource::new(&frame, w, h, Some(chroma));
+            for y in 0..h {
+                let mut plain = vec![0; w * 4];
+                let mut fused = vec![0; w * 4];
+                let mut grid = vec![0; w];
+                let mut rgb = vec![0; w];
+                src.fill_row(y, &mut plain);
+                assert!(src.fill_row_with_grid_keys(y, &mut fused, &mut grid));
+                src.fill_rgb_keys(y, &mut rgb);
+                assert_eq!(fused, plain);
+                for (i, px) in plain.as_chunks::<4>().0.iter().enumerate() {
+                    assert_eq!(grid[i], grid_key(px[0], px[1], px[2]));
+                    assert_eq!(
+                        rgb[i],
+                        ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | px[2] as u32
+                    );
+                }
+            }
+        }
     }
 
     #[test]

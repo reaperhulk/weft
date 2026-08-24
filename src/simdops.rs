@@ -36,6 +36,39 @@ pub fn convert_row(
     fearless_simd::dispatch!(level, simd => convert_row_impl(simd, yrow, urow, vrow, cx_shift, out))
 }
 
+/// Convert one YUV row to RGBA while also emitting the 6-bit/channel grid
+/// key consumed by the staged blue-noise quantizer. The RGB channels are
+/// already live as SIMD lanes here, so producing keys avoids rereading and
+/// unpacking the completed RGBA row in a second pass.
+pub fn convert_row_with_keys(
+    level: Level,
+    yrow: &[u8],
+    urow: &[u8],
+    vrow: &[u8],
+    cx_shift: u32,
+    out: &mut [u8],
+    keys: &mut [u32],
+) -> usize {
+    fearless_simd::dispatch!(level, simd => convert_row_with_keys_impl(
+        simd, yrow, urow, vrow, cx_shift, out, keys
+    ))
+}
+
+/// Convert one YUV row directly to canonical `0xRRGGBB` keys for the
+/// histogram pass, which does not otherwise need an RGBA materialization.
+pub fn convert_row_to_rgb_keys(
+    level: Level,
+    yrow: &[u8],
+    urow: &[u8],
+    vrow: &[u8],
+    cx_shift: u32,
+    keys: &mut [u32],
+) -> usize {
+    fearless_simd::dispatch!(level, simd => convert_row_to_rgb_keys_impl(
+        simd, yrow, urow, vrow, cx_shift, keys
+    ))
+}
+
 #[inline(always)]
 fn convert_row_impl<S: Simd>(
     simd: S,
@@ -76,6 +109,96 @@ fn convert_row_impl<S: Simd>(
 }
 
 #[inline(always)]
+fn convert_row_with_keys_impl<S: Simd>(
+    simd: S,
+    yrow: &[u8],
+    urow: &[u8],
+    vrow: &[u8],
+    cx_shift: u32,
+    out: &mut [u8],
+    keys: &mut [u32],
+) -> usize {
+    let w = yrow.len();
+    let mut x = 0usize;
+    while x + 16 <= w && (x >> cx_shift) + 16 <= urow.len() {
+        let cx = x >> cx_shift;
+        let yv = u8x16::from_slice(simd, &yrow[x..x + 16]);
+        let (ylo, yhi) = yv.widen();
+        let (u0, u1, v0, v1) = chroma_groups(simd, urow, vrow, cx, cx_shift);
+        convert_group_with_keys(
+            simd,
+            ylo,
+            u0,
+            v0,
+            &mut out[x * 4..x * 4 + 32],
+            &mut keys[x..x + 8],
+        );
+        convert_group_with_keys(
+            simd,
+            yhi,
+            u1,
+            v1,
+            &mut out[x * 4 + 32..x * 4 + 64],
+            &mut keys[x + 8..x + 16],
+        );
+        x += 16;
+    }
+    x
+}
+
+#[inline(always)]
+fn convert_row_to_rgb_keys_impl<S: Simd>(
+    simd: S,
+    yrow: &[u8],
+    urow: &[u8],
+    vrow: &[u8],
+    cx_shift: u32,
+    keys: &mut [u32],
+) -> usize {
+    let w = yrow.len();
+    let mut x = 0usize;
+    while x + 16 <= w && (x >> cx_shift) + 16 <= urow.len() {
+        let cx = x >> cx_shift;
+        let yv = u8x16::from_slice(simd, &yrow[x..x + 16]);
+        let (ylo, yhi) = yv.widen();
+        let (u0, u1, v0, v1) = chroma_groups(simd, urow, vrow, cx, cx_shift);
+        convert_group_to_rgb_keys(simd, ylo, u0, v0, &mut keys[x..x + 8]);
+        convert_group_to_rgb_keys(simd, yhi, u1, v1, &mut keys[x + 8..x + 16]);
+        x += 16;
+    }
+    x
+}
+
+#[inline(always)]
+fn chroma_groups<S: Simd>(
+    simd: S,
+    urow: &[u8],
+    vrow: &[u8],
+    cx: usize,
+    cx_shift: u32,
+) -> (
+    fearless_simd::u16x8<S>,
+    fearless_simd::u16x8<S>,
+    fearless_simd::u16x8<S>,
+    fearless_simd::u16x8<S>,
+) {
+    if cx_shift == 1 {
+        let (ulo, _) = u8x16::from_slice(simd, &urow[cx..cx + 16]).widen();
+        let (vlo, _) = u8x16::from_slice(simd, &vrow[cx..cx + 16]).widen();
+        (
+            ulo.zip_low(ulo),
+            ulo.zip_high(ulo),
+            vlo.zip_low(vlo),
+            vlo.zip_high(vlo),
+        )
+    } else {
+        let (ulo, uhi) = u8x16::from_slice(simd, &urow[cx..cx + 16]).widen();
+        let (vlo, vhi) = u8x16::from_slice(simd, &vrow[cx..cx + 16]).widen();
+        (ulo, uhi, vlo, vhi)
+    }
+}
+
+#[inline(always)]
 fn convert_group<S: Simd>(
     simd: S,
     y16: fearless_simd::u16x8<S>,
@@ -83,6 +206,52 @@ fn convert_group<S: Simd>(
     v16v: fearless_simd::u16x8<S>,
     out: &mut [u8],
 ) {
+    let (r, g, b) = convert_channels(simd, y16, u16v, v16v);
+    let px = r | (g << 8u32) | (b << 16u32) | ALPHA;
+    // lane bytes in LE order are exactly the RGBA byte layout
+    let bytes: fearless_simd::u8x32<S> = px.bitcast();
+    bytes.store_slice(out);
+}
+
+#[inline(always)]
+fn convert_group_with_keys<S: Simd>(
+    simd: S,
+    y16: fearless_simd::u16x8<S>,
+    u16v: fearless_simd::u16x8<S>,
+    v16v: fearless_simd::u16x8<S>,
+    out: &mut [u8],
+    keys: &mut [u32],
+) {
+    let (r, g, b) = convert_channels(simd, y16, u16v, v16v);
+    let px = r | (g << 8u32) | (b << 16u32) | ALPHA;
+    let bytes: fearless_simd::u8x32<S> = px.bitcast();
+    bytes.store_slice(out);
+    (((r >> 2u32) << 12u32) | ((g >> 2u32) << 6u32) | (b >> 2u32))
+        .bitcast::<u32x8<S>>()
+        .store_slice(keys);
+}
+
+#[inline(always)]
+fn convert_group_to_rgb_keys<S: Simd>(
+    simd: S,
+    y16: fearless_simd::u16x8<S>,
+    u16v: fearless_simd::u16x8<S>,
+    v16v: fearless_simd::u16x8<S>,
+    keys: &mut [u32],
+) {
+    let (r, g, b) = convert_channels(simd, y16, u16v, v16v);
+    ((r << 16u32) | (g << 8u32) | b)
+        .bitcast::<u32x8<S>>()
+        .store_slice(keys);
+}
+
+#[inline(always)]
+fn convert_channels<S: Simd>(
+    simd: S,
+    y16: fearless_simd::u16x8<S>,
+    u16v: fearless_simd::u16x8<S>,
+    v16v: fearless_simd::u16x8<S>,
+) -> (i32x8<S>, i32x8<S>, i32x8<S>) {
     let (ya, yb) = y16.widen();
     let yi: i32x8<S> = ya.combine(yb).bitcast();
     let (ua, ub) = u16v.widen();
@@ -98,10 +267,7 @@ fn convert_group<S: Simd>(
     let r = ((c + e * CRV + ROUND) >> 16u32).max(zero).min(hi);
     let g = ((c + d * CGU + e * CGV + ROUND) >> 16u32).max(zero).min(hi);
     let b = ((c + d * CBU + ROUND) >> 16u32).max(zero).min(hi);
-    let px = r | (g << 8u32) | (b << 16u32) | ALPHA;
-    // lane bytes in LE order are exactly the RGBA byte layout
-    let bytes: fearless_simd::u8x32<S> = px.bitcast();
-    bytes.store_slice(out);
+    (r, g, b)
 }
 
 /// Vectorized fast cube root for 8 non-negative lanes: shift-series
@@ -204,6 +370,40 @@ pub fn bn_keys_att(
     att: &mut [u32],
 ) -> bool {
     fearless_simd::dispatch!(level, simd => bn_keys_att_impl(simd, cur, prev, gate, keys, att))
+}
+
+/// Activity attenuation only. Sources that emitted their grid keys while
+/// constructing the RGBA row use this instead of rereading the row to
+/// derive those keys a second time.
+pub fn bn_activity(level: Level, cur: &[u8], prev: &[u8], gate: u32, att: &mut [u32]) {
+    fearless_simd::dispatch!(level, simd => bn_activity_impl(simd, cur, prev, gate, att))
+}
+
+#[inline(always)]
+fn bn_activity_impl<S: Simd>(simd: S, cur: &[u8], prev: &[u8], gate: u32, att: &mut [u32]) {
+    let w = att.len();
+    if w == 0 {
+        return;
+    }
+    let g64 = gate as i32 + 64;
+    att[0] = att_scalar(cur, prev, 0, g64);
+    let zero = i32x16::splat(simd, 0);
+    let full = i32x16::splat(simd, 256);
+    let g64v = i32x16::splat(simd, g64);
+    let mut i = 1usize;
+    while i + 16 <= w {
+        let px = px16(simd, &cur[i * 4..]);
+        let pl = px16(simd, &cur[(i - 1) * 4..]);
+        let pu = px16(simd, &prev[i * 4..]);
+        let act = sad3(simd, px, pl) + sad3(simd, px, pu);
+        let a = ((g64v - act) << 2u32).max(zero).min(full);
+        a.bitcast::<u32x16<S>>().store_slice(&mut att[i..i + 16]);
+        i += 16;
+    }
+    while i < w {
+        att[i] = att_scalar(cur, prev, i, g64);
+        i += 1;
+    }
 }
 
 #[inline(always)]

@@ -145,12 +145,16 @@ impl<'a> Quantizer<'a> {
         let gate_on = self.gate > 0;
         let mut has_alpha = false;
         for y in 0..h {
-            src.fill_row(y, &mut scratch.row);
+            let keys_ready = src.fill_row_with_grid_keys(y, &mut scratch.row, &mut scratch.keys);
             // stage 1 runs row-wide: grid keys + alpha presence, with the
             // activity attenuation fused into the same pass over the
             // pixels when the gate is on (row 0 has no upper neighbor, so
             // it gates on horizontal activity alone)
-            let has_alpha_row = if gate_on {
+            let has_alpha_row = if gate_on && keys_ready {
+                let prev: &[u8] = if y == 0 { &scratch.row } else { &scratch.row2 };
+                crate::simdops::bn_activity(level, &scratch.row, prev, self.gate, &mut scratch.att);
+                false
+            } else if gate_on {
                 let prev: &[u8] = if y == 0 { &scratch.row } else { &scratch.row2 };
                 crate::simdops::bn_keys_att(
                     level,
@@ -160,8 +164,10 @@ impl<'a> Quantizer<'a> {
                     &mut scratch.keys,
                     &mut scratch.att,
                 )
-            } else {
+            } else if !keys_ready {
                 crate::simdops::bn_keys(level, &scratch.row, &mut scratch.keys)
+            } else {
+                false
             };
             has_alpha |= has_alpha_row;
             let mrow: &[u32; 64] = mask32[(y & 63) << 6..((y & 63) << 6) + 64]
