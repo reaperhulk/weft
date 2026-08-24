@@ -107,11 +107,20 @@ pub fn encode_frame(
                 plain.extend_from_slice(a);
             }
             let descriptor_len = body.len();
-            enc.encode(min_code_size, &punched, lossy, &mut body);
-            // Skip the opaque attempt when the rect is almost entirely
-            // transparent — punching always wins there, and sparse-change
-            // frames dominate typical animations.
-            if trans_count * 10 < punched.len() * 9 {
+            if trans_count * 10 >= punched.len() * 9 {
+                // Almost entirely transparent: punching always wins, skip
+                // the opaque attempt (sparse-change frames dominate typical
+                // animations).
+                enc.encode(min_code_size, &punched, lossy, &mut body);
+            } else if trans_count * 20 <= punched.len() {
+                // Almost everything changed: punching would only shatter
+                // smooth runs with scattered transparent pixels, so skip
+                // it — on dense-motion content this halves the LZW work.
+                enc.encode(min_code_size, &plain, lossy, &mut body);
+            } else {
+                // In between, encode both and keep the smaller (gifsicle
+                // -O2/-O3 behavior).
+                enc.encode(min_code_size, &punched, lossy, &mut body);
                 let mut alt = Vec::new();
                 enc.encode(min_code_size, &plain, lossy, &mut alt);
                 if alt.len() < body.len() - descriptor_len {
