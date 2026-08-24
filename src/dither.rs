@@ -183,8 +183,8 @@ impl<'a> Quantizer<'a> {
                     let d = self.nearest.direct_lookup(scratch.keys2[i]);
                     scratch.pk2[i] = d;
                     scratch.wl[m2] = i as u32;
-                    m2 += (((d & 0xFF) == crate::palette::MULTI as u32)
-                        & (scratch.ors[i] != 0)) as usize;
+                    m2 += (((d & 0xFF) == crate::palette::MULTI as u32) & (scratch.ors[i] != 0))
+                        as usize;
                 }
                 // stage 6: resolve c2 misses (same lookahead as stage 3)
                 for j in 0..m2 {
