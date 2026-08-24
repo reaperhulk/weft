@@ -58,39 +58,42 @@ planar form (e.g. 1.5 bytes/pixel for 4:2:0) and converted on the fly.
 ## Benchmarks
 
 640×360 @30fps, 150 frames (5 s) except `big` (1280×720, 300 frames);
-4 cores; ffmpeg 6.1.1 running its single-command in-memory two-pass
-`split[a][b];[a]palettegen[p];[b][p]paletteuse`. Best of 2 runs. PSNR/SSIM
-measured on the decoded GIF against the decoded source at the source frame
-rate.
+4 cores (Xeon Skylake-SP); ffmpeg 7.0.2 running its single-command
+in-memory two-pass `split[a][b];[a]palettegen[p];[b][p]paletteuse`. Both
+encoders measured in the same session by `bench/run.sh`, best of 2 runs.
+PSNR/SSIM measured on the decoded GIF against the decoded source at the
+source frame rate.
 
 | clip      | encoder | time (s) | peak RSS (MB) | size (KB) | PSNR (dB) | SSIM  |
 |-----------|---------|---------:|--------------:|----------:|----------:|------:|
-| rgba¹     | ffmpeg  | 1.63     | 202           | 2296      | 40.07     | 0.9847|
-| rgba¹     | weft    | **0.24** | 37            | **2226**  | 39.60¹    | **0.9853**|
-| testsrc   | ffmpeg  | 1.70     | 199           | 2296      | 40.07     | 0.985 |
-| testsrc   | weft    | **0.22** | 28            | **2242**  | 39.24²    | 0.899²|
-| big (720p)| ffmpeg  | 10.84    | 1152          | 13751     | 42.16     | 0.993 |
-| big (720p)| weft    | **1.32** | 75            | **13596** | 41.09²    | 0.900²|
-| mandel    | ffmpeg  | 7.12     | 265           | 16762     | 31.40     | 0.886 |
-| mandel    | weft    | **0.85** | 108           | **16399** | 30.54     | 0.864 |
-| gradients | ffmpeg  | 1.29     | 190           | 2569      | inf³      | 1.000 |
-| gradients | weft    | **0.24** | 36            | **2086**  | 43.8²³    | 0.9997|
-| life      | ffmpeg  | 1.04     | 190           | 2559      | 76.02     | 0.9997|
-| life      | weft    | **0.25** | 31            | **2467**  | 54.8²     | 0.993 |
-| static    | ffmpeg  | 1.05     | 190           | 15        | inf³      | 1.000 |
-| static    | weft    | **0.12** | 29            | **11**    | 49.7²³    | 0.976 |
+| rgba¹     | ffmpeg  | 1.36     | 176           | 2296      | 40.07     | 0.9847|
+| rgba¹     | weft    | **0.24** | **154**       | **2167**  | **40.87** | **0.9859**|
+| testsrc   | ffmpeg  | 1.38     | 169           | 2296      | 40.07     | 0.985 |
+| testsrc   | weft    | **0.19** | **71**        | **2167**  | **40.83**²| 0.902²|
+| big (720p)| ffmpeg  | 9.61     | 1114          | 13751     | 42.16     | 0.993 |
+| big (720p)| weft    | **1.07** | **430**       | **13202** | **42.29**²| 0.901²|
+| mandel    | ffmpeg  | 5.85     | 234           | 16762     | 31.40     | 0.886 |
+| mandel    | weft    | **0.40** | **77**        | **15977** | **32.32** | 0.882 |
+| gradients | ffmpeg  | 1.04     | 160           | 7592      | 80.07     | 1.000 |
+| gradients | weft    | **0.25** | **96**        | **7282**  | 45.72²    | 0.998 |
+| life      | ffmpeg  | 1.01     | 159           | 2630      | 75.91     | 0.9997|
+| life      | weft    | **0.19** | **72**        | **2538**  | 54.74²    | 0.994 |
+| static    | ffmpeg  | 1.00     | 159           | 15        | inf³      | 1.000 |
+| static    | weft    | **0.13** | **72**        | **11**    | 49.74²³   | 0.976 |
 
-**4–9× faster, smaller output on every clip, 5–15× less memory.**
+**4–15× faster, smaller output on every clip, 1.1–3× less memory.** On
+the four clips whose sources hold more colours than a palette can, weft
+also measures *higher* PSNR than ffmpeg (rgba, testsrc, big, mandel); the
+three it trails on are the near-losslessly-representable ones, where
+footnote ² caps what weft can measure at all.
 
 Each encoder runs its default dither: sierra2 error diffusion for
 ffmpeg's paletteuse, blue-noise for weft (temporally stable and smaller;
 see below).
 
 ¹ `rgba` is the apples-to-apples row: identical input bytes for both
-encoders, no YUV→RGB conversion anywhere. The 0.5 dB PSNR gap is the
-blue-noise default's deliberate trade (SSIM is slightly *higher*, and the
-file 3% smaller); with `--dither sierra2` — the same algorithm ffmpeg
-uses — weft measures 40.08 dB / 0.9846: statistically identical.
+encoders, no YUV→RGB conversion anywhere. weft is ahead on PSNR, SSIM and
+size at once here, with the blue-noise default against ffmpeg's sierra2.
 
 ² The y4m rows undercount weft's quality: the PSNR/SSIM reference is
 decoded with swscale, which *truncates* in YUV→RGB where weft rounds to
@@ -183,6 +186,12 @@ dramatically better. Measured at `--lossy 30` (same clips as above):
 
 ¹ gifsicle 1.94 `-O3 --lossy=30` applied to weft's lossless output.
 
+The lossy timings in this section predate the optimization pass that
+produced the table above (the machine used for it has no gifsicle, so the
+two-tool column could not be re-measured alongside). weft's `--lossy 30`
+times are now about a third lower than shown; sizes and quality are within
+a percent of the figures given.
+
 Two structural pieces land alongside it (and improve lossless output too):
 each delta frame is encoded both transparency-punched and plain-opaque and
 the smaller wins — sparse changes favor punching, while smooth animated
@@ -193,12 +202,19 @@ holds up (gifsicle's EWMA heuristic) instead of resetting at 4096 codes.
 
 ## Design
 
-Every heavy stage is embarrassingly parallel across frames (rayon):
+Every heavy stage is parallel across frames or across bands of a frame
+(rayon):
 
 1. **Read + histogram, overlapped.** A reader thread streams frames into a
    bounded channel while workers accumulate per-thread exact-color
    histograms (open-addressed hash keyed by 24-bit color, run-length
-   batched). Palette statistics cost ~nothing beyond input I/O.
+   batched). Runs are found with a vector compare of the row against
+   itself shifted by a pixel, reduced to a bitmask: real content averages
+   under two pixels per run, so the scalar "same as the last one?" test
+   was a coin flip that mispredicted on most pixels. Once a worker's table
+   outgrows the fold grid it switches to summing 5-bit/channel bins — 1 MB
+   per worker, an L2-resident random-write target, where matching the
+   6-bit lookup grid meant 8 MB and a cache miss per run.
 2. **Palette: variance median cut in OkLab**, mirroring ffmpeg ≥5.x
    palettegen: the box with the largest single-channel squared error (in
    Lab) splits at its count-weighted median along that channel; each box
@@ -206,34 +222,55 @@ Every heavy stage is embarrassingly parallel across frames (rayon):
    ≥99% dominated by) one exact color emit that color byte-exactly.
    Sources with ≤255 distinct colors skip straight to a lossless palette.
 3. **Exact nearest-color lookup** via per-cell candidate lists over a
-   6-bit/channel RGB grid (locally sorted search): a triangle-inequality
-   bound makes the argmin over the cell's candidates the true OkLab
-   nearest for every color in the cell. Most cells hold one candidate, so
-   the hot path is a single table load; multi-candidate lookups memoize in
-   a per-thread direct-mapped cache. The build's 262k-cell × 256-color
-   distance sweep runs on fearless_simd's portable f32 lanes.
+   6-bit/channel RGB grid: a triangle-inequality bound makes the argmin
+   over the cell's candidates the true OkLab nearest for every color in
+   the cell. The same bound composes across scales, so the lists are built
+   in two passes — 16³ super-cells filtered against the whole palette,
+   then each grid cell against only its super-cell's survivors — which
+   gives lists identical to the flat build for a fraction of the 262k ×
+   256 distance sweep. Lists that repeat (a palette clustered tightly in
+   Lab gives most cells the same long one) are interned.
 
-Three hot paths are vectorized with fearless_simd behind runtime dispatch
+   Per pixel the *memo cache* is probed first, not the grid: 78–96% of
+   pixels land on a multi-candidate cell, and the cache — keyed by exact
+   color, per thread, built once per worker and warm for the whole clip —
+   answers 75–98% of probes. Only the rest touch the 1 MB grid table.
+
+Hot paths are vectorized with fearless_simd behind runtime dispatch
 (SSE4.2/AVX2/AVX-512/NEON picked per machine, so the baseline-CPU static
 binaries lose nothing), all verified byte-identical to the scalar paths:
 the YUV→RGBA row conversion (16 px/iteration through widen/zip, feeding
 both the histogram and quantize passes), the nearest-map distance sweep,
-and bulk histogram run extension (8-pixel block compares, guarded by one
-scalar compare so noisy content skips the overhead). 720p end-to-end:
-2.48 s → 2.13 s. Verified not to help: sierra2 error diffusion (the
-carry→lookup→error chain is latency-bound, not throughput-bound), LZW (a
-serial hash walk), and palette lookups (gather-bound). Known follow-up: a
-radix sort on the cut axis inside median cut (mandel's remaining
-hotspot).
-4. **Quantize + dither, parallel per frame.** Blue-noise ordered dither
-   by default; `--dither sierra2` selects Sierra-2-4A error diffusion
-   (ffmpeg's paletteuse default), which diffuses sRGB error with
-   truncating division (an arithmetic shift would diffuse >100% of
-   negative error and explode into noise). YUV→RGB conversion is fused
-   row-by-row into this pass — full RGBA frames never materialize.
+histogram run extraction, inter-frame change masks, and the transition
+count that picks a delta encoding. Verified not to help: sierra2 error
+diffusion (the carry→lookup→error chain is latency-bound, not
+throughput-bound), LZW (a serial hash walk), and palette lookups
+(gather-bound).
+
+4. **Quantize + dither.** Blue-noise ordered dither by default;
+   `--dither sierra2` selects Sierra-2-4A error diffusion (ffmpeg's
+   paletteuse default), which diffuses sRGB error with truncating division
+   (an arithmetic shift would diffuse >100% of negative error and explode
+   into noise). YUV→RGB conversion is fused row-by-row into this pass —
+   full RGBA frames never materialize.
+
+   Most of a frame does not move, and a pixel whose source color and the
+   two neighbours the activity gate reads are all unchanged quantizes to
+   exactly the index it did last frame — the two-candidate pick reads
+   nothing else. Such pixels (39–88% of real footage) take last frame's
+   index and skip both random lookups; whole tiles of them are a memcpy.
+   Getting a predecessor into workers' hands needs the frames of a block
+   quantized in four interleaved waves rather than all at once, so three
+   quarters of them have one. A block only takes that schedule when a
+   sampled frame pair says most of it is still. Work is handed out in
+   row bands, not whole frames: a band re-derives the one row above it and
+   is then independent, which keeps every worker busy through each wave's
+   barrier.
 5. **Delta + LZW, parallel per frame.** Frames crop to the changed
-   bounding box; the rect is encoded both transparency-punched and plain
-   opaque, keeping whichever is smaller; identical frames fold their delay
+   bounding box; the rect is encoded transparency-punched or plain opaque,
+   whichever will compress better — byte-to-byte transition count ranks
+   the two candidates the way LZW does, for a fraction of a percent of the
+   cost of encoding both and measuring. Identical frames fold their delay
    into the predecessor. With disposal "none" the decoded canvas after
    frame *i−1* equals indexed frame *i−1*, so frame *i*'s delta needs only
    its neighbor — no serial canvas walk. LZW uses a generation-stamped
@@ -247,7 +284,7 @@ palette exactness, nearest-map-vs-brute-force in OkLab, y4m parsing, delay
 accumulation) and an end-to-end test that decodes weft's output with an
 independent minimal GIF decoder and compares canvases byte-for-byte.
 
-Only dependency: rayon.
+Dependencies: rayon and fearless_simd.
 
 ## License
 
