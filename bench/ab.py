@@ -31,9 +31,12 @@ SETS["frink"] = sorted({f"frink/{s}-{d}s" for s in
                         for d in (1, 3, 5, 7, 10)})
 SETS["full"] = SETS["frink"] + SETS["synth"] + SETS["big"][:2]
 
+# Rust's Duration Debug picks its own unit (ns/us/ms/s), so parse the unit too.
+DUR = r"([\d.]+)(ns|\u00b5s|ms|s)"
 STAGE_RE = re.compile(
-    r"read\+hist ([\d.]+)ms.*?palette\+lut ([\d.]+)ms\s+quantize\+lzw ([\d.]+)ms"
-    r"\s+mux\+write ([\d.]+)ms\s+total ([\d.]+)ms")
+    rf"read\+hist {DUR}.*?palette\+lut {DUR}\s+quantize\+lzw {DUR}"
+    rf"\s+mux\+write {DUR}\s+total {DUR}")
+UNIT_MS = {"ns": 1e-6, "\u00b5s": 1e-3, "ms": 1.0, "s": 1000.0}
 STAGES = ["read_hist", "palette", "quant_lzw", "mux", "total_internal"]
 
 
@@ -52,7 +55,12 @@ def run_once(binary, clip, out, extra):
     if r.returncode != 0:
         sys.exit(f"{binary} failed on {clip}:\n{r.stderr.decode()}")
     m = STAGE_RE.search(r.stderr.decode().replace("\n", " "))
-    stages = dict(zip(STAGES, (float(x) for x in m.groups()))) if m else {}
+    if m:
+        g = m.groups()
+        vals = [float(g[i]) * UNIT_MS[g[i + 1]] for i in range(0, len(g), 2)]
+        stages = dict(zip(STAGES, vals))
+    else:
+        stages = {}
     return wall, stages, os.path.getsize(out)
 
 

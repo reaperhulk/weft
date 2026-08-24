@@ -791,6 +791,102 @@ pub struct NearestMap {
     avg_cands: f32,
 }
 
+/// Two-level candidate build geometry: `SUPER_BITS` bits per channel at
+/// the coarse level (16^3 super-cells, each spanning a 16-wide RGB box =
+/// 4x4x4 of the 4-wide grid cells the lookup indexes).
+const SUPER_BITS: u32 = 4;
+const SUPER_MASK: usize = (1 << SUPER_BITS) - 1;
+const SUPER_SIZE: usize = 1 << (3 * SUPER_BITS);
+/// Channel shift from a super-cell index to its base RGB value.
+const SUPER_SHIFT: u32 = 8 - SUPER_BITS;
+/// RGB values spanned by a super-cell along one axis.
+const SUPER_SPAN: u8 = 1 << SUPER_SHIFT;
+/// Grid cells per super-cell along one axis, and in total.
+const SUB_BITS: u32 = GRID_BITS - SUPER_BITS;
+
+/// Base RGB corner of a grid cell in super-cell-major order: `m`'s high
+/// bits pick the super-cell, its low `3 * SUB_BITS` bits the child.
+#[inline]
+fn cell_base(m: usize) -> (u8, u8, u8) {
+    let (sr, sg, sb) = super_base(m >> (3 * SUB_BITS));
+    let sub = m & ((1 << (3 * SUB_BITS)) - 1);
+    (
+        sr + ((((sub >> (2 * SUB_BITS)) as u8) & 3) << 2),
+        sg + ((((sub >> SUB_BITS) as u8) & 3) << 2),
+        sb + (((sub as u8) & 3) << 2),
+    )
+}
+
+/// Grid key (the lookup index) of a super-cell-major cell index.
+#[inline]
+fn cell_key(m: usize) -> usize {
+    let (r, g, b) = cell_base(m);
+    grid_key(r, g, b)
+}
+
+/// Base RGB corner of a super-cell index.
+#[inline]
+fn super_base(skey: usize) -> (u8, u8, u8) {
+    (
+        (((skey >> (2 * SUPER_BITS)) & SUPER_MASK) as u8) << SUPER_SHIFT,
+        (((skey >> SUPER_BITS) & SUPER_MASK) as u8) << SUPER_SHIFT,
+        ((skey & SUPER_MASK) as u8) << SUPER_SHIFT,
+    )
+}
+
+/// Candidate list for the RGB box `[base, base+span)` against the colors in
+/// `soa` (`n` real entries; `map` turns a position in `soa` into the global
+/// palette index to emit).
+///
+/// The reference point q is the box's integer center. Every integer color p
+/// in the box satisfies dist(p, q) <= rmax (the max over the 8 corners), so
+/// the true nearest c for any such p satisfies
+/// dist(c, q) <= dmin(q) + 2*rmax by the triangle inequality — every color
+/// inside that bound is kept, which makes the argmin over the list exact
+/// for every color in the box.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn cell_candidates<const SPAN: u8>(
+    cv: &LabConverter,
+    level: fearless_simd::Level,
+    soa: &crate::simdops::PalSoa,
+    dists: &mut [f32],
+    n: usize,
+    rb: u8,
+    gb: u8,
+    bb: u8,
+    map: impl Fn(usize) -> u8,
+) -> Vec<u8> {
+    const { assert!(SPAN.is_power_of_two()) };
+    let half = SPAN >> 1;
+    let hi = SPAN - 1;
+    let q = cv.srgb_to_oklab(rb + half, gb + half, bb + half);
+    // All 8 corners in SIMD lanes (slightly inflated to stay an upper
+    // bound): candidate lists built from it are supersets of the exact
+    // lists, so lookups still return the true nearest.
+    let mut lr = [0f32; 8];
+    let mut lg = [0f32; 8];
+    let mut lb = [0f32; 8];
+    for corner in 0..8 {
+        lr[corner] = cv.linear(rb + if corner & 1 != 0 { hi } else { 0 });
+        lg[corner] = cv.linear(gb + if corner & 2 != 0 { hi } else { 0 });
+        lb[corner] = cv.linear(bb + if corner & 4 != 0 { hi } else { 0 });
+    }
+    let rmax = crate::simdops::corner_rmax2(level, &lr, &lg, &lb, q).sqrt();
+    // one SIMD distance pass, buffered, shared by the dmin scan and the
+    // candidate filter
+    let dmin2 = crate::simdops::cell_distances(level, soa, q, dists);
+    let bound = dmin2.sqrt() + 2.0 * rmax + 1e-6;
+    let bound2 = bound * bound;
+    let mut list = Vec::new();
+    for (i, &d) in dists[..n].iter().enumerate() {
+        if d <= bound2 {
+            list.push(map(i));
+        }
+    }
+    list
+}
+
 /// A packed lookup result: `r<<24 | g<<16 | b<<8 | idx`.
 pub type PackedNearest = u32;
 
@@ -808,43 +904,117 @@ impl NearestMap {
         // nearest for p then satisfies dist(c, q) <= dmin(q) + 2*rmax, so
         // collecting all palette colors within that bound makes the argmin
         // over candidates exact for every p in the cell.
+        //
+        // Doing that against the whole palette for all 262144 cells is
+        // 67M distance evaluations. Instead the same bound is applied
+        // twice: once over 16^3 super-cells (each covering 4x4x4 grid
+        // cells) against the full palette, then per grid cell against
+        // only its super-cell's candidates. The super-cell list is a
+        // superset of every child's - it is built from a strictly larger
+        // box around a point of the same lattice - so the result is
+        // identical to the flat build, at a fraction of the work.
         let soa = crate::simdops::PalSoa::new(&pal_lab);
         let level = fearless_simd::Level::new();
+        let npal = pal_lab.len();
+        // A palette that forms one tight cluster in Lab (few distinct
+        // source colors) admits nearly every color for every distant
+        // super-cell, so the coarse level prunes nothing and its per-cell
+        // scan arrays are just duplicated data pushed out of L1. Probe a
+        // spread-out sample of super-cells first and skip the whole coarse
+        // level when it would not pay.
+        let probe: usize = {
+            let cv = LabConverter::new();
+            let mut dists = vec![0f32; soa.l.len()];
+            // a 4x4x4 lattice of super-cells spread through the cube (a
+            // plain stride would sample one face of it)
+            let step = 1 << (SUPER_BITS - 2);
+            (0..64)
+                .map(|i| {
+                    let sr = ((i >> 4) * step + step / 2) as u8;
+                    let sg = (((i >> 2) & 3) * step + step / 2) as u8;
+                    let sb = ((i & 3) * step + step / 2) as u8;
+                    let (sr, sg, sb) = (sr << SUPER_SHIFT, sg << SUPER_SHIFT, sb << SUPER_SHIFT);
+                    cell_candidates::<SUPER_SPAN>(
+                        &cv,
+                        level,
+                        &soa,
+                        &mut dists,
+                        npal,
+                        sr,
+                        sg,
+                        sb,
+                        |i| i as u8,
+                    )
+                    .len()
+                })
+                .sum()
+        };
+        let pruned = probe * 4 <= npal * 64 * 3;
+
+        // Pass A: one candidate list per super-cell, against the full
+        // palette, with the surviving colors compacted into their own SoA
+        // so the children scan a short contiguous array.
+        let supers: Vec<(Vec<u8>, crate::simdops::PalSoa)> = if pruned {
+            (0..SUPER_SIZE)
+                .into_par_iter()
+                .map_init(
+                    || (LabConverter::new(), vec![0f32; soa.l.len()]),
+                    |(cv, dists), skey| {
+                        let (sr, sg, sb) = super_base(skey);
+                        let list = cell_candidates::<SUPER_SPAN>(
+                            cv,
+                            level,
+                            &soa,
+                            dists,
+                            npal,
+                            sr,
+                            sg,
+                            sb,
+                            |i| i as u8,
+                        );
+                        let lab: Vec<[f32; 3]> =
+                            list.iter().map(|&i| pal_lab[i as usize]).collect();
+                        let sub = crate::simdops::PalSoa::new(&lab);
+                        (list, sub)
+                    },
+                )
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let widest = supers.iter().map(|(_, s)| s.l.len()).max().unwrap_or(0);
+        // Pass B: each grid cell filters only its super-cell's candidates.
+        // Cells are visited in super-cell-major order (`m`), so a worker
+        // runs all 64 children of one super-cell back to back against the
+        // same short scan array instead of cycling through 16 of them; in
+        // grid-key order the innermost channel crosses a super-cell
+        // boundary every 4 cells. `cell_key` puts the result back.
         let cell_lists: Vec<Vec<u8>> = (0..GRID_SIZE)
             .into_par_iter()
             .map_init(
-                || (LabConverter::new(), vec![0f32; soa.l.len()]),
-                |(cv, dists), key| {
-                    let rb = (((key >> (2 * GRID_BITS)) & 63) as u8) << 2;
-                    let gb = (((key >> GRID_BITS) & 63) as u8) << 2;
-                    let bb = ((key & 63) as u8) << 2;
-                    let q = cv.srgb_to_oklab(rb + 2, gb + 2, bb + 2);
-                    // All 8 corners in SIMD lanes (slightly inflated to
-                    // stay an upper bound): candidate lists built from it
-                    // are supersets of the exact-rmax lists, so lookups
-                    // still return the true nearest.
-                    let mut lr = [0f32; 8];
-                    let mut lg = [0f32; 8];
-                    let mut lb = [0f32; 8];
-                    for corner in 0..8 {
-                        lr[corner] = cv.linear(rb + if corner & 1 != 0 { 3 } else { 0 });
-                        lg[corner] = cv.linear(gb + if corner & 2 != 0 { 3 } else { 0 });
-                        lb[corner] = cv.linear(bb + if corner & 4 != 0 { 3 } else { 0 });
+                || {
+                    let n = if pruned { widest } else { soa.l.len() };
+                    (LabConverter::new(), vec![0f32; n])
+                },
+                |(cv, dists), m| {
+                    let (rb, gb, bb) = cell_base(m);
+                    if !pruned {
+                        return cell_candidates::<4>(
+                            cv,
+                            level,
+                            &soa,
+                            dists,
+                            npal,
+                            rb,
+                            gb,
+                            bb,
+                            |i| i as u8,
+                        );
                     }
-                    let rmax2 = crate::simdops::corner_rmax2(level, &lr, &lg, &lb, q);
-                    let rmax = rmax2.sqrt();
-                    // one SIMD distance pass, buffered, shared by the dmin
-                    // scan and the candidate filter
-                    let dmin2 = crate::simdops::cell_distances(level, &soa, q, dists);
-                    let bound = dmin2.sqrt() + 2.0 * rmax + 1e-6;
-                    let bound2 = bound * bound;
-                    let mut list = Vec::new();
-                    for (i, &d) in dists[..pal_lab.len()].iter().enumerate() {
-                        if d <= bound2 {
-                            list.push(i as u8);
-                        }
-                    }
-                    list
+                    let (parent, psoa) = &supers[m >> (3 * SUB_BITS)];
+                    cell_candidates::<4>(cv, level, psoa, dists, parent.len(), rb, gb, bb, |i| {
+                        parent[i]
+                    })
                 },
             )
             .collect();
@@ -853,7 +1023,7 @@ impl NearestMap {
             .iter()
             .map(|c| ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32)
             .collect();
-        let mut direct = Vec::with_capacity(GRID_SIZE);
+        let mut direct = vec![0u32; GRID_SIZE];
         let mut cands = Vec::new();
         // Long lists are interned: when the palette is a tight cluster in
         // Lab (few distinct source colors), the triangle bound admits
@@ -865,8 +1035,8 @@ impl NearestMap {
         // the hashing entirely.
         const INTERN_MIN: usize = 16;
         let mut interned: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
-        for l in &cell_lists {
-            direct.push(if l.len() == 1 {
+        for (m, l) in cell_lists.iter().enumerate() {
+            direct[cell_key(m)] = if l.len() == 1 {
                 (pal_rgb[l[0] as usize] << 8) | l[0] as u32
             } else {
                 let off = match interned.get(l.as_slice()) {
@@ -885,7 +1055,7 @@ impl NearestMap {
                     }
                 };
                 (off << 8) | MULTI as u32
-            });
+            };
         }
         drop(interned);
         let total: usize = cell_lists.iter().map(Vec::len).sum();
