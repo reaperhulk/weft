@@ -65,6 +65,7 @@ pub struct QuantScratch {
     ors: Vec<u32>,
     c2c: Vec<u32>,
     wl: Vec<u32>,
+    wl2: Vec<u32>,
     att: Vec<u32>,
 }
 
@@ -81,6 +82,7 @@ impl QuantScratch {
             ors: vec![0; w],
             c2c: vec![0; w],
             wl: vec![0; w],
+            wl2: vec![0; w],
             // 256 = no attenuation: with the gate off this is never
             // rewritten and the threshold pick reduces to the ungated one
             att: vec![256; w],
@@ -231,21 +233,34 @@ impl<'a> Quantizer<'a> {
                     );
 
                 if tile_live {
-                    // stage 5: c2 cache probe, same shape as stage 2.
-                    // Only pixels that are inexact and not fully
-                    // attenuated can enter the worklist; for the rest a
-                    // copy of c1 is stored, which makes the threshold
-                    // pick keep c1 (identical candidates).
-                    let mut m2 = 0usize;
+                    // stage 5a: compact the pixels that can actually
+                    // flip to c2 — an exact match has no error to dither
+                    // and a fully gated pixel keeps c1 whatever c2 is.
+                    // On busy content the gate rules out a third to a
+                    // half of the tile, and every one of those was
+                    // costing a random memo-cache probe. Pixels not on
+                    // the list keep c1 as their c2, which makes the
+                    // threshold pick keep c1 (identical candidates).
+                    scratch.pk2[..tw].copy_from_slice(&scratch.pk1[..tw]);
+                    let mut nlive = 0usize;
                     for i in 0..tw {
-                        if i + 16 < tw {
-                            self.nearest.prefetch_color_slot(cache, scratch.c2c[i + 16]);
+                        scratch.wl2[nlive] = i as u32;
+                        nlive += ((scratch.ors[i] != 0) & (att[i] != 0)) as usize;
+                    }
+                    // stage 5b: c2 cache probe over the live list
+                    let mut m2 = 0usize;
+                    for j in 0..nlive {
+                        if let Some(&fu) = scratch.wl2[..nlive].get(j + 16) {
+                            self.nearest
+                                .prefetch_color_slot(cache, scratch.c2c[fu as usize]);
                         }
-                        let live = (scratch.ors[i] != 0) & (att[i] != 0);
+                        let i = scratch.wl2[j] as usize;
                         let hit = self.nearest.cache_probe(cache, scratch.c2c[i]);
-                        scratch.pk2[i] = hit.unwrap_or(scratch.pk1[i]);
+                        if let Some(p) = hit {
+                            scratch.pk2[i] = p;
+                        }
                         scratch.wl[m2] = i as u32;
-                        m2 += (hit.is_none() & live) as usize;
+                        m2 += hit.is_none() as usize;
                     }
                     // stage 6: resolve c2 misses (same lookahead as stage 3)
                     for j in 0..m2 {
