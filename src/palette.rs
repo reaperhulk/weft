@@ -1220,11 +1220,19 @@ impl NearestMap {
     }
 }
 
-/// Direct-mapped memo cache for multi-candidate nearest lookups (64K
-/// slots). Each u64 packs `query_color<<40 | palette_rgb<<8 | idx`, so a
-/// probe touches one cache line and a hit returns the palette color along
-/// with the index. Empty slots are u64::MAX (see the sentinel guard in
-/// `lookup_packed`).
+/// log2 of the memo cache's slot count. A miss costs a full `resolve_off`
+/// (sRGB->OkLab conversion plus the candidate scan), which is several
+/// times the rest of a pixel's work, so the cache is sized for hit rate
+/// rather than for staying L2-resident: 128K slots (1 MiB per worker)
+/// measured 2-7 % faster quantize than 64K (the more so the fewer the
+/// threads), 256K gained nothing further, and 16K/32K lost.
+const IDX_CACHE_BITS: u32 = 17;
+
+/// Direct-mapped memo cache for multi-candidate nearest lookups (128K
+/// slots, see `IDX_CACHE_BITS`). Each u64 packs
+/// `query_color<<40 | palette_rgb<<8 | idx`, so a probe touches one cache
+/// line and a hit returns the palette color along with the index. Empty
+/// slots are u64::MAX (see the sentinel guard in `lookup_packed`).
 pub struct IdxCache {
     slots: Vec<u64>,
 }
@@ -1232,7 +1240,7 @@ pub struct IdxCache {
 impl Default for IdxCache {
     fn default() -> Self {
         IdxCache {
-            slots: vec![u64::MAX; 1 << 16],
+            slots: vec![u64::MAX; 1 << IDX_CACHE_BITS],
         }
     }
 }
@@ -1242,7 +1250,10 @@ impl IdxCache {
     #[inline(always)]
     fn slot(r: u8, g: u8, b: u8) -> (usize, u32) {
         let color = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
-        ((color.wrapping_mul(0x9E37_79B1) >> 16) as usize, color)
+        (
+            (color.wrapping_mul(0x9E37_79B1) >> (32 - IDX_CACHE_BITS)) as usize,
+            color,
+        )
     }
 }
 

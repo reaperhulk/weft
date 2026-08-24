@@ -659,7 +659,7 @@ fn run(args: &Args) -> io::Result<()> {
     let mut idx_block: Vec<Vec<u8>> = Vec::new();
     // `for_each_init`/`map_init` state lives for only one parallel
     // operation. Since the block loop launches two new operations per
-    // block, using them here would repeatedly allocate and zero the 512 KiB
+    // block, using them here would repeatedly allocate and zero the 1 MiB
     // nearest-color cache and recreate the encoder buffers. Keep one state
     // bundle per Rayon worker for the whole clip instead. Initialize each
     // half lazily on the worker that first uses it: eagerly constructing
