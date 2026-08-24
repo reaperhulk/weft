@@ -23,12 +23,20 @@ impl Chroma {
     }
 }
 
-/// A stored input frame: either raw RGBA bytes or raw Y4M planes.
-/// Y4M frames are kept in their native (smaller) form and converted to RGBA
-/// on the fly in each parallel pass, trading a cheap reconversion for a
-/// much smaller resident set.
+/// A stored input frame: packed pixels or raw Y4M planes. Frames are kept
+/// in the smallest form that reproduces their pixels exactly and converted
+/// to RGBA rows on the fly in each parallel pass, trading a cheap
+/// reconversion for a much smaller resident set — the whole clip stays
+/// resident between passes, so a byte per pixel is a byte per pixel per
+/// frame.
 pub enum Frame {
+    /// Raw RGBA, kept only for frames that actually carry transparency.
     Rgba(Vec<u8>),
+    /// Packed RGB: an RGBA frame whose every pixel pass 1 found opaque, so
+    /// the alpha plane is a constant and costs nothing to re-synthesize.
+    /// A quarter smaller than `Rgba`, which is a quarter off the resident
+    /// set for the overwhelmingly common alpha-free RGBA clip.
+    Rgb(Vec<u8>),
     Yuv(Vec<u8>),
 }
 

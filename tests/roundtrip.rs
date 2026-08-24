@@ -11,7 +11,32 @@ struct DecodedGif {
     height: usize,
     /// composited full frames (palette-index canvases rendered to RGB)
     frames: Vec<(Vec<u8>, u32)>, // (rgb canvas, delay in cs)
+    /// per-frame palette indices as encoded, before compositing — the
+    /// composited view above cannot show transparency, since it keeps
+    /// whatever the canvas already held
+    raw: Vec<RawFrame>,
     loop_ext: bool,
+}
+
+/// One image block exactly as it was encoded: its sub-rectangle, its
+/// palette indices, and the transparent index in force for it.
+struct RawFrame {
+    rect: (usize, usize, usize, usize), // x0, y0, w, h
+    px: Vec<u8>,
+    transparent: Option<u8>,
+}
+
+impl RawFrame {
+    /// Indices of a frame that covers the whole canvas (what every frame
+    /// looks like once a clip carries any transparency).
+    fn full(&self, width: usize, height: usize) -> &[u8] {
+        assert_eq!(
+            self.rect,
+            (0, 0, width, height),
+            "expected a full-canvas frame"
+        );
+        &self.px
+    }
 }
 
 fn decode_gif(data: &[u8]) -> DecodedGif {
@@ -28,6 +53,7 @@ fn decode_gif(data: &[u8]) -> DecodedGif {
     let mut canvas: Vec<u8> = vec![0; width * height]; // palette indices
     let mut canvas_valid = false;
     let mut frames = Vec::new();
+    let mut raw = Vec::new();
     let mut loop_ext = false;
     let mut delay = 0u32;
     let mut transparent: Option<u8> = None;
@@ -86,6 +112,11 @@ fn decode_gif(data: &[u8]) -> DecodedGif {
                 }
                 let pixels = lzw_decode(mcs, &payload);
                 assert_eq!(pixels.len(), sw * sh, "decoded pixel count");
+                raw.push(RawFrame {
+                    rect: (x0, y0, sw, sh),
+                    px: pixels.clone(),
+                    transparent,
+                });
                 if !canvas_valid {
                     // first frame must cover everything opaque; treat
                     // uncovered as index 0
@@ -115,6 +146,7 @@ fn decode_gif(data: &[u8]) -> DecodedGif {
         width,
         height,
         frames,
+        raw,
         loop_ext,
     }
 }
@@ -272,6 +304,88 @@ fn no_loop_flag_drops_extension() {
     let dec = decode_gif(&gif);
     assert!(!dec.loop_ext);
     assert_eq!(dec.frames.len(), 1);
+}
+
+/// Transparency in *any* frame must survive, including when other frames in
+/// the same clip are fully opaque — those are packed down to RGB in pass 1,
+/// and the packing must neither lose a transparent pixel nor stop the clip
+/// from switching to whole-frame, restore-to-background encoding.
+#[test]
+fn mixed_alpha_frames_keep_transparency() {
+    let (w, h) = (16usize, 16usize);
+    let a = [10u8, 200, 10, 255];
+    let b = [200u8, 10, 10, 255];
+    let hole = [0u8, 0, 0, 0];
+    let mut raw = Vec::new();
+    // frame 0: fully opaque (packs to RGB)
+    raw.extend(std::iter::repeat_n(a, w * h).flatten());
+    // frame 1: same, but with a transparent 4x4 hole (stays RGBA)
+    for y in 0..h {
+        for x in 0..w {
+            let c = if (4..8).contains(&x) && (4..8).contains(&y) {
+                hole
+            } else {
+                a
+            };
+            raw.extend_from_slice(&c);
+        }
+    }
+    // frame 2: fully opaque, different color (packs to RGB)
+    raw.extend(std::iter::repeat_n(b, w * h).flatten());
+
+    let gif = run_weft(&["--size", "16x16", "--fps", "10"], &raw);
+    let dec = decode_gif(&gif);
+    assert_eq!(dec.raw.len(), 3, "three distinct frames");
+
+    let trans = dec.raw[1].transparent.expect("transparent index declared");
+    // frames from opaque sources carry no transparent pixel at all
+    for f in [0usize, 2] {
+        let px = dec.raw[f].full(w, h);
+        assert!(
+            px.iter().all(|&p| Some(p) != dec.raw[f].transparent),
+            "frame {f} came from an opaque source, so nothing may be transparent"
+        );
+        assert!(
+            px.iter().all(|&p| p == px[0]),
+            "frame {f} is one flat color"
+        );
+    }
+    // and the two opaque frames kept their distinct colors
+    let opaque = dec.raw[0].full(w, h)[0];
+    assert_ne!(opaque, dec.raw[2].full(w, h)[0]);
+    // the alpha frame's hole is transparent, everything else matches frame 0
+    for y in 0..h {
+        for x in 0..w {
+            let p = dec.raw[1].full(w, h)[y * w + x];
+            if (4..8).contains(&x) && (4..8).contains(&y) {
+                assert_eq!(p, trans, "hole pixel ({x},{y})");
+            } else {
+                assert_eq!(p, opaque, "opaque pixel ({x},{y})");
+            }
+        }
+    }
+}
+
+/// Alpha is a binary test at 128, so any pixel at or above it is opaque and
+/// the frame is packable — the stored alpha byte itself is never read.
+#[test]
+fn partial_alpha_at_or_above_threshold_is_opaque() {
+    let (w, h) = (16usize, 16usize);
+    let mut raw = Vec::new();
+    for i in 0..w * h {
+        // every alpha from 128 to 255: all of them count as opaque, so the
+        // frame packs to RGB and the stored alpha byte is never read back
+        raw.extend_from_slice(&[10, 200, 10, 128 + (i / 2) as u8]);
+    }
+    let gif = run_weft(&["--size", "16x16"], &raw);
+    let dec = decode_gif(&gif);
+    assert_eq!(dec.raw.len(), 1);
+    let f = &dec.raw[0];
+    assert!(
+        f.full(w, h).iter().all(|&p| Some(p) != f.transparent),
+        "no pixel may decode as transparent"
+    );
+    assert_eq!(dec.frames[0].0[..3], [10, 200, 10]);
 }
 
 #[test]
