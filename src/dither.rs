@@ -57,7 +57,6 @@ pub struct QuantScratch {
     pk2: Vec<u32>,
     ors: Vec<u32>,
     c2c: Vec<u32>,
-    wl: Vec<u32>,
     att: Vec<u32>,
 }
 
@@ -73,7 +72,6 @@ impl QuantScratch {
             pk2: vec![0; w],
             ors: vec![0; w],
             c2c: vec![0; w],
-            wl: vec![0; w],
             // 256 = no attenuation: with the gate off this is never
             // rewritten and the threshold pick reduces to the ungated one
             att: vec![256; w],
@@ -112,17 +110,15 @@ impl<'a> Quantizer<'a> {
     ///
     /// There is no cross-pixel dependency, so each row runs as staged
     /// passes: an attenuation pass against the previous row (gate on),
-    /// SIMD key computation, a branchless gather of the packed fast-path
-    /// entries, cache/resolve only for a compacted worklist of misses,
-    /// SIMD probe-color math, the same gather/resolve pair for the far
-    /// candidates (skipping exact and fully attenuated pixels), and a
-    /// SIMD threshold pick. Results are identical to the per-pixel
-    /// formulation — the lookups and integer math are the same, just
-    /// reordered. Tiles that can't dither at all — every pixel exact, or
-    /// every pixel fully attenuated — skip the far-candidate stages and
-    /// emit c1 directly.
-    // the gather loops index several parallel stage arrays plus a
-    // compacting worklist cursor; an iterator form would obscure that
+    /// SIMD key computation, a prefetched memo-cache-first lookup pass,
+    /// SIMD probe-color math, the same lookup pass for the far candidates
+    /// (skipping exact and fully attenuated pixels), and a SIMD threshold
+    /// pick. Results are identical to the per-pixel formulation — the
+    /// lookups and integer math are the same, just reordered. Tiles that
+    /// can't dither at all — every pixel exact, or every pixel fully
+    /// attenuated — skip the far-candidate stages and emit c1 directly.
+    // the lookup loops index several parallel stage arrays at fixed
+    // lookahead offsets; an iterator form would obscure that
     #[allow(clippy::needless_range_loop)]
     fn quantize_bluenoise(
         &self,
@@ -181,44 +177,30 @@ impl<'a> Quantizer<'a> {
                 let att = &scratch.att[x0..x0 + tw];
                 let cache = &mut scratch.cache;
 
-                // stage 2: branchless c1 gather; misses go to the
-                // worklist. The direct[] table is 1MB, so a lookup 16
-                // pixels ahead is prefetched each step (keys are
-                // row-wide: the tail of one tile prefetches into the
-                // next, and get() falls off the row end cleanly).
-                let mut m1 = 0usize;
+                // stage 2: c1 lookups, memo cache first (see
+                // `lookup_cache_first`); the memo slot a few pixels ahead
+                // is prefetched each step (its address needs only the
+                // color bytes; get() falls off the tile end cleanly). The
+                // direct[] cell is deliberately not prefetched: it is
+                // needed only on a memo miss, and pulling a 1MB table's
+                // line per pixel measured slower than the occasional
+                // stall.
                 for i in 0..tw {
-                    if let Some(&k) = keys.get(i + 16) {
-                        self.nearest.prefetch_key(k);
-                    }
-                    let d = self.nearest.direct_lookup(keys[i]);
-                    scratch.pk1[i] = d;
-                    scratch.wl[m1] = i as u32;
-                    m1 += ((d & 0xFF) == crate::palette::MULTI as u32) as usize;
-                }
-                // stage 3: resolve c1 misses through the memo cache (the
-                // gathered entry's high bits carry the candidate-list
-                // offset, so no cell metadata reload); prefetching the
-                // slot a few misses ahead hides the hash-probe latency
-                for j in 0..m1 {
-                    if let Some(&fu) = scratch.wl[..m1].get(j + 8) {
-                        let f = fu as usize;
-                        let p = &row[f * 4..f * 4 + 4];
+                    if let Some(p) = row.get((i + 8) * 4..(i + 8) * 4 + 4) {
                         self.nearest.prefetch_cache_slot(cache, p[0], p[1], p[2]);
                     }
-                    let i = scratch.wl[j] as usize;
                     let p = &row[i * 4..i * 4 + 4];
                     scratch.pk1[i] =
                         self.nearest
-                            .lookup_slow(cache, scratch.pk1[i] >> 8, p[0], p[1], p[2]);
+                            .lookup_cache_first(cache, keys[i], p[0], p[1], p[2]);
                 }
 
                 // A fully attenuated tile can't flip any pixel to c2, so
-                // stages 4-7 would only reproduce c1 — emit it directly.
+                // stages 3-5 would only reproduce c1 — emit it directly.
                 // (Common on busy content, where the gate is doing its job.)
                 let tile_live = !gate_on || att.iter().any(|&a| a != 0);
 
-                // stage 4: errors, far-probe colors, and their keys; a
+                // stage 3: errors, far-probe colors, and their keys; a
                 // tile with all-exact pixels short-circuits the same way
                 let tile_live = tile_live
                     && crate::simdops::bn_probe(
@@ -231,27 +213,12 @@ impl<'a> Quantizer<'a> {
                     );
 
                 if tile_live {
-                    // stage 5: c2 gather (prefetched like stage 2); only
-                    // pixels that are inexact and not fully attenuated can
-                    // enter the worklist (for the rest a stale pk2 entry
-                    // is harmless: the threshold math then degenerates to
-                    // picking c1)
-                    let mut m2 = 0usize;
+                    // stage 4: c2 lookups (prefetched like stage 2), only
+                    // for pixels that are inexact and not fully attenuated:
+                    // the threshold pick reduces to c1 for the rest, so
+                    // their stale pk2 entry is never consulted
                     for i in 0..tw {
-                        if let Some(&k) = scratch.keys2.get(i + 16) {
-                            self.nearest.prefetch_key(k);
-                        }
-                        let d = self.nearest.direct_lookup(scratch.keys2[i]);
-                        scratch.pk2[i] = d;
-                        scratch.wl[m2] = i as u32;
-                        m2 += (((d & 0xFF) == crate::palette::MULTI as u32)
-                            & (scratch.ors[i] != 0)
-                            & (att[i] != 0)) as usize;
-                    }
-                    // stage 6: resolve c2 misses (same lookahead as stage 3)
-                    for j in 0..m2 {
-                        if let Some(&fu) = scratch.wl[..m2].get(j + 8) {
-                            let c = scratch.c2c[fu as usize];
+                        if let Some(&c) = scratch.c2c.get(i + 8) {
                             self.nearest.prefetch_cache_slot(
                                 cache,
                                 (c >> 16) as u8,
@@ -259,18 +226,19 @@ impl<'a> Quantizer<'a> {
                                 c as u8,
                             );
                         }
-                        let i = scratch.wl[j] as usize;
-                        let c = scratch.c2c[i];
-                        scratch.pk2[i] = self.nearest.lookup_slow(
-                            cache,
-                            scratch.pk2[i] >> 8,
-                            (c >> 16) as u8,
-                            (c >> 8) as u8,
-                            c as u8,
-                        );
+                        if (scratch.ors[i] != 0) & (att[i] != 0) {
+                            let c = scratch.c2c[i];
+                            scratch.pk2[i] = self.nearest.lookup_cache_first(
+                                cache,
+                                scratch.keys2[i],
+                                (c >> 16) as u8,
+                                (c >> 8) as u8,
+                                c as u8,
+                            );
+                        }
                     }
 
-                    // stage 7: threshold pick (x0 is a multiple of 64, so
+                    // stage 5: threshold pick (x0 is a multiple of 64, so
                     // the kernel's local x & 63 mask indexing stays aligned)
                     crate::simdops::bn_threshold(
                         level,
@@ -287,7 +255,7 @@ impl<'a> Quantizer<'a> {
                     }
                 }
 
-                // stage 8: transparent pixels override whatever was computed
+                // stage 6: transparent pixels override whatever was computed
                 if has_alpha_row {
                     for (o, px) in orow.iter_mut().zip(row.as_chunks::<4>().0) {
                         if px[3] < 128 {
