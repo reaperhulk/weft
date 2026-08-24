@@ -99,12 +99,20 @@ pub fn parse_y4m_header(line: &str) -> io::Result<VideoIn> {
     })
 }
 
-/// Read exactly `n` bytes into a fresh buffer without pre-zeroing it
-/// (via `take` + `read_to_end`, which fills spare capacity directly).
+/// Fill the caller's frame buffer (`buf.len()` bytes, already faulted in
+/// — see the reader's prefault thread in main.rs) from the stream.
 /// Returns None on immediate clean EOF; errors on a short read.
-fn read_frame_buf(r: &mut impl Read, n: usize, what: &str) -> io::Result<Option<Vec<u8>>> {
-    let mut buf = Vec::with_capacity(n);
-    let got = r.take(n as u64).read_to_end(&mut buf)?;
+fn read_frame_into(r: &mut impl Read, mut buf: Vec<u8>, what: &str) -> io::Result<Option<Vec<u8>>> {
+    let n = buf.len();
+    let mut got = 0usize;
+    while got < n {
+        match r.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(k) => got += k,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
     if got == 0 {
         return Ok(None);
     }
@@ -117,10 +125,9 @@ fn read_frame_buf(r: &mut impl Read, n: usize, what: &str) -> io::Result<Option<
     Ok(Some(buf))
 }
 
-/// Read the next Y4M frame (FRAME marker + planes), or None at EOF.
-pub fn read_y4m_frame(r: &mut impl BufRead, meta: &VideoIn) -> io::Result<Option<Frame>> {
-    let chroma = meta.chroma.unwrap();
-    let fsize = chroma.frame_bytes(meta.width, meta.height);
+/// Read the next Y4M frame (FRAME marker + planes) into `buf`, which must
+/// hold exactly one frame (`Chroma::frame_bytes`), or None at EOF.
+pub fn read_y4m_frame(r: &mut impl BufRead, buf: Vec<u8>) -> io::Result<Option<Frame>> {
     let mut line = String::new();
     if r.read_line(&mut line)? == 0 {
         return Ok(None); // clean EOF
@@ -131,7 +138,7 @@ pub fn read_y4m_frame(r: &mut impl BufRead, meta: &VideoIn) -> io::Result<Option
             "y4m: expected FRAME marker",
         ));
     }
-    match read_frame_buf(r, fsize, "y4m")? {
+    match read_frame_into(r, buf, "y4m")? {
         Some(buf) => Ok(Some(Frame::Yuv(buf))),
         None => Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -140,9 +147,10 @@ pub fn read_y4m_frame(r: &mut impl BufRead, meta: &VideoIn) -> io::Result<Option
     }
 }
 
-/// Read the next raw RGBA frame, or None at EOF.
-pub fn read_rgba_frame(r: &mut impl Read, w: usize, h: usize) -> io::Result<Option<Frame>> {
-    Ok(read_frame_buf(r, w * h * 4, "raw rgba")?.map(Frame::Rgba))
+/// Read the next raw RGBA frame into `buf` (exactly w*h*4 bytes), or None
+/// at EOF.
+pub fn read_rgba_frame(r: &mut impl Read, buf: Vec<u8>) -> io::Result<Option<Frame>> {
+    Ok(read_frame_into(r, buf, "raw rgba")?.map(Frame::Rgba))
 }
 
 #[cfg(test)]
