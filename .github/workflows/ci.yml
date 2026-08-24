@@ -97,10 +97,91 @@ jobs:
           path: weft-${{ matrix.arch }}-linux-musl
           if-no-files-found: error
 
+  glibc:
+    name: glibc (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          # Pinned to 24.04 images (glibc 2.39), NOT ubuntu-latest: the
+          # newest glibc symbol version the linker references is the
+          # binary's minimum glibc, so the build image is the
+          # compatibility floor. These binaries run on Ubuntu 24.04+ and
+          # anything else with glibc >= 2.39 (Debian 13, Fedora 40, ...).
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: "1.98"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Run tests against the glibc target
+        run: cargo test --release --target ${{ matrix.target }}
+
+      - name: Build binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Verify glibc ceiling and that the binary runs
+        run: |
+          bin=target/${{ matrix.target }}/release/weft
+          file "$bin"
+          # Only baseline libraries every distro ships may be NEEDED.
+          readelf -d "$bin" | grep NEEDED
+          bad=$(readelf -d "$bin" | grep NEEDED \
+            | grep -vE '\[(libc\.so\.6|libm\.so\.6|libgcc_s\.so\.1|ld-linux[^]]*)\]' || true)
+          if [ -n "$bad" ]; then
+            echo "unexpected NEEDED libraries:" >&2
+            echo "$bad" >&2
+            exit 1
+          fi
+          # Enforce the compatibility contract: no versioned glibc symbol
+          # newer than 2.39 (Ubuntu 24.04), even if the runner image or
+          # toolchain drifts.
+          ceiling=2.39
+          max=$(objdump -T "$bin" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
+            | sed 's/GLIBC_//' | sort -Vu | tail -1)
+          echo "max required glibc symbol version: $max (ceiling: $ceiling)"
+          if [ "$(printf '%s\n' "$max" "$ceiling" | sort -V | tail -1)" != "$ceiling" ]; then
+            echo "binary requires glibc $max, newer than $ceiling" >&2
+            exit 1
+          fi
+          # smoke test: 2 raw RGBA frames in, a decodable GIF out
+          python3 - "$bin" <<'EOF'
+          import subprocess, sys
+          frames = bytes([255, 0, 0, 255]) * (8 * 8) + bytes([0, 0, 255, 255]) * (8 * 8)
+          out = subprocess.run(
+              [sys.argv[1], "--size", "8x8", "--fps", "10"],
+              input=frames, capture_output=True, check=True,
+          ).stdout
+          assert out[:6] == b"GIF89a", out[:6]
+          assert out[-1] == 0x3B, "missing trailer"
+          print(f"smoke test OK ({len(out)} bytes)")
+          EOF
+
+      - name: Prepare artifact
+        run: |
+          cp target/${{ matrix.target }}/release/weft weft-${{ matrix.arch }}-linux-gnu
+          strip weft-${{ matrix.arch }}-linux-gnu
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: weft-${{ matrix.arch }}-linux-gnu
+          path: weft-${{ matrix.arch }}-linux-gnu
+          if-no-files-found: error
+
   release:
     name: attach binaries to release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [test, static]
+    needs: [test, static, glibc]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -110,4 +191,4 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
-          files: weft-*-linux-musl
+          files: weft-*-linux-*
