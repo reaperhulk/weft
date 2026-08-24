@@ -65,6 +65,24 @@ impl ColorHist {
         }
     }
 
+    /// Prefetch the home slot for `color` (the add loop runs a few runs
+    /// ahead of itself; the table is large enough that every probe is a
+    /// cache miss without this).
+    #[inline(always)]
+    pub fn prefetch(&self, color: u32) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let slot = (color.wrapping_mul(0x9E37_79B1) as usize >> 8) & self.mask;
+            _mm_prefetch(self.keys.as_ptr().add(slot) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(self.counts.as_ptr().add(slot) as *const i8, _MM_HINT_T0);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = color;
+        }
+    }
+
     #[inline(always)]
     pub fn add(&mut self, color: u32, n: u32) {
         let slot = self.slot_of(color);
@@ -112,9 +130,20 @@ impl ColorHist {
 /// Accumulate one RGBA frame into the exact-color histogram. Pixels with
 /// alpha < 128 are skipped; returns true when any were, so the pipeline
 /// knows the disposal mode (and thus whether delta encoding is possible)
-/// before quantization starts.
-pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8]) -> bool {
-    accumulate_frame_with(rgba, |c, n| hist.add(c, n))
+/// before quantization starts. `runs` is caller-provided scratch: the row
+/// is RLE-scanned into it first, then added with the table slot for a few
+/// runs ahead prefetched — the adds are otherwise serialized behind one
+/// cache miss each on noisy content.
+pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8], runs: &mut Vec<(u32, u32)>) -> bool {
+    let has_alpha = scan_runs(rgba, runs);
+    for j in 0..runs.len() {
+        if let Some(&(c, _)) = runs.get(j + 8) {
+            hist.prefetch(c);
+        }
+        let (c, n) = runs[j];
+        hist.add(c, n);
+    }
+    has_alpha
 }
 
 /// Accumulate one RGBA frame directly into 6-bit/channel bins (the coarse
@@ -122,15 +151,41 @@ pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8]) -> bool {
 /// threshold — see `maybe_fold` for why the grid is quality-sufficient).
 /// A binned add is a key computation plus four u64 adds, with no probing
 /// and no table growth, and bin sums are commutative, so the result is
-/// independent of how frames are scheduled across workers.
-pub fn accumulate_frame_coarse(bins: &mut [[u64; 4]], rgba: &[u8]) -> bool {
-    accumulate_frame_with(rgba, |c, n| bin_add(bins, c, n))
+/// independent of how frames are scheduled across workers. Same
+/// prefetched two-pass shape as `accumulate_frame` (the bin array is 8MB).
+pub fn accumulate_frame_coarse(
+    bins: &mut [[u64; 4]],
+    rgba: &[u8],
+    runs: &mut Vec<(u32, u32)>,
+) -> bool {
+    let has_alpha = scan_runs(rgba, runs);
+    for j in 0..runs.len() {
+        if let Some(&(c, _)) = runs.get(j + 8) {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                let key = grid_key((c >> 16) as u8, (c >> 8) as u8, c as u8);
+                _mm_prefetch(bins.as_ptr().add(key) as *const i8, _MM_HINT_T0);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            let _ = c;
+        }
+        let (c, n) = runs[j];
+        bin_add(bins, c, n);
+    }
+    has_alpha
 }
 
-/// Shared RLE scan: run-length batching keeps sink traffic low on flat
-/// content.
+/// Shared RLE scan into `runs` (cleared first): run-length batching keeps
+/// sink traffic low on flat content.
 #[inline(always)]
-fn accumulate_frame_with(rgba: &[u8], mut add: impl FnMut(u32, u32)) -> bool {
+fn scan_runs(rgba: &[u8], runs: &mut Vec<(u32, u32)>) -> bool {
+    runs.clear();
+    scan_runs_with(rgba, |c, n| runs.push((c, n)))
+}
+
+#[inline(always)]
+fn scan_runs_with(rgba: &[u8], mut add: impl FnMut(u32, u32)) -> bool {
     let pixels = rgba.as_chunks::<4>().0;
     let n = pixels.len();
     let mut has_alpha = false;
@@ -706,18 +761,27 @@ pub fn median_cut(mut entries: Vec<(u32, u32)>, max_colors: usize) -> Vec<[u8; 3
 // ---------------------------------------------------------------------------
 // Exact nearest-color lookup (OkLab metric)
 
+/// Marker byte for multi-candidate cells: appears as the low byte of a
+/// multi-candidate `direct[]` entry and as the candidate-list terminator.
+/// Palette indices never reach it (palettes cap at 255 colors).
+pub const MULTI: u8 = 0xFF;
+
 /// Per-grid-cell candidate lists. `lookup` returns the palette index whose
 /// OkLab distance to the query color is minimal; for most cells there is a
 /// single candidate and the search collapses to one load.
 pub struct NearestMap {
-    /// Single-candidate fast path, packed `r<<24 | g<<16 | b<<8 | idx` so
-    /// the caller gets the palette color with the same load as the index
-    /// (no dependent colors[] fetch); u32::MAX marks a multi-candidate
-    /// cell (a real entry can't collide: palettes cap at 255 colors, so
-    /// the index byte never reaches 0xFF).
+    /// Per-cell entry. Single-candidate cells (the fast path) pack
+    /// `r<<24 | g<<16 | b<<8 | idx`, so the caller gets the palette color
+    /// with the same load as the index (no dependent colors[] fetch).
+    /// Multi-candidate cells pack `offset<<8 | 0xFF`: the low byte can't
+    /// collide with a real entry (palettes cap at 255 colors, so the index
+    /// byte never reaches 0xFF), and the offset points straight at the
+    /// cell's 0xFF-terminated list in `cands` — the whole resolve path
+    /// touches one table instead of bouncing through a separate starts[]
+    /// array.
     direct: Vec<u32>,
-    /// start offset into `cands` for each cell; len GRID_SIZE + 1
-    starts: Vec<u32>,
+    /// Concatenated candidate lists for multi-candidate cells, each list
+    /// terminated by 0xFF.
     cands: Vec<u8>,
     /// packed 24-bit sRGB per palette entry, for re-packing resolve results
     pal_rgb: Vec<u32>,
@@ -788,23 +852,23 @@ impl NearestMap {
             .map(|c| ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32)
             .collect();
         let mut direct = Vec::with_capacity(GRID_SIZE);
-        let mut starts = Vec::with_capacity(GRID_SIZE + 1);
         let mut cands = Vec::new();
-        let mut off = 0u32;
         for l in &cell_lists {
             direct.push(if l.len() == 1 {
                 (pal_rgb[l[0] as usize] << 8) | l[0] as u32
             } else {
-                u32::MAX
+                let off = cands.len() as u32;
+                // 24-bit offset: total list bytes stay far below 16M for
+                // any 255-color palette (avg candidates/cell is single
+                // digits), but guard the packing invariant regardless
+                assert!(off < (1 << 24), "candidate lists exceed 24-bit offsets");
+                cands.extend_from_slice(l);
+                cands.push(MULTI); // terminator
+                (off << 8) | MULTI as u32
             });
-            starts.push(off);
-            cands.extend_from_slice(l);
-            off += l.len() as u32;
         }
-        starts.push(off);
         NearestMap {
             direct,
-            starts,
             cands,
             pal_rgb,
             pal_lab,
@@ -814,7 +878,14 @@ impl NearestMap {
 
     /// Average candidates per cell — perf diagnostic.
     pub fn avg_candidates(&self) -> f32 {
-        self.cands.len() as f32 / GRID_SIZE as f32
+        let multi = self
+            .direct
+            .iter()
+            .filter(|&&d| (d & 0xFF) == MULTI as u32)
+            .count();
+        // cands holds one terminator per multi-candidate cell; every other
+        // cell has exactly one candidate.
+        (self.cands.len() - 2 * multi + GRID_SIZE) as f32 / GRID_SIZE as f32
     }
 
     /// Uncached lookup (tests; `lookup_packed` is the hot path).
@@ -823,10 +894,10 @@ impl NearestMap {
     pub fn lookup(&self, r: u8, g: u8, b: u8) -> u8 {
         let key = grid_key(r, g, b);
         let d = self.direct[key];
-        if d != u32::MAX {
+        if (d & 0xFF) != MULTI as u32 {
             return d as u8;
         }
-        self.resolve_cell(key, r, g, b)
+        self.resolve_off((d >> 8) as usize, r, g, b)
     }
 
     /// Nearest palette entry as a packed `rgb<<8 | idx` word, memoizing
@@ -838,10 +909,10 @@ impl NearestMap {
     pub fn lookup_packed(&self, cache: &mut IdxCache, r: u8, g: u8, b: u8) -> PackedNearest {
         let key = grid_key(r, g, b);
         let d = self.direct[key];
-        if d != u32::MAX {
+        if (d & 0xFF) != MULTI as u32 {
             return d;
         }
-        self.lookup_slow(cache, key as u32, r, g, b)
+        self.lookup_slow(cache, d >> 8, r, g, b)
     }
 
     /// The direct[] entry for a precomputed grid key (staged gather loops).
@@ -851,18 +922,20 @@ impl NearestMap {
     }
 
     /// The multi-candidate path of `lookup_packed`, for callers that
-    /// already saw `direct_lookup` miss on `key`.
+    /// already saw `direct_lookup` return a multi-candidate entry on this
+    /// color's cell; `off` is that entry's high 24 bits (the candidate
+    /// list offset), so no further cell metadata load is needed.
     #[inline]
     pub fn lookup_slow(
         &self,
         cache: &mut IdxCache,
-        key: u32,
+        off: u32,
         r: u8,
         g: u8,
         b: u8,
     ) -> PackedNearest {
         let color = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
-        let slot = (color.wrapping_mul(0x9E37_79B1) >> 18) as usize;
+        let slot = (color.wrapping_mul(0x9E37_79B1) >> 16) as usize;
         let e = cache.slots[slot];
         // the e != MAX guard keeps the empty sentinel (whose tag bits read
         // as 0xFFFFFF) from false-hitting on white; a real white entry has
@@ -870,14 +943,32 @@ impl NearestMap {
         if (e >> 40) == color as u64 && e != u64::MAX {
             return e as u32;
         }
-        let idx = self.resolve_cell(key as usize, r, g, b);
+        let idx = self.resolve_off(off as usize, r, g, b);
         let packed = (self.pal_rgb[idx as usize] << 8) | idx as u32;
         cache.slots[slot] = ((color as u64) << 40) | packed as u64;
         packed
     }
 
+    /// Prefetch the memo-cache slot for a color a few worklist entries
+    /// ahead: the staged resolve loops are bound by the dependent
+    /// hash-slot load, and the slot address needs only the color bytes.
+    #[inline(always)]
+    pub fn prefetch_cache_slot(&self, cache: &IdxCache, r: u8, g: u8, b: u8) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let color = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
+            let slot = (color.wrapping_mul(0x9E37_79B1) >> 16) as usize;
+            _mm_prefetch(cache.slots.as_ptr().add(slot) as *const i8, _MM_HINT_T0);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (cache, r, g, b);
+        }
+    }
+
     /// Prefetch the fast-path cell for a color a few pixels ahead of the
-    /// current one: the direct[] table is 256KB, and on colorful content
+    /// current one: the direct[] table is 1MB, and on colorful content
     /// the dependent load is what stalls the quantize loops. The raw
     /// (pre-dither) color is close enough to the adjusted one to land on
     /// the right cache line almost always.
@@ -913,19 +1004,17 @@ impl NearestMap {
         }
     }
 
+    /// Scan the 0xFF-terminated candidate list at `off` for the OkLab
+    /// argmin.
     #[inline(never)]
-    fn resolve_cell(&self, key: usize, r: u8, g: u8, b: u8) -> u8 {
-        let s = self.starts[key] as usize;
-        let e = self.starts[key + 1] as usize;
-        self.resolve(&self.cands[s..e], r, g, b)
-    }
-
-    #[inline(always)]
-    fn resolve(&self, cands: &[u8], r: u8, g: u8, b: u8) -> u8 {
+    fn resolve_off(&self, off: usize, r: u8, g: u8, b: u8) -> u8 {
         let q = self.cv.srgb_to_oklab_fast(r, g, b);
-        let mut best = cands[0];
+        let mut best = 0u8;
         let mut best_d = f32::MAX;
-        for &i in cands {
+        for &i in self.cands[off..].iter() {
+            if i == MULTI {
+                break;
+            }
             let d = dist2(&self.pal_lab[i as usize], &q);
             if d < best_d {
                 best_d = d;
@@ -936,7 +1025,7 @@ impl NearestMap {
     }
 }
 
-/// Direct-mapped memo cache for multi-candidate nearest lookups (16K
+/// Direct-mapped memo cache for multi-candidate nearest lookups (64K
 /// slots). Each u64 packs `query_color<<40 | palette_rgb<<8 | idx`, so a
 /// probe touches one cache line and a hit returns the palette color along
 /// with the index. Empty slots are u64::MAX (see the sentinel guard in
@@ -948,7 +1037,7 @@ pub struct IdxCache {
 impl Default for IdxCache {
     fn default() -> Self {
         IdxCache {
-            slots: vec![u64::MAX; 1 << 14],
+            slots: vec![u64::MAX; 1 << 16],
         }
     }
 }
@@ -967,7 +1056,7 @@ mod tests {
 
     fn hist_from_frame(frame: &[u8]) -> Vec<(u32, u32)> {
         let mut h = ColorHist::new();
-        accumulate_frame(&mut h, frame);
+        accumulate_frame(&mut h, frame, &mut Vec::new());
         h.entries()
     }
 
@@ -1195,8 +1284,8 @@ mod tests {
         let mut alpha_exact = false;
         let mut alpha_coarse = false;
         for row in &rows {
-            alpha_exact |= accumulate_frame(&mut hist, row);
-            alpha_coarse |= accumulate_frame_coarse(&mut bins, row);
+            alpha_exact |= accumulate_frame(&mut hist, row, &mut Vec::new());
+            alpha_coarse |= accumulate_frame_coarse(&mut bins, row, &mut Vec::new());
         }
         assert_eq!(alpha_exact, alpha_coarse);
         let mut expect = new_fold_bins();

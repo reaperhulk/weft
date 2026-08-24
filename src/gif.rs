@@ -16,6 +16,16 @@ pub struct EncodedFrame {
 pub const DISPOSAL_NONE: u8 = 1;
 pub const DISPOSAL_BACKGROUND: u8 = 2;
 
+/// Per-thread frame-encoding state: the LZW encoder plus the delta
+/// buffers, all recycled across frames so a thread encoding many frames
+/// allocates (and page-faults) each buffer once instead of per frame.
+#[derive(Default)]
+pub struct EncodeCtx {
+    pub enc: LzwEncoder,
+    punched: Vec<u8>,
+    plain: Vec<u8>,
+}
+
 /// Encode one indexed frame relative to the previous full indexed frame.
 ///
 /// With disposal "none" and no source alpha, the canvas after frame i-1 is
@@ -33,8 +43,9 @@ pub fn encode_frame(
     delay_cs: u32,
     disposal: u8,
     lossy: Option<&LossyMap>,
-    enc: &mut LzwEncoder,
+    ctx: &mut EncodeCtx,
 ) -> EncodedFrame {
+    let enc = &mut ctx.enc;
     let mut body = Vec::new();
 
     let (x0, y0, x1, y1, sub) = match prev {
@@ -97,8 +108,13 @@ pub fn encode_frame(
             // changes are sparse; plain opaque wins when punching would
             // shatter smooth runs into fragments (e.g. animated gradients).
             let level = crate::simdops::level();
-            let mut punched = vec![0u8; sw * sh];
-            let mut plain = Vec::with_capacity(sw * sh);
+            if ctx.punched.len() < sw * sh {
+                ctx.punched.resize(sw * sh, 0);
+            }
+            let punched = &mut ctx.punched[..sw * sh];
+            let plain = &mut ctx.plain;
+            plain.clear();
+            plain.reserve(sw * sh);
             let mut trans_count = 0usize;
             for (orow, y) in punched.chunks_exact_mut(sw).zip(y0..=y1) {
                 let a = &idx[y * w + x0..y * w + x1 + 1];
@@ -107,22 +123,25 @@ pub fn encode_frame(
                 plain.extend_from_slice(a);
             }
             let descriptor_len = body.len();
-            if trans_count * 10 >= punched.len() * 9 {
-                // Almost entirely transparent: punching always wins, skip
-                // the opaque attempt (sparse-change frames dominate typical
-                // animations).
-                enc.encode(min_code_size, &punched, lossy, &mut body);
+            if trans_count * 5 >= punched.len() * 3 {
+                // Mostly transparent: punching wins, skip the opaque
+                // attempt. Measured across varied real footage, the opaque
+                // encoding only ever wins (and then by a few percent) below
+                // ~45% transparent; 60% leaves margin while skipping the
+                // double encode on the sparse-change frames that dominate
+                // typical animations.
+                enc.encode(min_code_size, punched, lossy, &mut body);
             } else if trans_count * 20 <= punched.len() {
                 // Almost everything changed: punching would only shatter
                 // smooth runs with scattered transparent pixels, so skip
                 // it — on dense-motion content this halves the LZW work.
-                enc.encode(min_code_size, &plain, lossy, &mut body);
+                enc.encode(min_code_size, plain, lossy, &mut body);
             } else {
                 // In between, encode both and keep the smaller (gifsicle
                 // -O2/-O3 behavior).
-                enc.encode(min_code_size, &punched, lossy, &mut body);
+                enc.encode(min_code_size, punched, lossy, &mut body);
                 let mut alt = Vec::new();
-                enc.encode(min_code_size, &plain, lossy, &mut alt);
+                enc.encode(min_code_size, plain, lossy, &mut alt);
                 if alt.len() < body.len() - descriptor_len {
                     // the opaque encoding won: swap it in after the descriptor
                     body.truncate(descriptor_len);
@@ -241,8 +260,8 @@ mod tests {
     #[test]
     fn identical_frame_returns_empty_body() {
         let a = vec![5u8; 16];
-        let mut enc = LzwEncoder::default();
-        let f = encode_frame(&a, Some(&a), 4, 4, 255, 8, 3, DISPOSAL_NONE, None, &mut enc);
+        let mut ctx = EncodeCtx::default();
+        let f = encode_frame(&a, Some(&a), 4, 4, 255, 8, 3, DISPOSAL_NONE, None, &mut ctx);
         assert!(f.body.is_empty());
         assert_eq!(f.delay_cs, 3);
     }
@@ -254,7 +273,7 @@ mod tests {
         let prev = vec![0u8; w * h];
         let mut cur = prev.clone();
         cur[3 * w + 2] = 9; // single changed pixel at (2,3)
-        let mut enc = LzwEncoder::default();
+        let mut ctx = EncodeCtx::default();
         let f = encode_frame(
             &cur,
             Some(&prev),
@@ -265,7 +284,7 @@ mod tests {
             3,
             DISPOSAL_NONE,
             None,
-            &mut enc,
+            &mut ctx,
         );
         // descriptor: 2C x0 y0 w h
         assert_eq!(f.body[0], 0x2C);
