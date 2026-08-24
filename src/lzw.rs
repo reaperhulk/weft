@@ -3,6 +3,8 @@
 //! accumulator, sub-block chunking done in a single trailing pass.
 
 const MAX_CODE: u32 = 4096;
+/// GIF caps codes at 12 bits; the dictionary stops growing there.
+const MAX_WIDTH: u32 = 12;
 const TABLE_BITS: u32 = 13;
 const TABLE_SIZE: usize = 1 << TABLE_BITS;
 
@@ -322,6 +324,17 @@ impl LzwEncoder {
             }
         }
         bw.put(cur, width);
+        // A decoder can only build the entry for a code once it has read
+        // the code that follows, so it trails this loop by one entry for
+        // the whole stream — and on the final code it catches up, adding
+        // an entry that was never added here (the flush above emits `cur`
+        // without extending the dictionary). When that entry is the one
+        // that fills the dictionary, the decoder widens its codes before
+        // reading the EOI. Widen to match, or a decoder that reads through
+        // to the EOI runs off the end of the stream looking for it.
+        if next == (1 << width) && width < MAX_WIDTH {
+            width += 1;
+        }
         bw.put(eoi, width);
         bw.flush();
     }
@@ -415,6 +428,10 @@ impl LzwEncoder {
                 gen = self.gen;
             }
             // else: dictionary frozen — keep matching against it
+        }
+        // Same trailing-EOI widening as the lossless loop above.
+        if next == (1 << width) && width < MAX_WIDTH {
+            width += 1;
         }
         bw.put(eoi, width);
         bw.flush();
@@ -567,11 +584,49 @@ pub mod tests {
     }
 
     fn roundtrip(data: &[u8]) {
+        roundtrip_at(8, data);
+    }
+
+    fn roundtrip_at(min_code_size: u8, data: &[u8]) {
         let mut enc = LzwEncoder::default();
         let mut raw = Vec::new();
-        enc.encode_raw(8, data, None, &mut raw);
-        let dec = lzw_decode(8, &raw, data.len());
+        enc.encode_raw(min_code_size, data, None, &mut raw);
+        let dec = lzw_decode(min_code_size, &raw, data.len());
         assert_eq!(dec, data, "roundtrip failed for len {}", data.len());
+    }
+
+    /// The trailing EOI must be as wide as the decoder expects it to be.
+    /// A decoder builds the entry for code *k* only after reading code
+    /// *k+1*, so it trails the encoder by one entry and then catches up on
+    /// the final code — creating an entry the encoder never made. If that
+    /// entry is the one that fills the dictionary, the decoder widens its
+    /// codes while the encoder, which flushes its last code without adding
+    /// anything, has no reason to. This band brackets the lengths whose
+    /// final code lands exactly there; a flat run reaches the first
+    /// boundary quickly at `min_code_size` 2.
+    #[test]
+    fn eoi_width_matches_decoder_at_dict_boundary() {
+        for len in 50..80 {
+            roundtrip_at(2, &vec![0u8; len]);
+        }
+    }
+
+    /// The lossy loop flushes its last code the same way, so it needs the
+    /// same widening. A lossy map that changes nothing keeps the code
+    /// stream identical to the lossless one, so the same lengths land on
+    /// the boundary.
+    #[test]
+    fn lossy_eoi_width_matches_decoder_at_dict_boundary() {
+        // 4 colors so min_code_size is 2; level 0 admits no substitution
+        let colors: Vec<[u8; 3]> = (0..4u16).map(|i| [(i * 64) as u8; 3]).collect();
+        let map = LossyMap::build(&colors, 4, 0);
+        for len in 50..80 {
+            let data = vec![0u8; len];
+            let mut enc = LzwEncoder::default();
+            let mut raw = Vec::new();
+            enc.encode_raw(2, &data, Some(&map), &mut raw);
+            assert_eq!(lzw_decode(2, &raw, len), data, "lossy roundtrip len {len}");
+        }
     }
 
     #[test]
