@@ -24,8 +24,7 @@ SETS = {
     "dur": [f"frink/hams-{d}s" for d in (1, 3, 5, 7, 10)],
     # large frames: cache and memory-bandwidth behavior.
     "big": ["frink/hams-10s-720p", "frink/hams-10s-1080p", "big"],
-    "synth": ["testsrc", "gradients", "mandel", "life", "static", "big",
-              "testsrc_rgba"],
+    "synth": ["testsrc", "gradients", "mandel", "life", "static", "big"],
 }
 SETS["frink"] = sorted({f"frink/{s}-{d}s" for s in
                         ("hams", "goo", "mayor", "cater", "cupid")
@@ -42,19 +41,12 @@ STAGES = ["read_hist", "palette", "quant_lzw", "mux", "total_internal"]
 
 
 def clip_path(name):
-    if name.endswith("_rgba"):
-        return DATA / (name[:-5] + ".rgba")
-    return DATA / (name + ".y4m")
-
-
-# Raw-RGBA clips carry no header, so weft needs the geometry on the
-# command line; the corpus has one, generated from testsrc.
-RGBA_ARGS = {"testsrc.rgba": ["--size", "640x360", "--fps", "30"]}
+    p = DATA / (name + ".y4m")
+    return p if p.exists() else DATA / (name + ".rgba")
 
 
 def run_once(binary, clip, out, extra):
     """One timed run. Returns (wall_seconds, stage_dict, out_bytes)."""
-    extra = extra + RGBA_ARGS.get(clip.name, [])
     with open(clip, "rb") as fin, open(out, "wb") as fout:
         t0 = time.perf_counter()
         r = subprocess.run([binary, "--stats", *extra], stdin=fin, stdout=fout,
@@ -114,8 +106,6 @@ _FPS_CACHE = {}
 
 
 def src_fps(name):
-    if name.endswith("_rgba"):
-        return "30"
     """Source frame rate, for resampling the GIF back onto it."""
     if name not in _FPS_CACHE:
         p = subprocess.run(

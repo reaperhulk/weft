@@ -122,6 +122,7 @@ pub fn encode_frame(
                 trans_count += crate::simdops::punch_row(level, a, b, trans_idx, orow);
                 plain.extend_from_slice(a);
             }
+            let descriptor_len = body.len();
             if trans_count * 5 >= punched.len() * 3 {
                 // Mostly transparent: punching wins, skip the opaque
                 // attempt. Measured across varied real footage, the opaque
@@ -135,21 +136,17 @@ pub fn encode_frame(
                 // smooth runs with scattered transparent pixels, so skip
                 // it — on dense-motion content this halves the LZW work.
                 enc.encode(min_code_size, plain, lossy, &mut body);
-            } else if crate::simdops::transitions(level, punched)
-                <= crate::simdops::transitions(level, plain)
-            {
-                // In between, pick the encoding that will compress better
-                // rather than trying both. Byte-to-byte transition count
-                // ranks the two candidates the same way LZW does on the
-                // content where this branch actually fires (100% of
-                // frames on the gradient and fractal clips); where it
-                // does not, the two encodings are within a fraction of a
-                // percent of each other anyway, so a wrong pick costs at
-                // most a few tenths of a percent of file size and saves
-                // the entire second LZW pass.
-                enc.encode(min_code_size, punched, lossy, &mut body);
             } else {
-                enc.encode(min_code_size, plain, lossy, &mut body);
+                // In between, encode both and keep the smaller (gifsicle
+                // -O2/-O3 behavior).
+                enc.encode(min_code_size, punched, lossy, &mut body);
+                let mut alt = Vec::new();
+                enc.encode(min_code_size, plain, lossy, &mut alt);
+                if alt.len() < body.len() - descriptor_len {
+                    // the opaque encoding won: swap it in after the descriptor
+                    body.truncate(descriptor_len);
+                    body.extend_from_slice(&alt);
+                }
             }
         }
         None => enc.encode(min_code_size, idx, lossy, &mut body),

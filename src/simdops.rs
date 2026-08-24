@@ -258,33 +258,6 @@ pub fn spread2(m: u32) -> u64 {
     x * 3
 }
 
-/// Count positions where a byte differs from its predecessor.
-///
-/// A cheap stand-in for "how well will LZW compress this?" — used to pick
-/// which of two candidate encodings of a rect to try first. Vector
-/// compare plus popcount, so it costs a fraction of a percent of the LZW
-/// pass it steers.
-pub fn transitions(level: Level, buf: &[u8]) -> usize {
-    fearless_simd::dispatch!(level, simd => transitions_impl(simd, buf))
-}
-
-#[inline(always)]
-fn transitions_impl<S: Simd>(simd: S, buf: &[u8]) -> usize {
-    let mut n = 0usize;
-    let mut i = 1usize;
-    while i + 64 <= buf.len() {
-        let a = u8x64::from_slice(simd, &buf[i..i + 64]);
-        let b = u8x64::from_slice(simd, &buf[i - 1..i + 63]);
-        n += (!simd.simd_eq_u8x64(a, b).to_bitmask()).count_ones() as usize;
-        i += 64;
-    }
-    while i < buf.len() {
-        n += (buf[i] != buf[i - 1]) as usize;
-        i += 1;
-    }
-    n
-}
-
 /// Run-length scan of an opaque RGBA row into `runs` (cleared first).
 ///
 /// Returns `None` if the row contains a transparent pixel, which has
