@@ -6,8 +6,8 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Make mimalloc give freed pages back to the OS promptly. The pipeline
-/// frees in large phase-sized bursts (raw frames after packing, histogram
-/// tables after the palette, index buffers per block), and with the default
+/// frees in large phase-sized bursts (raw frames as pass 2 consumes them,
+/// histogram tables after the palette, index buffers per block), and with the default
 /// 10ms purge delay + no abandoned-page purging those bursts linger and the
 /// static binary peaks 20-30% above the glibc build. A 1ms delay recovers
 /// nearly all of that while still letting the reader's hot frame buffers
@@ -42,7 +42,7 @@ mod palette;
 mod simdops;
 
 use dither::{Dither, Quantizer};
-use input::{Frame, StoredFrame, VideoIn};
+use input::{Frame, VideoIn};
 use lzw::LzwEncoder;
 use rayon::prelude::*;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -59,7 +59,6 @@ struct Args {
     lossy: u32,
     threads: Option<usize>,
     stats: bool,
-    compress: bool,
 }
 
 #[derive(PartialEq)]
@@ -92,9 +91,6 @@ options:
                      encoding of the quantized frames; ~30 is subtle and
                      much smaller on dithered content)
   --no-loop          play once (no NETSCAPE extension)
-  --no-compress      buffer frames raw in memory instead of LZ4-packing
-                     them between passes (output is identical; raises
-                     peak memory, mainly for benchmarking the tradeoff)
   --threads N        worker threads             (default: all cores)
   --stats            print timing breakdown to stderr
 ";
@@ -110,7 +106,6 @@ fn parse_args() -> Result<Args, String> {
         lossy: 0,
         threads: None,
         stats: false,
-        compress: true,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -170,7 +165,6 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--no-loop" => a.loop_count = None,
-            "--no-compress" => a.compress = false,
             "--threads" => {
                 a.threads = Some(val("--threads")?.parse().map_err(|_| "bad --threads")?)
             }
@@ -290,11 +284,8 @@ fn run(args: &Args) -> io::Result<()> {
     // A reader thread streams frames into a bounded channel while rayon
     // workers accumulate per-thread histograms, so palette statistics are
     // (nearly) free whenever input arrives slower than it can be hashed.
-    // Each frame is LZ4-packed by the worker that histogrammed it (while
-    // its bytes are still cache-warm), so the set buffered for pass 2
-    // shrinks to roughly the compressed size of the input. Alpha presence
-    // is detected here too — pass 2+3 needs it before the first frame is
-    // quantized.
+    // Alpha presence is detected here too — pass 2+3 needs it before the
+    // first frame is quantized.
     let t1 = Instant::now();
     let nthreads = rayon::current_num_threads().max(1);
     let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(2 * nthreads);
@@ -339,10 +330,9 @@ fn run(args: &Args) -> io::Result<()> {
                         Vec::new(),
                         vec![0u8; w * 4],
                         false,
-                        Vec::new(), // per-worker LZ4 scratch, reused
                     )
                 },
-                |(mut hist, mut frames, mut row, mut alpha, mut lz4buf), (i, f)| {
+                |(mut hist, mut frames, mut row, mut alpha), (i, f)| {
                     let src = color::RowSource::new(&f, w, h, meta_ref.chroma);
                     for y in 0..h {
                         src.fill_row(y, &mut row);
@@ -353,11 +343,11 @@ fn run(args: &Args) -> io::Result<()> {
                         spilled.lock().unwrap().push(run);
                         hist = palette::ColorHist::new();
                     }
-                    frames.push((i, StoredFrame::pack(f, args.compress, &mut lz4buf)));
-                    (hist, frames, row, alpha, lz4buf)
+                    frames.push((i, f));
+                    (hist, frames, row, alpha)
                 },
             )
-            .reduce_with(|(ha, mut fa, row, aa, lz4buf), (hb, fb, _, ab, _)| {
+            .reduce_with(|(ha, mut fa, row, aa), (hb, fb, _, ab)| {
                 // Flush instead of hash-merging: reductions run while other
                 // workers still accumulate, and a table-into-table merge of
                 // millions of colors would serialize them behind cache-miss
@@ -367,12 +357,12 @@ fn run(args: &Args) -> io::Result<()> {
                     spilled.lock().unwrap().push(run);
                 }
                 fa.extend(fb);
-                (ha, fa, row, aa | ab, lz4buf)
+                (ha, fa, row, aa | ab)
             });
         (reader_handle.join().expect("reader thread panicked"), acc)
     });
     let nread = read_res?;
-    let Some((hist, mut indexed_frames, _, any_alpha, _)) = acc else {
+    let Some((hist, mut indexed_frames, _, any_alpha)) = acc else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "no frames in input",
@@ -380,17 +370,7 @@ fn run(args: &Args) -> io::Result<()> {
     };
     debug_assert_eq!(indexed_frames.len(), nread);
     indexed_frames.sort_unstable_by_key(|(i, _)| *i);
-    let frames: Vec<StoredFrame> = indexed_frames.into_iter().map(|(_, f)| f).collect();
-    if args.stats {
-        let raw: u64 = frames.iter().map(|f| f.raw_len() as u64).sum();
-        let stored: u64 = frames.iter().map(|f| f.stored_len() as u64).sum();
-        eprintln!(
-            "  buffered: {:.1} MB raw -> {:.1} MB stored ({:.2}x)",
-            raw as f64 / 1e6,
-            stored as f64 / 1e6,
-            raw as f64 / stored.max(1) as f64
-        );
-    }
+    let frames: Vec<Frame> = indexed_frames.into_iter().map(|(_, f)| f).collect();
     // Concatenate all flushed runs plus the surviving accumulator, then sum
     // duplicate colors with one parallel sort + adjacent merge. median_cut
     // canonicalizes its input by the same sort, so this costs nothing extra
@@ -477,15 +457,15 @@ fn run(args: &Args) -> io::Result<()> {
     let mut frames_it = frames.into_iter();
     let mut start = 0usize;
     while start < nread {
-        let chunk: Vec<StoredFrame> = frames_it.by_ref().take(block).collect();
+        let chunk: Vec<Frame> = frames_it.by_ref().take(block).collect();
         let cn = chunk.len();
         let idx_block: Vec<Vec<u8>> = chunk
             .into_par_iter()
             .map_init(
-                || (dither::QuantScratch::new(w), Vec::new()),
-                |(scratch, raw), f| {
+                || dither::QuantScratch::new(w),
+                |scratch, f| {
                     let mut idx = vec![0u8; w * h];
-                    let src = color::RowSource::from_bytes(f.unpack(raw), w, h, meta.chroma);
+                    let src = color::RowSource::new(&f, w, h, meta.chroma);
                     quant.quantize(&src, w, h, args.dither, scratch, &mut idx);
                     idx
                 },

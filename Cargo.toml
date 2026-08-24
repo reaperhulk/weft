@@ -7,7 +7,6 @@ license = "Apache-2.0"
 
 [dependencies]
 fearless_simd = "0.7.0"
-lz4_flex = { version = "0.14.0", default-features = false, features = ["std"] }
 rayon = "1.10"
 
 # musl's malloc is slow under multithreaded allocation; swap it out so the
