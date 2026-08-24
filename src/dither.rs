@@ -218,9 +218,11 @@ impl<'a> Quantizer<'a> {
         }
         let y_first = rows.start;
         // Tile width: multiple of 64 so the blue-noise mask stays aligned
-        // to tile starts, small enough that a tile's stage arrays (~28
-        // bytes per pixel) stay L1-resident between passes.
-        const TILE: usize = 256;
+        // to tile starts, small enough that a tile's stage arrays stay
+        // L1-resident between passes — and small enough that the
+        // all-reusable shortcut catches tiles a wider one would split
+        // across a moving edge.
+        const TILE: usize = 128;
         // `rgb << 8 | idx` per palette index, for turning a reused index
         // straight back into the pair the threshold pick expects.
         let pal = self.nearest.packed_palette();
