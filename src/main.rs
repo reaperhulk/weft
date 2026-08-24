@@ -555,7 +555,7 @@ fn run(args: &Args) -> io::Result<()> {
     // length-independent working set.
     let block = 4 * nthreads;
     // Interleaving factor for the quantize passes (see below).
-    const WAVE: usize = 2;
+    const WAVE: usize = 4;
     let mut encoded: Vec<gif::EncodedFrame> = Vec::with_capacity(nread);
     let mut prev_last: Option<Vec<u8>> = None;
     // Source frame matching `prev_last`, so a block's first frame can
@@ -597,9 +597,7 @@ fn run(args: &Args) -> io::Result<()> {
         // The stiller the block, the more waves are worth interleaving:
         // each extra wave gives another 1/waves of the frames a
         // predecessor, at the cost of a shorter parallel pass.
-        let waves = if still >= 80 {
-            4
-        } else if still >= dither::REUSE_MIN_PCT {
+        let waves = if still >= dither::REUSE_MIN_PCT {
             WAVE
         } else {
             1
