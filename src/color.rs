@@ -40,6 +40,17 @@ impl<'a> RowSource<'a> {
         }
     }
 
+    /// Return a row directly when the input is already RGBA. Hot callers
+    /// can avoid copying every source byte into their conversion scratch;
+    /// YUV callers fall back to `fill_row` as before.
+    #[inline]
+    pub fn rgba_row(&self, y: usize) -> Option<&[u8]> {
+        match self.frame {
+            Frame::Rgba(buf) => Some(&buf[y * self.w * 4..(y + 1) * self.w * 4]),
+            Frame::Yuv(_) => None,
+        }
+    }
+
     /// Fill `out` (len w*4) with RGBA for row `y`.
     #[inline]
     pub fn fill_row(&self, y: usize, out: &mut [u8]) {
@@ -166,6 +177,18 @@ mod tests {
             out[0] > 200 && out[1] < 60 && out[2] < 60,
             "{:?}",
             &out[..4]
+        );
+    }
+
+    #[test]
+    fn rgba_rows_are_borrowed_from_input() {
+        let frame = Frame::Rgba((0..32).collect());
+        let src = RowSource::new(&frame, 4, 2, None);
+        assert_eq!(src.rgba_row(1).unwrap(), &(16..32).collect::<Vec<_>>());
+        assert!(
+            RowSource::new(&Frame::Yuv(vec![0; 6]), 2, 2, Some(Chroma::C420))
+                .rgba_row(0)
+                .is_none()
         );
     }
 }

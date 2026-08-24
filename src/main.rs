@@ -389,14 +389,24 @@ fn run(args: &Args) -> io::Result<()> {
                         match &mut coarse {
                             Some(bins) => {
                                 for y in 0..h {
-                                    src.fill_row(y, row);
-                                    alpha |= palette::accumulate_frame_coarse(bins, row, runs);
+                                    let rgba = if let Some(rgba) = src.rgba_row(y) {
+                                        rgba
+                                    } else {
+                                        src.fill_row(y, row);
+                                        &row[..]
+                                    };
+                                    alpha |= palette::accumulate_frame_coarse(bins, rgba, runs);
                                 }
                             }
                             None => {
                                 for y in 0..h {
-                                    src.fill_row(y, row);
-                                    alpha |= palette::accumulate_frame(&mut hist, row, runs);
+                                    let rgba = if let Some(rgba) = src.rgba_row(y) {
+                                        rgba
+                                    } else {
+                                        src.fill_row(y, row);
+                                        &row[..]
+                                    };
+                                    alpha |= palette::accumulate_frame(&mut hist, rgba, runs);
                                 }
                                 if hist.len() > palette::GRID_SIZE {
                                     go_coarse.store(true, Ordering::Relaxed);

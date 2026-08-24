@@ -133,6 +133,15 @@ bench/gen_inputs.sh   # synthesize test clips (needs ffmpeg)
 bench/run.sh          # full comparison table
 ```
 
+For the raw RGBA hot path on real cartoon footage, the dedicated duration
+scaling benchmark fetches permanent Frinkiac videos (without invoking the
+generation API), decodes fixed 640x360@30 RGBA fixtures outside the timed
+region, and reports best wall time plus peak RSS for 1/3/5/7/10-second clips:
+
+```sh
+bench/run_frinkiac.sh # RUNS=5 by default; fixtures stay ignored in bench/data
+```
+
 ## Dithering modes
 
 `bluenoise` (default) is a two-candidate ordered dither against a 64×64
