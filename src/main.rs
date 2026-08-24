@@ -405,6 +405,8 @@ fn run(args: &Args) -> io::Result<()> {
     // ---- palette + nearest-color map --------------------------------------
     let t2 = Instant::now();
     let n_entries = entries.len();
+    let entries = palette::maybe_fold(entries);
+    let n_folded = entries.len();
     let colors = palette::median_cut(&entries, args.colors - 1);
     let t_mc = t2.elapsed();
     drop(entries);
@@ -415,10 +417,16 @@ fn run(args: &Args) -> io::Result<()> {
     let nearest = palette::NearestMap::build(&colors);
     let t_pal = t2.elapsed();
     if args.stats {
+        let folded = if n_folded != n_entries {
+            format!(" (folded to {n_folded})")
+        } else {
+            String::new()
+        };
         eprintln!(
-            "  palette: {} colors from {} entries, nearest-map avg candidates/cell {:.2}, median_cut {:?}",
+            "  palette: {} colors from {} entries{}, nearest-map avg candidates/cell {:.2}, median_cut {:?}",
             colors.len(),
             n_entries,
+            folded,
             nearest.avg_candidates(),
             t_mc
         );

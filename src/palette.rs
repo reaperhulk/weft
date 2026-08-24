@@ -2,7 +2,11 @@
 //! in OkLab space to match ffmpeg's palettegen/paletteuse (ffmpeg >= 5.x).
 //!
 //! - Histogram: open-addressed hash keyed by exact 24-bit color, so sources
-//!   with few distinct colors get a lossless palette.
+//!   with few distinct colors get a lossless palette. When the deduped
+//!   histogram outgrows the 6-bit/channel bin count (true-color content),
+//!   it is folded to one count-weighted mean color per bin before median
+//!   cut — a 255-color palette can't resolve finer than that, and median
+//!   cut's cost is linear in distinct colors.
 //! - Median cut: variance-based (Heckbert), palettegen-style — the box with
 //!   the largest single-channel squared error (in Lab) is split at its
 //!   count-weighted median along that channel; each box yields the Lab
@@ -156,6 +160,49 @@ pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8]) -> bool {
         hist.add(last, run);
     }
     has_alpha
+}
+
+// ---------------------------------------------------------------------------
+// Histogram folding
+
+/// Fold an exact-color histogram into `GRID_BITS`-per-channel bins, each
+/// represented by the count-weighted mean of its colors, when it holds more
+/// entries than there are bins (so folding always shrinks). Means stay
+/// within their (4-wide) cell, so output colors remain unique — a property
+/// `median_cut`'s tie-breaking relies on.
+pub fn maybe_fold(entries: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    if entries.len() <= GRID_SIZE {
+        return entries;
+    }
+    // [count, r_sum, g_sum, b_sum] per bin
+    let mut bins = vec![[0u64; 4]; GRID_SIZE];
+    for &(c, n) in &entries {
+        let (r, g, b) = (c >> 16, (c >> 8) & 255, c & 255);
+        let key = grid_key(r as u8, g as u8, b as u8);
+        let bin = &mut bins[key];
+        let n = n as u64;
+        bin[0] += n;
+        bin[1] += n * r as u64;
+        bin[2] += n * g as u64;
+        bin[3] += n * b as u64;
+    }
+    fold_bins_to_entries(&bins)
+}
+
+/// Emit one (mean color, count) entry per populated bin, in bin order.
+pub fn fold_bins_to_entries(bins: &[[u64; 4]]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    for bin in bins {
+        let n = bin[0];
+        if n == 0 {
+            continue;
+        }
+        let r = ((bin[1] + n / 2) / n) as u32;
+        let g = ((bin[2] + n / 2) / n) as u32;
+        let b = ((bin[3] + n / 2) / n) as u32;
+        out.push(((r << 16) | (g << 8) | b, n.min(u32::MAX as u64) as u32));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -946,6 +993,64 @@ mod tests {
             if s < n {
                 assert_eq!(k, sorted[s - 1].0, "boundary key, case {case}");
             }
+        }
+    }
+
+    #[test]
+    fn fold_is_identity_when_small() {
+        let entries = vec![(0x102030u32, 5u32), (0xFFFFFF, 1)];
+        assert_eq!(maybe_fold(entries.clone()), entries);
+    }
+
+    #[test]
+    fn fold_means_and_counts() {
+        // More entries than bins forces a fold; verify against a brute-force
+        // per-cell weighted mean.
+        let mut entries = Vec::new();
+        let mut x = 1234567u32;
+        let mut rng = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let mut seen = std::collections::HashSet::new();
+        while entries.len() <= GRID_SIZE {
+            let c = rng() & 0xFF_FFFF;
+            if seen.insert(c) {
+                entries.push((c, 1 + rng() % 1000));
+            }
+        }
+        let folded = maybe_fold(entries.clone());
+        assert!(folded.len() <= GRID_SIZE);
+        let total_in: u64 = entries.iter().map(|&(_, n)| n as u64).sum();
+        let total_out: u64 = folded.iter().map(|&(_, n)| n as u64).sum();
+        assert_eq!(total_in, total_out);
+        // reference: one-pass weighted sums per cell
+        let mut expect: std::collections::HashMap<usize, (u64, [u64; 3])> =
+            std::collections::HashMap::new();
+        for &(ec, en) in &entries {
+            let (r, g, b) = (
+                (ec >> 16) as u64,
+                ((ec >> 8) & 255) as u64,
+                (ec & 255) as u64,
+            );
+            let e = expect
+                .entry(grid_key(r as u8, g as u8, b as u8))
+                .or_default();
+            e.0 += en as u64;
+            e.1[0] += en as u64 * r;
+            e.1[1] += en as u64 * g;
+            e.1[2] += en as u64 * b;
+        }
+        assert_eq!(folded.len(), expect.len());
+        for &(c, n) in &folded {
+            let (r, g, b) = ((c >> 16) as u8, (c >> 8) as u8, c as u8);
+            let (cnt, sum) = expect.remove(&grid_key(r, g, b)).expect("cell");
+            assert_eq!(n as u64, cnt);
+            assert_eq!(r as u64, (sum[0] + cnt / 2) / cnt);
+            assert_eq!(g as u64, (sum[1] + cnt / 2) / cnt);
+            assert_eq!(b as u64, (sum[2] + cnt / 2) / cnt);
         }
     }
 
