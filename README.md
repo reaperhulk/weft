@@ -52,8 +52,13 @@ weft --colors 64 --dither none --no-loop < input.y4m > out.gif
 ```
 
 Input is buffered in memory (a single global palette needs two passes), so
-peak memory scales with clip size: y4m frames are kept in their native
-planar form (e.g. 1.5 bytes/pixel for 4:2:0) and converted on the fly.
+peak memory scales with clip size. Frames are kept in the smallest form
+that reproduces their pixels exactly and converted to RGBA rows on the fly:
+y4m frames stay in their native planar form (e.g. 1.5 bytes/pixel for
+4:2:0), and raw RGBA frames whose pixels are all opaque — the overwhelmingly
+common case — drop their constant alpha byte and are stored as 3 bytes/pixel.
+Frames that do use transparency keep their alpha; the choice is per frame,
+so a clip that mixes them pays only for the frames that need it.
 
 ## Benchmarks
 
@@ -198,7 +203,13 @@ Every heavy stage is embarrassingly parallel across frames (rayon):
 1. **Read + histogram, overlapped.** A reader thread streams frames into a
    bounded channel while workers accumulate per-thread exact-color
    histograms (open-addressed hash keyed by 24-bit color, run-length
-   batched). Palette statistics cost ~nothing beyond input I/O.
+   batched). Palette statistics cost ~nothing beyond input I/O. RGBA rows
+   are hashed in place, straight out of the frame; only y4m pays a
+   conversion into a scratch row. This pass also records, per frame,
+   whether any pixel is transparent — the pipeline needs that before
+   quantization to pick a disposal mode, and it doubles as the test for
+   packing an all-opaque frame down to 3 bytes/pixel for the rest of the
+   run.
 2. **Palette: variance median cut in OkLab**, mirroring ffmpeg ≥5.x
    palettegen: the box with the largest single-channel squared error (in
    Lab) splits at its count-weighted median along that channel; each box

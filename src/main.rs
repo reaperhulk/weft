@@ -385,28 +385,53 @@ fn run(args: &Args) -> io::Result<()> {
                             hist = palette::ColorHist::new();
                             coarse = Some(bins);
                         }
-                        let src = color::RowSource::new(&f, w, h, meta_ref.chroma);
-                        match &mut coarse {
-                            Some(bins) => {
-                                for y in 0..h {
-                                    src.fill_row(y, row);
-                                    alpha |= palette::accumulate_frame_coarse(bins, row, runs);
+                        let mut frame_alpha = false;
+                        {
+                            let src = color::RowSource::new(&f, w, h, meta_ref.chroma);
+                            match &mut coarse {
+                                Some(bins) => {
+                                    for y in 0..h {
+                                        frame_alpha |= palette::accumulate_frame_coarse(
+                                            bins,
+                                            rgba_row(&src, y, row),
+                                            runs,
+                                        );
+                                    }
                                 }
-                            }
-                            None => {
-                                for y in 0..h {
-                                    src.fill_row(y, row);
-                                    alpha |= palette::accumulate_frame(&mut hist, row, runs);
-                                }
-                                if hist.len() > palette::GRID_SIZE {
-                                    go_coarse.store(true, Ordering::Relaxed);
-                                    let mut bins = palette::new_fold_bins();
-                                    palette::fold_into_bins(&mut bins, &hist.entries());
-                                    hist = palette::ColorHist::new();
-                                    coarse = Some(bins);
+                                None => {
+                                    for y in 0..h {
+                                        frame_alpha |= palette::accumulate_frame(
+                                            &mut hist,
+                                            rgba_row(&src, y, row),
+                                            runs,
+                                        );
+                                    }
+                                    if hist.len() > palette::GRID_SIZE {
+                                        go_coarse.store(true, Ordering::Relaxed);
+                                        let mut bins = palette::new_fold_bins();
+                                        palette::fold_into_bins(&mut bins, &hist.entries());
+                                        hist = palette::ColorHist::new();
+                                        coarse = Some(bins);
+                                    }
                                 }
                             }
                         }
+                        alpha |= frame_alpha;
+                        // The scan above already told us whether this frame
+                        // uses any transparency; when it doesn't, the alpha
+                        // plane is a constant and the frame can be packed to
+                        // RGB for the rest of its (clip-long) life. Packing
+                        // here rather than in the reader keeps it parallel
+                        // and reuses the scan the histogram needed anyway.
+                        // The RGBA buffer is freed immediately, so the extra
+                        // resident bytes are one frame per busy worker, not
+                        // one per clip.
+                        let f = match f {
+                            Frame::Rgba(rgba) if !frame_alpha => {
+                                Frame::Rgb(color::rgba_to_rgb(&rgba))
+                            }
+                            other => other,
+                        };
                         frames.push((i, f));
                         (hist, coarse, frames, scratch, alpha)
                     },
@@ -648,6 +673,21 @@ fn run(args: &Args) -> io::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Row `y` of `src` as RGBA: borrowed straight from the frame when it is
+/// already stored that way, otherwise converted into `scratch` (len w*4).
+/// RGBA input is by far the hot case, and copying every source byte into a
+/// scratch row just to read it back is pure overhead.
+#[inline]
+fn rgba_row<'r>(src: &color::RowSource<'r>, y: usize, scratch: &'r mut [u8]) -> &'r [u8] {
+    match src.rgba_row(y) {
+        Some(borrowed) => borrowed,
+        None => {
+            src.fill_row(y, scratch);
+            scratch
+        }
+    }
 }
 
 /// Passthrough writer that counts bytes for the --stats report.

@@ -40,15 +40,54 @@ impl<'a> RowSource<'a> {
         }
     }
 
+    /// Borrow row `y` as RGBA when the frame is stored that way, so hot
+    /// callers can read it in place instead of copying it into scratch.
+    /// Returns None for the formats that need conversion (`Rgb`, `Yuv`);
+    /// those callers fall back to `fill_row`.
+    #[inline]
+    pub fn rgba_row(&self, y: usize) -> Option<&'a [u8]> {
+        match self.frame {
+            Frame::Rgba(buf) => Some(&buf[y * self.w * 4..(y + 1) * self.w * 4]),
+            Frame::Rgb(_) | Frame::Yuv(_) => None,
+        }
+    }
+
     /// Fill `out` (len w*4) with RGBA for row `y`.
     #[inline]
     pub fn fill_row(&self, y: usize, out: &mut [u8]) {
         let w = self.w;
         match self.frame {
             Frame::Rgba(buf) => out.copy_from_slice(&buf[y * w * 4..(y + 1) * w * 4]),
+            Frame::Rgb(buf) => expand_row_rgb(&buf[y * w * 3..(y + 1) * w * 3], out),
             Frame::Yuv(buf) => fill_row_yuv(buf, w, self.h, self.chroma.unwrap(), y, out),
         }
     }
+}
+
+/// Re-expand a packed RGB row to RGBA. Frames are only stored as RGB when
+/// pass 1 found every pixel opaque, so the synthesized alpha is 255.
+#[inline]
+fn expand_row_rgb(row: &[u8], out: &mut [u8]) {
+    for (dst, src) in out
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(row.as_chunks::<3>().0)
+    {
+        *dst = [src[0], src[1], src[2], 255];
+    }
+}
+
+/// Pack an all-opaque RGBA frame down to RGB, dropping the alpha byte.
+/// Callers must have established that no pixel is transparent (alpha
+/// < 128) — see `Frame::Rgb`.
+pub fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
+    let px = rgba.as_chunks::<4>().0;
+    let mut rgb = vec![0u8; px.len() * 3];
+    for (dst, src) in rgb.as_chunks_mut::<3>().0.iter_mut().zip(px) {
+        *dst = [src[0], src[1], src[2]];
+    }
+    rgb
 }
 
 #[inline]
@@ -147,6 +186,36 @@ mod tests {
         let buf = vec![16, 16, 16, 16, 128, 128];
         frame_to_rgba(&Frame::Yuv(buf), w, h, Some(Chroma::C420), &mut out);
         assert_eq!(&out[..4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn rgb_frames_round_trip_with_opaque_alpha() {
+        // 2x2 RGBA, all opaque -> packed RGB -> rows re-expanded to RGBA
+        let w = 2;
+        let h = 2;
+        let rgba: Vec<u8> = (0..h as u8)
+            .flat_map(|y| (0..w as u8).flat_map(move |x| [x * 10, y * 20, 30 + x, 255]))
+            .collect();
+        let rgb = rgba_to_rgb(&rgba);
+        assert_eq!(rgb, vec![0, 0, 30, 10, 0, 31, 0, 20, 30, 10, 20, 31]);
+        let frame = Frame::Rgb(rgb);
+        let mut out = vec![0u8; w * h * 4];
+        frame_to_rgba(&frame, w, h, None, &mut out);
+        assert_eq!(out, rgba);
+        // packed rows can't be borrowed as RGBA
+        assert!(RowSource::new(&frame, w, h, None).rgba_row(0).is_none());
+    }
+
+    #[test]
+    fn rgba_rows_are_borrowed_from_input() {
+        let frame = Frame::Rgba((0..32).collect());
+        let src = RowSource::new(&frame, 4, 2, None);
+        assert_eq!(src.rgba_row(1).unwrap(), &(16..32).collect::<Vec<_>>());
+        assert!(
+            RowSource::new(&Frame::Yuv(vec![0; 6]), 2, 2, Some(Chroma::C420))
+                .rgba_row(0)
+                .is_none()
+        );
     }
 
     #[test]
