@@ -191,6 +191,67 @@ pub fn bn_keys(level: Level, rgba: &[u8], keys: &mut [u32]) -> bool {
     fearless_simd::dispatch!(level, simd => bn_keys_impl(simd, rgba, keys))
 }
 
+/// Stage 1 with the activity gate fused in: grid keys, alpha presence,
+/// and the per-pixel dither attenuation (see `att_scalar`) in one pass
+/// over the row, sharing the pixel loads. Semantically identical to
+/// `bn_keys` + `bn_activity` run separately.
+pub fn bn_keys_att(
+    level: Level,
+    cur: &[u8],
+    prev: &[u8],
+    gate: u32,
+    keys: &mut [u32],
+    att: &mut [u32],
+) -> bool {
+    fearless_simd::dispatch!(level, simd => bn_keys_att_impl(simd, cur, prev, gate, keys, att))
+}
+
+#[inline(always)]
+fn bn_keys_att_impl<S: Simd>(
+    simd: S,
+    cur: &[u8],
+    prev: &[u8],
+    gate: u32,
+    keys: &mut [u32],
+    att: &mut [u32],
+) -> bool {
+    let w = keys.len();
+    if w == 0 {
+        return false;
+    }
+    let g64 = gate as i32 + 64;
+    // pixel 0 has no left neighbor: scalar, like bn_activity
+    att[0] = att_scalar(cur, prev, 0, g64);
+    keys[0] = grid_key_scalar(cur[0], cur[1], cur[2]);
+    let mut any_alpha = cur[3] < 128;
+    let zero = i32x16::splat(simd, 0);
+    let full = i32x16::splat(simd, 256);
+    let g64v = i32x16::splat(simd, g64);
+    let mut amin = i32x16::splat(simd, 255);
+    let mut i = 1usize;
+    while i + 16 <= w {
+        let px = px16(simd, &cur[i * 4..]);
+        keys16(simd, px).store_slice(&mut keys[i..i + 16]);
+        amin = amin.min((px >> 24u32).bitcast::<i32x16<S>>());
+        let pl = px16(simd, &cur[(i - 1) * 4..]);
+        let pu = px16(simd, &prev[i * 4..]);
+        let act = sad3(simd, px, pl) + sad3(simd, px, pu);
+        let a = ((g64v - act) << 2u32).max(zero).min(full);
+        a.bitcast::<u32x16<S>>().store_slice(&mut att[i..i + 16]);
+        i += 16;
+    }
+    let arr: [i32; 16] = amin.into();
+    any_alpha |= arr.iter().any(|&a| a < 128);
+    while i < w {
+        let p = &cur[i * 4..i * 4 + 4];
+        keys[i] = grid_key_scalar(p[0], p[1], p[2]);
+        any_alpha |= p[3] < 128;
+        att[i] = att_scalar(cur, prev, i, g64);
+        i += 1;
+    }
+    any_alpha
+}
+
 #[inline(always)]
 fn bn_keys_impl<S: Simd>(simd: S, rgba: &[u8], keys: &mut [u32]) -> bool {
     let w = keys.len();
@@ -217,6 +278,8 @@ fn bn_keys_impl<S: Simd>(simd: S, rgba: &[u8], keys: &mut [u32]) -> bool {
 /// Stage 4: from packed c1 results, compute per pixel the nonzero-error
 /// flag (`ors`, 0 means the pixel matched its palette color exactly), the
 /// clamped far-probe color (`c2c`, packed r<<16|g<<8|b), and its grid key.
+/// Returns true if any pixel had nonzero error — false lets the caller
+/// skip the candidate-2 stages entirely.
 pub fn bn_probe(
     level: Level,
     rgba: &[u8],
@@ -224,7 +287,7 @@ pub fn bn_probe(
     ors: &mut [u32],
     c2c: &mut [u32],
     keys2: &mut [u32],
-) {
+) -> bool {
     fearless_simd::dispatch!(level, simd => bn_probe_impl(simd, rgba, pk1, ors, c2c, keys2))
 }
 
@@ -236,11 +299,12 @@ fn bn_probe_impl<S: Simd>(
     ors: &mut [u32],
     c2c: &mut [u32],
     keys2: &mut [u32],
-) {
+) -> bool {
     let w = pk1.len();
     let ff = u32x16::splat(simd, 0xFF);
     let zero = i32x16::splat(simd, 0);
     let hi = i32x16::splat(simd, 255);
+    let mut oacc = u32x16::splat(simd, 0);
     let mut i = 0usize;
     while i + 16 <= w {
         let px = px16(simd, &rgba[i * 4..]);
@@ -253,6 +317,7 @@ fn bn_probe_impl<S: Simd>(
         let eb = b - ((p1 >> 8u32) & ff).bitcast::<i32x16<S>>();
         let o: u32x16<S> = (er | eg | eb).bitcast();
         o.store_slice(&mut ors[i..i + 16]);
+        oacc |= o;
         let r2 = (r + er + er).max(zero).min(hi).bitcast::<u32x16<S>>();
         let g2 = (g + eg + eg).max(zero).min(hi).bitcast::<u32x16<S>>();
         let b2 = (b + eb + eb).max(zero).min(hi).bitcast::<u32x16<S>>();
@@ -261,6 +326,8 @@ fn bn_probe_impl<S: Simd>(
             .store_slice(&mut keys2[i..i + 16]);
         i += 16;
     }
+    let arr: [u32; 16] = oacc.into();
+    let mut any_err = arr.iter().any(|&o| o != 0);
     while i < w {
         let p = &rgba[i * 4..i * 4 + 4];
         let p1 = pk1[i];
@@ -268,6 +335,7 @@ fn bn_probe_impl<S: Simd>(
         let eg = p[1] as i32 - ((p1 >> 16) & 0xFF) as i32;
         let eb = p[2] as i32 - ((p1 >> 8) & 0xFF) as i32;
         ors[i] = (er | eg | eb) as u32;
+        any_err |= ors[i] != 0;
         let r2 = (p[0] as i32 + 2 * er).clamp(0, 255) as u32;
         let g2 = (p[1] as i32 + 2 * eg).clamp(0, 255) as u32;
         let b2 = (p[2] as i32 + 2 * eb).clamp(0, 255) as u32;
@@ -275,23 +343,91 @@ fn bn_probe_impl<S: Simd>(
         keys2[i] = grid_key_scalar(r2 as u8, g2 as u8, b2 as u8);
         i += 1;
     }
+    any_err
+}
+
+/// Summed per-channel absolute difference of two packed-RGBA vectors
+/// (alpha excluded). Byte-wise max - min gives every |channel diff| in
+/// one subtraction; the alpha byte is masked off and the three remaining
+/// bytes of each lane summed (each <= 255, so the 32-bit sums can't
+/// carry into one another).
+#[inline(always)]
+fn sad3<S: Simd>(simd: S, a: u32x16<S>, b: u32x16<S>) -> i32x16<S> {
+    let ab = a.bitcast::<u8x64<S>>();
+    let bb = b.bitcast::<u8x64<S>>();
+    let d = (ab.max(bb) - ab.min(bb)).bitcast::<u32x16<S>>();
+    let ff = u32x16::splat(simd, 0xFF);
+    ((d & ff) + ((d >> 8u32) & ff) + ((d >> 16u32) & ff)).bitcast()
+}
+
+/// Scalar `bn_activity` for one pixel (vector-loop edges and tails; also
+/// the reference the parity tests check the lanes against). `g64` is
+/// `gate + 64`.
+#[inline(always)]
+pub fn att_scalar(cur: &[u8], prev: &[u8], i: usize, g64: i32) -> u32 {
+    let li = i.saturating_sub(1);
+    let p = &cur[i * 4..i * 4 + 4];
+    let l = &cur[li * 4..li * 4 + 4];
+    let u = &prev[i * 4..i * 4 + 4];
+    let mut act = 0i32;
+    for c in 0..3 {
+        act += (p[c] as i32 - l[c] as i32).abs() + (p[c] as i32 - u[c] as i32).abs();
+    }
+    ((g64 - act) << 2).clamp(0, 256) as u32
 }
 
 /// Stage 7: the two-candidate threshold pick. `mrow32` is the row's
-/// blue-noise threshold line widened to u32 (64 entries, repeating every
-/// 64 pixels — rows start at x = 0, so chunks of 16 stay aligned to it).
-/// For pixels with zero error or equal candidates the math degenerates to
-/// picking c1, so no lane needs special casing (garbage pk2 lanes on
-/// exact pixels produce den >= 0 and num == 0, which always keeps c1).
+/// blue-noise threshold line as u32 (64 entries, repeating every 64
+/// pixels — rows start at x = 0, so chunks of 16 stay aligned to it).
+/// `att` is the per-pixel dither attenuation in 0..=256 (256 = the
+/// ungated pick; 0 always keeps c1). For pixels with zero error, equal
+/// candidates, or zero attenuation the math degenerates to picking c1,
+/// so no lane needs special casing (garbage pk2 lanes on exact or fully
+/// attenuated pixels produce den >= 0 and num * att == 0, which always
+/// keeps c1).
 pub fn bn_threshold(
     level: Level,
     rgba: &[u8],
     pk1: &[u32],
     pk2: &[u32],
     mrow32: &[u32; 64],
+    att: &[u32],
     out: &mut [u8],
 ) {
-    fearless_simd::dispatch!(level, simd => bn_threshold_impl(simd, rgba, pk1, pk2, mrow32, out))
+    fearless_simd::dispatch!(level, simd => bn_threshold_impl(simd, rgba, pk1, pk2, mrow32, att, out))
+}
+
+/// The per-16-lane pick of stage 7: palette index per pixel as u32 lanes
+/// (only the low byte is nonzero).
+#[inline(always)]
+fn bn_pick16<S: Simd>(
+    simd: S,
+    rgba: &[u8],
+    pk1: &[u32],
+    pk2: &[u32],
+    m16: &[u32],
+    att: &[u32],
+) -> u32x16<S> {
+    let ff = u32x16::splat(simd, 0xFF);
+    let zero = i32x16::splat(simd, 0);
+    let px = px16(simd, rgba);
+    let p1 = u32x16::from_slice(simd, &pk1[..16]);
+    let p2 = u32x16::from_slice(simd, &pk2[..16]);
+    let c1r: i32x16<S> = (p1 >> 24u32).bitcast();
+    let c1g: i32x16<S> = ((p1 >> 16u32) & ff).bitcast();
+    let c1b: i32x16<S> = ((p1 >> 8u32) & ff).bitcast();
+    let er = (px & ff).bitcast::<i32x16<S>>() - c1r;
+    let eg = ((px >> 8u32) & ff).bitcast::<i32x16<S>>() - c1g;
+    let eb = ((px >> 16u32) & ff).bitcast::<i32x16<S>>() - c1b;
+    let dr = (p2 >> 24u32).bitcast::<i32x16<S>>() - c1r;
+    let dg = ((p2 >> 16u32) & ff).bitcast::<i32x16<S>>() - c1g;
+    let db = ((p2 >> 8u32) & ff).bitcast::<i32x16<S>>() - c1b;
+    let num = (er * dr + eg * dg + eb * db).max(zero);
+    let den = dr * dr + dg * dg + db * db;
+    let m: i32x16<S> = u32x16::from_slice(simd, &m16[..16]).bitcast();
+    let attv: i32x16<S> = u32x16::from_slice(simd, &att[..16]).bitcast();
+    let pick = (m * den).simd_lt(num * attv);
+    pick.select(p2 & ff, p1 & ff)
 }
 
 #[inline(always)]
@@ -301,36 +437,67 @@ fn bn_threshold_impl<S: Simd>(
     pk1: &[u32],
     pk2: &[u32],
     mrow32: &[u32; 64],
+    att: &[u32],
     out: &mut [u8],
 ) {
     let w = out.len();
-    let ff = u32x16::splat(simd, 0xFF);
-    let zero = i32x16::splat(simd, 0);
     let mut i = 0usize;
-    while i + 16 <= w {
-        let px = px16(simd, &rgba[i * 4..]);
-        let p1 = u32x16::from_slice(simd, &pk1[i..i + 16]);
-        let p2 = u32x16::from_slice(simd, &pk2[i..i + 16]);
-        let c1r: i32x16<S> = (p1 >> 24u32).bitcast();
-        let c1g: i32x16<S> = ((p1 >> 16u32) & ff).bitcast();
-        let c1b: i32x16<S> = ((p1 >> 8u32) & ff).bitcast();
-        let er = (px & ff).bitcast::<i32x16<S>>() - c1r;
-        let eg = ((px >> 8u32) & ff).bitcast::<i32x16<S>>() - c1g;
-        let eb = ((px >> 16u32) & ff).bitcast::<i32x16<S>>() - c1b;
-        let dr = (p2 >> 24u32).bitcast::<i32x16<S>>() - c1r;
-        let dg = ((p2 >> 16u32) & ff).bitcast::<i32x16<S>>() - c1g;
-        let db = ((p2 >> 8u32) & ff).bitcast::<i32x16<S>>() - c1b;
-        let num = (er * dr + eg * dg + eb * db).max(zero);
-        let den = dr * dr + dg * dg + db * db;
-        let m: i32x16<S> = u32x16::from_slice(simd, &mrow32[(i & 63)..(i & 63) + 16]).bitcast();
-        let pick = (m * den).simd_lt(num << 8u32);
-        let idx: i32x16<S> = pick.select(
-            (p2 & ff).bitcast::<i32x16<S>>(),
-            (p1 & ff).bitcast::<i32x16<S>>(),
+    // 64 pixels per round: four picks, then two unzip rounds compact the
+    // u32 lanes' low bytes into one contiguous 64-byte store (each unzip
+    // keeps even-indexed bytes: u32 lanes -> [idx, 0] u16 pairs -> idx
+    // bytes in order).
+    while i + 64 <= w {
+        let k = i & 63; // 0: chunks stay mask-aligned
+        let v0 = bn_pick16(
+            simd,
+            &rgba[i * 4..],
+            &pk1[i..],
+            &pk2[i..],
+            &mrow32[k..],
+            &att[i..],
         );
-        let arr: [i32; 16] = idx.into();
-        for (o, v) in out[i..i + 16].iter_mut().zip(arr) {
-            *o = v as u8;
+        let v1 = bn_pick16(
+            simd,
+            &rgba[(i + 16) * 4..],
+            &pk1[i + 16..],
+            &pk2[i + 16..],
+            &mrow32[k + 16..],
+            &att[i + 16..],
+        );
+        let v2 = bn_pick16(
+            simd,
+            &rgba[(i + 32) * 4..],
+            &pk1[i + 32..],
+            &pk2[i + 32..],
+            &mrow32[k + 32..],
+            &att[i + 32..],
+        );
+        let v3 = bn_pick16(
+            simd,
+            &rgba[(i + 48) * 4..],
+            &pk1[i + 48..],
+            &pk2[i + 48..],
+            &mrow32[k + 48..],
+            &att[i + 48..],
+        );
+        let t0 = v0.bitcast::<u8x64<S>>().unzip_low(v1.bitcast::<u8x64<S>>());
+        let t1 = v2.bitcast::<u8x64<S>>().unzip_low(v3.bitcast::<u8x64<S>>());
+        t0.unzip_low(t1).store_slice(&mut out[i..i + 64]);
+        i += 64;
+    }
+    while i + 16 <= w {
+        let k = i & 63;
+        let v = bn_pick16(
+            simd,
+            &rgba[i * 4..],
+            &pk1[i..],
+            &pk2[i..],
+            &mrow32[k..],
+            &att[i..],
+        );
+        let arr: [u32; 16] = v.into();
+        for (o, x) in out[i..i + 16].iter_mut().zip(arr) {
+            *o = x as u8;
         }
         i += 16;
     }
@@ -350,7 +517,7 @@ fn bn_threshold_impl<S: Simd>(
         let num = (er * dr + eg * dg + eb * db).max(0);
         let den = dr * dr + dg * dg + db * db;
         let m = mrow32[i & 63] as i32;
-        out[i] = if m * den < num * 256 {
+        out[i] = if m * den < num * att[i] as i32 {
             p2 as u8
         } else {
             p1 as u8
@@ -458,6 +625,38 @@ fn cell_distances_impl<S: Simd>(simd: S, pal: &PalSoa, q: [f32; 3], dists: &mut 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fused_keys_att_lanes_match_scalar() {
+        // bn_keys_att's vector lanes must agree with the scalar key and
+        // attenuation formulas for every pixel, including the x = 0 edge
+        // and the non-multiple-of-16 tail, and must flag alpha the same
+        // way bn_keys does.
+        let mut x = 0xC0FFEEu32;
+        let mut rng = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for w in [1usize, 5, 16, 17, 100, 130] {
+            let cur: Vec<u8> = (0..w * 4).map(|_| (rng() & 0xFF) as u8).collect();
+            let prev: Vec<u8> = (0..w * 4).map(|_| (rng() & 0xFF) as u8).collect();
+            for gate in [1u32, 16, 100] {
+                let mut att = vec![0u32; w];
+                let mut keys = vec![0u32; w];
+                let alpha = bn_keys_att(Level::new(), &cur, &prev, gate, &mut keys, &mut att);
+                let mut keys_ref = vec![0u32; w];
+                let alpha_ref = bn_keys(Level::new(), &cur, &mut keys_ref);
+                assert_eq!(alpha, alpha_ref, "w {w}");
+                assert_eq!(keys, keys_ref, "w {w}");
+                for (i, &a) in att.iter().enumerate() {
+                    let want = att_scalar(&cur, &prev, i, gate as i32 + 64);
+                    assert_eq!(a, want, "w {w} gate {gate} i {i}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn matches_scalar() {

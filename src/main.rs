@@ -54,6 +54,7 @@ struct Args {
     format: Format,
     colors: usize,
     dither: Dither,
+    dither_gate: u32,
     loop_count: Option<u16>,
     lossy: u32,
     threads: Option<usize>,
@@ -85,6 +86,11 @@ options:
                      stable, and compresses well; sierra2 error diffusion
                      has slightly higher visual quality but is slower and
                      shimmers frame-to-frame on animated content)
+  --dither-gate N    activity gate for bluenoise, 0-720 (default: 16;
+                     0 = off). Smooth regions keep full dither; busier
+                     regions get progressively less, reaching none at
+                     N+64 activity — texture masks palette error anyway,
+                     so skipping dither there cuts noise and file size
   --loop N           loop count, 0 = forever    (default: 0)
   --lossy N          lossy LZW compression, 0-200 (default: 0 = lossless
                      encoding of the quantized frames; ~30 is subtle and
@@ -101,6 +107,7 @@ fn parse_args() -> Result<Args, String> {
         format: Format::Auto,
         colors: 256,
         dither: Dither::BlueNoise,
+        dither_gate: 16,
         loop_count: Some(0),
         lossy: 0,
         threads: None,
@@ -154,6 +161,16 @@ fn parse_args() -> Result<Args, String> {
                     "bluenoise" | "bn" => Dither::BlueNoise,
                     "none" => Dither::None,
                     d => return Err(format!("unknown dither {d}")),
+                }
+            }
+            "--dither-gate" => {
+                a.dither_gate = val("--dither-gate")?
+                    .parse()
+                    .map_err(|_| "bad --dither-gate")?;
+                // 720 > the maximum activity a pixel can have minus the
+                // ramp, i.e. everything above this means "never gate off"
+                if a.dither_gate > 720 {
+                    return Err("--dither-gate must be 0-720".into());
                 }
             }
             "--loop" => a.loop_count = Some(val("--loop")?.parse().map_err(|_| "bad --loop")?),
@@ -524,6 +541,7 @@ fn run(args: &Args) -> io::Result<()> {
         trans_idx,
         // median_cut returns the exact colors when they all fit
         exact_palette: n_entries < args.colors,
+        gate: args.dither_gate,
     };
     let delays = gif::frame_delays(nread, meta.fps_num, meta.fps_den);
     let disposal = if any_alpha {
