@@ -267,11 +267,7 @@ pub fn scan_rgb_key_runs_with(keys: &[u32], mut add: impl FnMut(u32, u32)) {
 /// RLE-scan a row of canonical keys, appending the runs to `all` and
 /// counting them per red byte (pass 1 phase A).
 #[inline(always)]
-pub fn scan_rgb_key_runs_counted(
-    keys: &[u32],
-    all: &mut Vec<(u32, u32)>,
-    counts: &mut [u32; 256],
-) {
+pub fn scan_rgb_key_runs_counted(keys: &[u32], all: &mut Vec<(u32, u32)>, counts: &mut [u32; 256]) {
     scan_rgb_key_runs_with(keys, |c, n| {
         all.push((c, n));
         counts[(c >> 16) as usize] += 1;

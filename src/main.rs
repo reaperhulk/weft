@@ -529,7 +529,13 @@ fn run(args: &Args) -> io::Result<()> {
                             Frame::Rgba(rgba) if !alpha => Frame::Rgb(color::rgba_to_rgb(&rgba)),
                             other => other,
                         };
-                        Routed { idx: i, frame, alpha, runs, offs }
+                        Routed {
+                            idx: i,
+                            frame,
+                            alpha,
+                            runs,
+                            offs,
+                        }
                     },
                 )
                 .collect();
