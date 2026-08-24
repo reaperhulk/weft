@@ -22,36 +22,31 @@ fn clamp8(v: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
 
-/// Per-frame source of RGBA rows over raw frame bytes.
+/// Per-frame source of RGBA rows.
 pub struct RowSource<'a> {
-    buf: &'a [u8],
+    frame: &'a Frame,
     w: usize,
     h: usize,
-    /// None => `buf` is RGBA; Some(c) => `buf` is Y4M planes.
     chroma: Option<Chroma>,
 }
 
 impl<'a> RowSource<'a> {
     pub fn new(frame: &'a Frame, w: usize, h: usize, chroma: Option<Chroma>) -> Self {
-        match frame {
-            Frame::Rgba(buf) => Self::from_bytes(buf, w, h, None),
-            Frame::Yuv(buf) => Self::from_bytes(buf, w, h, Some(chroma.expect("yuv chroma"))),
+        RowSource {
+            frame,
+            w,
+            h,
+            chroma,
         }
-    }
-
-    /// `buf` interpreted per `chroma` (None = RGBA), e.g. bytes unpacked
-    /// from a `StoredFrame`.
-    pub fn from_bytes(buf: &'a [u8], w: usize, h: usize, chroma: Option<Chroma>) -> Self {
-        RowSource { buf, w, h, chroma }
     }
 
     /// Fill `out` (len w*4) with RGBA for row `y`.
     #[inline]
     pub fn fill_row(&self, y: usize, out: &mut [u8]) {
         let w = self.w;
-        match self.chroma {
-            None => out.copy_from_slice(&self.buf[y * w * 4..(y + 1) * w * 4]),
-            Some(chroma) => fill_row_yuv(self.buf, w, self.h, chroma, y, out),
+        match self.frame {
+            Frame::Rgba(buf) => out.copy_from_slice(&buf[y * w * 4..(y + 1) * w * 4]),
+            Frame::Yuv(buf) => fill_row_yuv(buf, w, self.h, self.chroma.unwrap(), y, out),
         }
     }
 }
