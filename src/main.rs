@@ -43,7 +43,6 @@ mod simdops;
 
 use dither::{Dither, Quantizer};
 use input::{Frame, VideoIn};
-use lzw::LzwEncoder;
 use rayon::prelude::*;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::Mutex;
@@ -356,12 +355,13 @@ fn run(args: &Args) -> io::Result<()> {
                             palette::ColorHist::new(),
                             None::<Vec<[u64; 4]>>,
                             Vec::new(),
-                            vec![0u8; w * 4],
+                            (vec![0u8; w * 4], Vec::new()),
                             false,
                         )
                     },
-                    |(mut hist, mut coarse, mut frames, mut row, mut alpha), (i, f)| {
+                    |(mut hist, mut coarse, mut frames, mut scratch, mut alpha), (i, f)| {
                         use std::sync::atomic::Ordering;
+                        let (row, runs) = &mut scratch;
                         if coarse.is_none() && go_coarse.load(Ordering::Relaxed) {
                             let mut bins = palette::new_fold_bins();
                             palette::fold_into_bins(&mut bins, &hist.entries());
@@ -372,14 +372,14 @@ fn run(args: &Args) -> io::Result<()> {
                         match &mut coarse {
                             Some(bins) => {
                                 for y in 0..h {
-                                    src.fill_row(y, &mut row);
-                                    alpha |= palette::accumulate_frame_coarse(bins, &row);
+                                    src.fill_row(y, row);
+                                    alpha |= palette::accumulate_frame_coarse(bins, row, runs);
                                 }
                             }
                             None => {
                                 for y in 0..h {
-                                    src.fill_row(y, &mut row);
-                                    alpha |= palette::accumulate_frame(&mut hist, &row);
+                                    src.fill_row(y, row);
+                                    alpha |= palette::accumulate_frame(&mut hist, row, runs);
                                 }
                                 if hist.len() > palette::GRID_SIZE {
                                     go_coarse.store(true, Ordering::Relaxed);
@@ -391,10 +391,10 @@ fn run(args: &Args) -> io::Result<()> {
                             }
                         }
                         frames.push((i, f));
-                        (hist, coarse, frames, row, alpha)
+                        (hist, coarse, frames, scratch, alpha)
                     },
                 )
-                .reduce_with(|(ha, ca, mut fa, row, aa), (hb, cb, fb, _, ab)| {
+                .reduce_with(|(ha, ca, mut fa, scratch, aa), (hb, cb, fb, _, ab)| {
                     // Flush instead of hash-merging: reductions run while other
                     // workers still accumulate, and a table-into-table merge of
                     // millions of colors would serialize them behind cache-miss
@@ -413,7 +413,7 @@ fn run(args: &Args) -> io::Result<()> {
                         (a, b) => a.or(b),
                     };
                     fa.extend(fb);
-                    (ha, coarse, fa, row, aa | ab)
+                    (ha, coarse, fa, scratch, aa | ab)
                 })
         };
         let acc = match &hist_pool {
@@ -540,25 +540,31 @@ fn run(args: &Args) -> io::Result<()> {
     let mut prev_last: Option<Vec<u8>> = None;
     let mut frames_it = frames.into_iter();
     let mut start = 0usize;
+    // Index buffers persist across blocks (every quantize mode overwrites
+    // all w*h bytes, so recycling needs no clearing): a clip-length run
+    // faults each buffer's pages once instead of allocating, zeroing, and
+    // freeing ~w*h bytes per frame.
+    let mut idx_block: Vec<Vec<u8>> = Vec::new();
     while start < nread {
         let chunk: Vec<Frame> = frames_it.by_ref().take(block).collect();
         let cn = chunk.len();
-        let idx_block: Vec<Vec<u8>> = chunk
+        while idx_block.len() < cn {
+            idx_block.push(vec![0u8; w * h]);
+        }
+        chunk
             .into_par_iter()
-            .map_init(
+            .zip(idx_block[..cn].par_iter_mut())
+            .for_each_init(
                 || dither::QuantScratch::new(w),
-                |scratch, f| {
-                    let mut idx = vec![0u8; w * h];
+                |scratch, (f, idx)| {
                     let src = color::RowSource::new(&f, w, h, meta.chroma);
-                    quant.quantize(&src, w, h, args.dither, scratch, &mut idx);
-                    idx
+                    quant.quantize(&src, w, h, args.dither, scratch, idx);
                 },
-            )
-            .collect();
+            );
         encoded.par_extend(
             (0..cn)
                 .into_par_iter()
-                .map_init(LzwEncoder::default, |enc, j| {
+                .map_init(gif::EncodeCtx::default, |ctx, j| {
                     let i = start + j;
                     let prev = if any_alpha || i == 0 {
                         None
@@ -577,11 +583,16 @@ fn run(args: &Args) -> io::Result<()> {
                         delays[i],
                         disposal,
                         lossy_map.as_ref(),
-                        enc,
+                        ctx,
                     )
                 }),
         );
-        prev_last = idx_block.into_iter().next_back();
+        // The block's last indexed frame seeds the next block's first
+        // delta; swap keeps both buffers in the recycled pool.
+        match prev_last.as_mut() {
+            Some(pl) => std::mem::swap(pl, &mut idx_block[cn - 1]),
+            None => prev_last = Some(std::mem::replace(&mut idx_block[cn - 1], vec![0u8; w * h])),
+        }
         start += cn;
     }
     let t_qlzw = t3.elapsed();
