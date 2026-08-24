@@ -23,6 +23,21 @@ use rayon::prelude::*;
 pub const GRID_BITS: u32 = 6;
 pub const GRID_SIZE: usize = 1 << (3 * GRID_BITS); // 262144
 
+/// Bits per channel for the histogram fold. Separate from the lookup
+/// grid: the fold array is written randomly once per colour run, so its
+/// size is what pass 1 pays in cache misses, while the lookup grid is
+/// read-mostly.
+pub const FOLD_BITS: u32 = 5;
+pub const FOLD_SIZE: usize = 1 << (3 * FOLD_BITS);
+
+#[inline(always)]
+pub fn fold_key(r: u8, g: u8, b: u8) -> usize {
+    let sh = 8 - FOLD_BITS;
+    (((r as usize) >> sh) << (2 * FOLD_BITS))
+        | (((g as usize) >> sh) << FOLD_BITS)
+        | ((b as usize) >> sh)
+}
+
 #[inline(always)]
 pub fn grid_key(r: u8, g: u8, b: u8) -> usize {
     (((r as usize) >> 2) << (2 * GRID_BITS))
@@ -164,7 +179,7 @@ pub fn accumulate_frame_coarse(
             #[cfg(target_arch = "x86_64")]
             unsafe {
                 use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-                let key = grid_key((c >> 16) as u8, (c >> 8) as u8, c as u8);
+                let key = fold_key((c >> 16) as u8, (c >> 8) as u8, c as u8);
                 _mm_prefetch(bins.as_ptr().add(key) as *const i8, _MM_HINT_T0);
             }
             #[cfg(not(target_arch = "x86_64"))]
@@ -246,7 +261,7 @@ fn scan_runs_with(rgba: &[u8], mut add: impl FnMut(u32, u32)) -> bool {
 /// within their (4-wide) cell, so output colors remain unique — a property
 /// `median_cut`'s tie-breaking relies on.
 pub fn maybe_fold(entries: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
-    if entries.len() <= GRID_SIZE {
+    if entries.len() <= FOLD_SIZE {
         return entries;
     }
     let mut bins = new_fold_bins();
@@ -256,13 +271,13 @@ pub fn maybe_fold(entries: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
 
 /// A zeroed bin array: `[count, r_sum, g_sum, b_sum]` per grid cell.
 pub fn new_fold_bins() -> Vec<[u64; 4]> {
-    vec![[0u64; 4]; GRID_SIZE]
+    vec![[0u64; 4]; FOLD_SIZE]
 }
 
 #[inline(always)]
 fn bin_add(bins: &mut [[u64; 4]], c: u32, n: u32) {
     let (r, g, b) = (c >> 16, (c >> 8) & 255, c & 255);
-    let bin = &mut bins[grid_key(r as u8, g as u8, b as u8)];
+    let bin = &mut bins[fold_key(r as u8, g as u8, b as u8)];
     let n = n as u64;
     bin[0] += n;
     bin[1] += n * r as u64;
@@ -1435,14 +1450,14 @@ mod tests {
             x
         };
         let mut seen = std::collections::HashSet::new();
-        while entries.len() <= GRID_SIZE {
+        while entries.len() <= FOLD_SIZE {
             let c = rng() & 0xFF_FFFF;
             if seen.insert(c) {
                 entries.push((c, 1 + rng() % 1000));
             }
         }
         let folded = maybe_fold(entries.clone());
-        assert!(folded.len() <= GRID_SIZE);
+        assert!(folded.len() <= FOLD_SIZE);
         let total_in: u64 = entries.iter().map(|&(_, n)| n as u64).sum();
         let total_out: u64 = folded.iter().map(|&(_, n)| n as u64).sum();
         assert_eq!(total_in, total_out);
@@ -1456,7 +1471,7 @@ mod tests {
                 (ec & 255) as u64,
             );
             let e = expect
-                .entry(grid_key(r as u8, g as u8, b as u8))
+                .entry(fold_key(r as u8, g as u8, b as u8))
                 .or_default();
             e.0 += en as u64;
             e.1[0] += en as u64 * r;
@@ -1466,7 +1481,7 @@ mod tests {
         assert_eq!(folded.len(), expect.len());
         for &(c, n) in &folded {
             let (r, g, b) = ((c >> 16) as u8, (c >> 8) as u8, c as u8);
-            let (cnt, sum) = expect.remove(&grid_key(r, g, b)).expect("cell");
+            let (cnt, sum) = expect.remove(&fold_key(r, g, b)).expect("cell");
             assert_eq!(n as u64, cnt);
             assert_eq!(r as u64, (sum[0] + cnt / 2) / cnt);
             assert_eq!(g as u64, (sum[1] + cnt / 2) / cnt);

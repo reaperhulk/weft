@@ -321,7 +321,7 @@ fn run(args: &Args) -> io::Result<()> {
             .expect("hist pool")
     });
     let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(2 * hist_threads);
-    // Once a worker's exact table exceeds GRID_SIZE distinct colors, the
+    // Once a worker's exact table exceeds FOLD_SIZE distinct colors, the
     // full histogram must exceed it too, so the palette input is getting
     // grid-folded regardless (see maybe_fold) and exact tables buy nothing:
     // the worker switches to coarse 6-bit binning — it folds its table into
@@ -398,7 +398,7 @@ fn run(args: &Args) -> io::Result<()> {
                                     src.fill_row(y, row);
                                     alpha |= palette::accumulate_frame(&mut hist, row, runs);
                                 }
-                                if hist.len() > palette::GRID_SIZE {
+                                if hist.len() > palette::FOLD_SIZE {
                                     go_coarse.store(true, Ordering::Relaxed);
                                     let mut bins = palette::new_fold_bins();
                                     palette::fold_into_bins(&mut bins, &hist.entries());
