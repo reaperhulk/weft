@@ -447,9 +447,8 @@ fn run(args: &Args) -> io::Result<()> {
     let n_entries = entries.len();
     let entries = palette::maybe_fold(entries);
     let n_folded = entries.len();
-    let colors = palette::median_cut(&entries, args.colors - 1);
+    let colors = palette::median_cut(entries, args.colors - 1);
     let t_mc = t2.elapsed();
-    drop(entries);
     let trans_idx = colors.len() as u8;
     let slots = colors.len() + 1;
     let gct_bits = (usize::BITS - (slots - 1).leading_zeros()).max(1) as u8;

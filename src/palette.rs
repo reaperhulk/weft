@@ -262,28 +262,77 @@ struct Box_ {
     cut_axis: usize,
 }
 
+/// Boxes at least this long compute their sums with parallel fixed-size
+/// chunks (only the first few splits of a large histogram qualify). The
+/// per-chunk partials combine sequentially in chunk order, so the result
+/// is independent of thread scheduling — it differs from the serial
+/// left-fold only in rounding grouping, which is equally arbitrary.
+const PAR_BOX: usize = 1 << 16;
+const BOX_CHUNK: usize = 8192;
+
 fn make_box(bins: &[HBin], start: usize, len: usize) -> Box_ {
     let slice = &bins[start..start + len];
-    let mut count = 0u64;
-    let mut sum = [0f64; 3];
-    for b in slice {
-        count += b.count as u64;
-        for (s, &l) in sum.iter_mut().zip(&b.lab) {
-            *s += b.count as f64 * l as f64;
+    let (count, sum) = if len >= PAR_BOX {
+        slice
+            .par_chunks(BOX_CHUNK)
+            .map(|ch| {
+                let mut count = 0u64;
+                let mut sum = [0f64; 3];
+                for b in ch {
+                    count += b.count as u64;
+                    for (s, &l) in sum.iter_mut().zip(&b.lab) {
+                        *s += b.count as f64 * l as f64;
+                    }
+                }
+                (count, sum)
+            })
+            .collect::<Vec<_>>()
+            .iter()
+            .fold((0u64, [0f64; 3]), |(ac, asum), &(c, s)| {
+                (ac + c, [asum[0] + s[0], asum[1] + s[1], asum[2] + s[2]])
+            })
+    } else {
+        let mut count = 0u64;
+        let mut sum = [0f64; 3];
+        for b in slice {
+            count += b.count as u64;
+            for (s, &l) in sum.iter_mut().zip(&b.lab) {
+                *s += b.count as f64 * l as f64;
+            }
         }
-    }
+        (count, sum)
+    };
     let mean = [
         sum[0] / count as f64,
         sum[1] / count as f64,
         sum[2] / count as f64,
     ];
-    let mut er2 = [0f64; 3];
-    for b in slice {
-        for c in 0..3 {
-            let d = b.lab[c] as f64 - mean[c];
-            er2[c] += b.count as f64 * d * d;
+    let er2 = if len >= PAR_BOX {
+        slice
+            .par_chunks(BOX_CHUNK)
+            .map(|ch| {
+                let mut er2 = [0f64; 3];
+                for b in ch {
+                    for c in 0..3 {
+                        let d = b.lab[c] as f64 - mean[c];
+                        er2[c] += b.count as f64 * d * d;
+                    }
+                }
+                er2
+            })
+            .collect::<Vec<_>>()
+            .iter()
+            .fold([0f64; 3], |a, e| [a[0] + e[0], a[1] + e[1], a[2] + e[2]])
+    } else {
+        let mut er2 = [0f64; 3];
+        for b in slice {
+            for c in 0..3 {
+                let d = b.lab[c] as f64 - mean[c];
+                er2[c] += b.count as f64 * d * d;
+            }
         }
-    }
+        er2
+    };
     // palettegen: split axis and box choice both follow the single largest
     // per-channel squared error
     let mut cut_axis = 0;
@@ -507,7 +556,7 @@ fn weighted_split(
 }
 
 /// Variance median cut over exact colors. Returns at most `max_colors`.
-pub fn median_cut(entries: &[(u32, u32)], max_colors: usize) -> Vec<[u8; 3]> {
+pub fn median_cut(mut entries: Vec<(u32, u32)>, max_colors: usize) -> Vec<[u8; 3]> {
     if entries.is_empty() {
         return vec![[0, 0, 0]];
     }
@@ -522,8 +571,8 @@ pub fn median_cut(entries: &[(u32, u32)], max_colors: usize) -> Vec<[u8; 3]> {
     // Canonicalize the entries order (histogram layout depends on merge
     // order): boxes are only partitioned below, never sorted, so this
     // initial srgb order is what makes every later float sum — and thus
-    // the palette — independent of thread scheduling.
-    let mut entries = entries.to_vec();
+    // the palette — independent of thread scheduling. (A no-op-cost sort
+    // for callers that already sorted, e.g. the exact histogram path.)
     if entries.len() > 16384 {
         entries.par_sort_unstable();
     } else {
@@ -915,7 +964,7 @@ mod tests {
         .iter()
         .flat_map(|p| p.iter().copied())
         .collect();
-        let mut pal = median_cut(&hist_from_frame(&frame), 255);
+        let mut pal = median_cut(hist_from_frame(&frame), 255);
         pal.sort();
         assert_eq!(pal, vec![[0, 0, 255], [0, 255, 0], [255, 0, 0]]);
     }
@@ -927,7 +976,7 @@ mod tests {
             .iter()
             .flat_map(|p| p.iter().copied())
             .collect();
-        let pal = median_cut(&hist_from_frame(&frame), 255);
+        let pal = median_cut(hist_from_frame(&frame), 255);
         assert_eq!(pal.len(), 2);
         let nm = NearestMap::build(&pal);
         assert_ne!(nm.lookup(10, 10, 10), nm.lookup(11, 11, 11));
@@ -941,7 +990,7 @@ mod tests {
             let g = (i / 64 * 4 % 256) as u8;
             frame.extend_from_slice(&[r, g, (i % 251) as u8, 255]);
         }
-        let pal = median_cut(&hist_from_frame(&frame), 255);
+        let pal = median_cut(hist_from_frame(&frame), 255);
         assert_eq!(pal.len(), 255);
     }
 
