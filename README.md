@@ -9,11 +9,19 @@ faster by parallelizing every stage across frames.
 
 ## Install
 
-Prebuilt fully static Linux binaries (x86_64 and aarch64) are attached to
-releases and built by CI for every push. They are linked against musl with
-mimalloc as the allocator, so they run on any Linux distro — any glibc
-version, Alpine, scratch containers — with no runtime dependencies, at the
-same speed as a glibc build.
+Prebuilt Linux binaries (x86_64 and aarch64) are attached to releases and
+built by CI for every push, in two flavors:
+
+- `weft-*-linux-musl` — fully static, linked against musl with mimalloc as
+  the allocator, so they run on any Linux distro — any glibc version,
+  Alpine, scratch containers — with no runtime dependencies, at the same
+  speed as a glibc build.
+- `weft-*-linux-gnu` — dynamically linked against glibc, built on Ubuntu
+  24.04 (glibc 2.39). CI verifies no symbol newer than GLIBC_2.39 is
+  referenced, so they run on Ubuntu 24.04+ and any other distro with
+  glibc ≥ 2.39 (Debian 13, Fedora 40, RHEL 10, ...).
+
+If unsure, take the musl binary; it runs everywhere the gnu one does.
 
 From source: `cargo build --release` (or
 `cargo build --release --target x86_64-unknown-linux-musl` for the static
