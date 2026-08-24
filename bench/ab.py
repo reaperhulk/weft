@@ -64,26 +64,41 @@ def run_once(binary, clip, out, extra):
     return wall, stages, os.path.getsize(out)
 
 
-def bench(binary, names, runs, extra, outdir):
-    res = {}
+def bench(binaries, names, runs, extra, outdir):
+    """Time each binary on each clip, interleaving the runs.
+
+    This box is a VM whose throughput drifts by tens of percent over
+    minutes, so timing all of A and then all of B compares two different
+    machines. Interleaving run-by-run puts both binaries under the same
+    conditions; best-of-N then keeps the least-disturbed sample of each.
+    """
+    res = [{} for _ in binaries]
     for name in names:
         clip = clip_path(name)
-        out = outdir / (name.replace("/", "_") + ".gif")
-        out.parent.mkdir(parents=True, exist_ok=True)
-        run_once(binary, clip, out, extra)  # warm page cache, discard
-        walls, stagesets, size = [], [], 0
+        outs, walls, stagesets, sizes = [], [], [], []
+        for bi, binary in enumerate(binaries):
+            out = outdir / str(bi) / (name.replace("/", "_") + ".gif")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            outs.append(out)
+            walls.append([])
+            stagesets.append([])
+            sizes.append(0)
+            run_once(binary, clip, out, extra)  # warm page cache, discard
         for _ in range(runs):
-            w, s, size = run_once(binary, clip, out, extra)
-            walls.append(w)
-            stagesets.append(s)
-        best = min(range(len(walls)), key=lambda i: walls[i])
-        res[name] = {
-            "wall": walls[best],
-            "wall_med": statistics.median(walls),
-            "size": size,
-            "stages": stagesets[best],
-            "gif": str(out),
-        }
+            for bi, binary in enumerate(binaries):
+                w, st, sz = run_once(binary, clip, outs[bi], extra)
+                walls[bi].append(w)
+                stagesets[bi].append(st)
+                sizes[bi] = sz
+        for bi in range(len(binaries)):
+            best = min(range(runs), key=lambda i: walls[bi][i])
+            res[bi][name] = {
+                "wall": walls[bi][best],
+                "wall_med": statistics.median(walls[bi]),
+                "size": sizes[bi],
+                "stages": stagesets[bi][best],
+                "gif": str(outs[bi]),
+            }
     return res
 
 
@@ -125,8 +140,10 @@ def main():
     names = args.clips.split(",") if args.clips else SETS[args.set]
     extra = args.extra.split() if args.extra else []
     outdir = ROOT / "out"
-    ra = bench(args.a, names, args.runs, extra, outdir / "a")
-    rb = bench(args.b, names, args.runs, extra, outdir / "b") if args.b else None
+    bins = [args.a] + ([args.b] if args.b else [])
+    got = bench(bins, names, args.runs, extra, outdir)
+    ra = got[0]
+    rb = got[1] if args.b else None
 
     hdr = f"{'clip':<22}{'A ms':>9}"
     if rb:

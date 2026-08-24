@@ -1101,10 +1101,58 @@ impl NearestMap {
         self.lookup_slow(cache, d >> 8, r, g, b)
     }
 
-    /// The direct[] entry for a precomputed grid key (staged gather loops).
+    /// Probe the memo cache for a colour, returning the packed nearest
+    /// entry on a hit.
+    ///
+    /// The staged quantizer probes this *before* the grid table. 80-95% of
+    /// pixels hit — a frame's distinct colours are far fewer than its
+    /// pixels — and on a hit the 1MB `direct` table is never touched at
+    /// all. Only a miss pays the grid lookup, and it is the same cost it
+    /// always was. (The old order paid both: the grid load told the caller
+    /// the cell was multi-candidate, and only then did the cache probe
+    /// happen, so the common pixel took two random loads instead of one.)
     #[inline(always)]
-    pub fn direct_lookup(&self, key: u32) -> u32 {
-        self.direct[key as usize]
+    pub fn cache_probe(&self, cache: &IdxCache, color: u32) -> Option<PackedNearest> {
+        let e = cache.slots[cache_slot(color)];
+        // the e != MAX guard keeps the empty sentinel (whose tag bits read
+        // as 0xFFFFFF) from false-hitting on white; a real white entry has
+        // an index byte below 0xFF and never equals MAX
+        ((e >> 40) == color as u64 && e != u64::MAX).then_some(e as u32)
+    }
+
+    /// Resolve a colour the cache missed on: grid lookup, candidate scan
+    /// if the cell holds more than one, then insert. `key` is the colour's
+    /// grid key, which the staged pipeline already has in hand.
+    #[inline]
+    pub fn resolve_keyed(&self, cache: &mut IdxCache, key: u32, color: u32) -> PackedNearest {
+        let (r, g, b) = ((color >> 16) as u8, (color >> 8) as u8, color as u8);
+        let d = self.direct[key as usize];
+        let packed = if (d & 0xFF) != MULTI as u32 {
+            d
+        } else {
+            let idx = self.resolve_off((d >> 8) as usize, r, g, b);
+            (self.pal_rgb[idx as usize] << 8) | idx as u32
+        };
+        cache.slots[cache_slot(color)] = ((color as u64) << 40) | packed as u64;
+        packed
+    }
+
+    /// Prefetch a colour's memo-cache slot (staged loops run a fixed
+    /// distance ahead of themselves).
+    #[inline(always)]
+    pub fn prefetch_color_slot(&self, cache: &IdxCache, color: u32) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch(
+                cache.slots.as_ptr().add(cache_slot(color)) as *const i8,
+                _MM_HINT_T0,
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (cache, color);
+        }
     }
 
     /// The multi-candidate path of `lookup_packed`, for callers that
@@ -1121,7 +1169,7 @@ impl NearestMap {
         b: u8,
     ) -> PackedNearest {
         let color = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
-        let slot = (color.wrapping_mul(0x9E37_79B1) >> 16) as usize;
+        let slot = cache_slot(color);
         let e = cache.slots[slot];
         // the e != MAX guard keeps the empty sentinel (whose tag bits read
         // as 0xFFFFFF) from false-hitting on white; a real white entry has
@@ -1133,24 +1181,6 @@ impl NearestMap {
         let packed = (self.pal_rgb[idx as usize] << 8) | idx as u32;
         cache.slots[slot] = ((color as u64) << 40) | packed as u64;
         packed
-    }
-
-    /// Prefetch the memo-cache slot for a color a few worklist entries
-    /// ahead: the staged resolve loops are bound by the dependent
-    /// hash-slot load, and the slot address needs only the color bytes.
-    #[inline(always)]
-    pub fn prefetch_cache_slot(&self, cache: &IdxCache, r: u8, g: u8, b: u8) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            let color = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
-            let slot = (color.wrapping_mul(0x9E37_79B1) >> 16) as usize;
-            _mm_prefetch(cache.slots.as_ptr().add(slot) as *const i8, _MM_HINT_T0);
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = (cache, r, g, b);
-        }
     }
 
     /// Prefetch the fast-path cell for a color a few pixels ahead of the
@@ -1218,6 +1248,12 @@ impl NearestMap {
 /// `lookup_packed`).
 pub struct IdxCache {
     slots: Vec<u64>,
+}
+
+/// Direct-mapped slot for a 24-bit colour.
+#[inline(always)]
+fn cache_slot(color: u32) -> usize {
+    (color.wrapping_mul(0x9E37_79B1) >> 16) as usize
 }
 
 impl Default for IdxCache {

@@ -28,6 +28,13 @@ const BAYER8: [[u8; 8]; 8] = [
     [63, 31, 55, 23, 61, 29, 53, 21],
 ];
 
+/// The 24-bit colour of an RGBA pixel, in the `r<<16 | g<<8 | b` packing
+/// the nearest-map's memo cache and probe colours use.
+#[inline(always)]
+fn rgb24(p: &[u8]) -> u32 {
+    ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32
+}
+
 pub struct Quantizer<'a> {
     pub nearest: &'a crate::palette::NearestMap,
     pub trans_idx: u8,
@@ -176,36 +183,34 @@ impl<'a> Quantizer<'a> {
                 let att = &scratch.att[x0..x0 + tw];
                 let cache = &mut scratch.cache;
 
-                // stage 2: branchless c1 gather; misses go to the
-                // worklist. The direct[] table is 1MB, so a lookup 16
-                // pixels ahead is prefetched each step (keys are
-                // row-wide: the tail of one tile prefetches into the
-                // next, and get() falls off the row end cleanly).
+                // stage 2: memo-cache probe for every pixel, misses
+                // compacted into the worklist. The cache is keyed by the
+                // exact colour and hits on 75-95% of pixels, so the 1MB
+                // grid table is only touched for the rest — the old order
+                // (grid first, cache only for multi-candidate cells) paid
+                // two random loads for the common pixel, since 80-95% of
+                // pixels land on a multi-candidate cell.
                 let mut m1 = 0usize;
                 for i in 0..tw {
-                    if let Some(&k) = keys.get(i + 16) {
-                        self.nearest.prefetch_key(k);
+                    if i + 16 < tw {
+                        self.nearest
+                            .prefetch_color_slot(cache, rgb24(&row[(i + 16) * 4..]));
                     }
-                    let d = self.nearest.direct_lookup(keys[i]);
-                    scratch.pk1[i] = d;
+                    let hit = self.nearest.cache_probe(cache, rgb24(&row[i * 4..]));
+                    scratch.pk1[i] = hit.unwrap_or(0);
                     scratch.wl[m1] = i as u32;
-                    m1 += ((d & 0xFF) == crate::palette::MULTI as u32) as usize;
+                    m1 += hit.is_none() as usize;
                 }
-                // stage 3: resolve c1 misses through the memo cache (the
-                // gathered entry's high bits carry the candidate-list
-                // offset, so no cell metadata reload); prefetching the
-                // slot a few misses ahead hides the hash-probe latency
+                // stage 3: resolve the misses through the grid table
+                // (prefetching the cell a few misses ahead hides the load)
                 for j in 0..m1 {
                     if let Some(&fu) = scratch.wl[..m1].get(j + 8) {
-                        let f = fu as usize;
-                        let p = &row[f * 4..f * 4 + 4];
-                        self.nearest.prefetch_cache_slot(cache, p[0], p[1], p[2]);
+                        self.nearest.prefetch_key(keys[fu as usize]);
                     }
                     let i = scratch.wl[j] as usize;
-                    let p = &row[i * 4..i * 4 + 4];
                     scratch.pk1[i] =
                         self.nearest
-                            .lookup_slow(cache, scratch.pk1[i] >> 8, p[0], p[1], p[2]);
+                            .resolve_keyed(cache, keys[i], rgb24(&row[i * 4..]));
                 }
 
                 // A fully attenuated tile can't flip any pixel to c2, so
@@ -226,43 +231,31 @@ impl<'a> Quantizer<'a> {
                     );
 
                 if tile_live {
-                    // stage 5: c2 gather (prefetched like stage 2); only
-                    // pixels that are inexact and not fully attenuated can
-                    // enter the worklist (for the rest a stale pk2 entry
-                    // is harmless: the threshold math then degenerates to
-                    // picking c1)
+                    // stage 5: c2 cache probe, same shape as stage 2.
+                    // Only pixels that are inexact and not fully
+                    // attenuated can enter the worklist; for the rest a
+                    // copy of c1 is stored, which makes the threshold
+                    // pick keep c1 (identical candidates).
                     let mut m2 = 0usize;
                     for i in 0..tw {
-                        if let Some(&k) = scratch.keys2.get(i + 16) {
-                            self.nearest.prefetch_key(k);
+                        if i + 16 < tw {
+                            self.nearest.prefetch_color_slot(cache, scratch.c2c[i + 16]);
                         }
-                        let d = self.nearest.direct_lookup(scratch.keys2[i]);
-                        scratch.pk2[i] = d;
+                        let live = (scratch.ors[i] != 0) & (att[i] != 0);
+                        let hit = self.nearest.cache_probe(cache, scratch.c2c[i]);
+                        scratch.pk2[i] = hit.unwrap_or(scratch.pk1[i]);
                         scratch.wl[m2] = i as u32;
-                        m2 += (((d & 0xFF) == crate::palette::MULTI as u32)
-                            & (scratch.ors[i] != 0)
-                            & (att[i] != 0)) as usize;
+                        m2 += (hit.is_none() & live) as usize;
                     }
                     // stage 6: resolve c2 misses (same lookahead as stage 3)
                     for j in 0..m2 {
                         if let Some(&fu) = scratch.wl[..m2].get(j + 8) {
-                            let c = scratch.c2c[fu as usize];
-                            self.nearest.prefetch_cache_slot(
-                                cache,
-                                (c >> 16) as u8,
-                                (c >> 8) as u8,
-                                c as u8,
-                            );
+                            self.nearest.prefetch_key(scratch.keys2[fu as usize]);
                         }
                         let i = scratch.wl[j] as usize;
-                        let c = scratch.c2c[i];
-                        scratch.pk2[i] = self.nearest.lookup_slow(
-                            cache,
-                            scratch.pk2[i] >> 8,
-                            (c >> 16) as u8,
-                            (c >> 8) as u8,
-                            c as u8,
-                        );
+                        scratch.pk2[i] =
+                            self.nearest
+                                .resolve_keyed(cache, scratch.keys2[i], scratch.c2c[i]);
                     }
 
                     // stage 7: threshold pick (x0 is a multiple of 64, so
