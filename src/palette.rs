@@ -896,7 +896,17 @@ fn cell_candidates<const SPAN: u8>(
     let dmin2 = crate::simdops::cell_distances(level, soa, q, dists);
     let bound = dmin2.sqrt() + 2.0 * rmax + 1e-6;
     let bound2 = bound * bound;
-    let mut list = Vec::new();
+    // A palette that clusters tightly in Lab admits dozens of candidates
+    // per cell, and growing 262144 vectors from empty is then a million
+    // reallocations. Long scans count first — branchless, and `dists` is
+    // still in L1 — and allocate once. Short scans, which is every cell
+    // on ordinary content, keep growing from empty: two or three pushes
+    // never reach a second allocation anyway.
+    let mut list = if n <= 16 {
+        Vec::new()
+    } else {
+        Vec::with_capacity(dists[..n].iter().filter(|&&d| d <= bound2).count())
+    };
     for (i, &d) in dists[..n].iter().enumerate() {
         if d <= bound2 {
             list.push(map(i));
