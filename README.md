@@ -15,7 +15,9 @@ built by CI for every push, in two flavors:
 - `weft-*-linux-musl` — fully static, linked against musl with mimalloc as
   the allocator, so they run on any Linux distro — any glibc version,
   Alpine, scratch containers — with no runtime dependencies, at the same
-  speed as a glibc build.
+  speed as a glibc build. Peak memory runs higher than the glibc build's
+  (roughly 1.5–2×): mimalloc holds onto freed pages where glibc's malloc
+  returns them promptly.
 - `weft-*-linux-gnu` — dynamically linked against glibc, built on Ubuntu
   24.04 (glibc 2.39). CI verifies no symbol newer than GLIBC_2.39 is
   referenced, so they run on Ubuntu 24.04+ and any other distro with
@@ -78,32 +80,33 @@ rate.
 
 | clip      | encoder | time (s) | peak RSS (MB) | size (KB) | PSNR (dB) | SSIM  |
 |-----------|---------|---------:|--------------:|----------:|----------:|------:|
-| rgba¹     | ffmpeg  | 1.63     | 202           | 2296      | 40.07     | 0.9847|
-| rgba¹     | weft    | **0.24** | 37            | **2226**  | 39.60¹    | **0.9853**|
-| testsrc   | ffmpeg  | 1.70     | 199           | 2296      | 40.07     | 0.985 |
-| testsrc   | weft    | **0.22** | 28            | **2242**  | 39.24²    | 0.899²|
-| big (720p)| ffmpeg  | 10.84    | 1152          | 13751     | 42.16     | 0.993 |
-| big (720p)| weft    | **1.32** | 75            | **13596** | 41.09²    | 0.900²|
-| mandel    | ffmpeg  | 7.12     | 265           | 16762     | 31.40     | 0.886 |
-| mandel    | weft    | **0.85** | 108           | **16399** | 30.54     | 0.864 |
-| gradients | ffmpeg  | 1.29     | 190           | 2569      | inf³      | 1.000 |
-| gradients | weft    | **0.24** | 36            | **2086**  | 43.8²³    | 0.9997|
-| life      | ffmpeg  | 1.04     | 190           | 2559      | 76.02     | 0.9997|
-| life      | weft    | **0.25** | 31            | **2467**  | 54.8²     | 0.993 |
-| static    | ffmpeg  | 1.05     | 190           | 15        | inf³      | 1.000 |
-| static    | weft    | **0.12** | 29            | **11**    | 49.7²³    | 0.976 |
+| rgba¹     | ffmpeg  | 2.25     | 201           | 2296      | 40.07     | 0.9847|
+| rgba¹     | weft    | **0.34** | 118           | **2160**  | **40.51** | **0.9855**|
+| testsrc   | ffmpeg  | 2.06     | 199           | 2296      | 40.07     | 0.985 |
+| testsrc   | weft    | **0.31** | 63            | **2170**  | 40.07²    | 0.900²|
+| big (720p)| ffmpeg  | 18.23    | 1150          | 13751     | 42.16     | 0.993 |
+| big (720p)| weft    | **2.28** | 417           | **13117** | 41.77²    | 0.900²|
+| mandel    | ffmpeg  | 9.51     | 264           | 16762     | 31.40     | 0.886 |
+| mandel    | weft    | **0.68** | 93            | **16130** | **32.20** | 0.873 |
+| gradients | ffmpeg  | 1.76     | 189           | 5378      | inf³      | 1.000 |
+| gradients | weft    | **0.35** | 78            | **4906**  | 46.7²³    | 0.9993|
+| life      | ffmpeg  | 1.62     | 189           | 3511      | 74.59     | 0.9997|
+| life      | weft    | **0.21** | 63            | **3389**  | 53.4²     | 0.993 |
+| static    | ffmpeg  | 1.28     | 189           | 15        | inf³      | 1.000 |
+| static    | weft    | **0.17** | 63            | **11**    | 49.7²³    | 0.976 |
 
-**4–9× faster, smaller output on every clip, 5–15× less memory.**
+**5–14× faster, smaller output on every clip, 2–3× less memory.**
 
 Each encoder runs its default dither: sierra2 error diffusion for
 ffmpeg's paletteuse, blue-noise for weft (temporally stable and smaller;
 see below).
 
 ¹ `rgba` is the apples-to-apples row: identical input bytes for both
-encoders, no YUV→RGB conversion anywhere. The 0.5 dB PSNR gap is the
-blue-noise default's deliberate trade (SSIM is slightly *higher*, and the
-file 3% smaller); with `--dither sierra2` — the same algorithm ffmpeg
-uses — weft measures 40.08 dB / 0.9846: statistically identical.
+encoders, no YUV→RGB conversion anywhere. With the activity-gated
+blue-noise default, weft measures *higher* PSNR and SSIM than ffmpeg on
+identical input, with a 6% smaller file; with `--dither sierra2` — the
+same algorithm ffmpeg uses — weft measures 40.08 dB / 0.9846:
+statistically identical.
 
 ² The y4m rows undercount weft's quality: the PSNR/SSIM reference is
 decoded with swscale, which *truncates* in YUV→RGB where weft rounds to
@@ -126,18 +129,18 @@ timed as the sum of both stages:
 
 | clip      | pipeline          | time (s) | size (KB) | PSNR (dB) | SSIM  |
 |-----------|-------------------|---------:|----------:|----------:|------:|
-| testsrc   | ffmpeg + gifsicle | 7.9      | 1975      | 39.17     | 0.940 |
-| testsrc   | weft --lossy 30   | **0.29** | 2047      | 38.61²    | 0.874²|
-| big (720p)| ffmpeg + gifsicle | 63.5     | 11854     | 41.02     | 0.974 |
-| big (720p)| weft --lossy 30   | **1.81** | 11932     | 40.55²    | 0.891²|
-| mandel    | ffmpeg + gifsicle | 28.3     | 11734     | 30.91     | 0.854 |
-| mandel    | weft --lossy 30   | **1.42** | 12064     | 30.13     | 0.833 |
-| gradients | ffmpeg + gifsicle | 4.1      | 663       | 47.63     | 0.989 |
-| gradients | weft --lossy 30   | **0.57** | 663       | 42.63²    | 0.990 |
+| testsrc   | ffmpeg + gifsicle | 12.9     | 1975      | 39.17     | 0.940 |
+| testsrc   | weft --lossy 30   | **0.49** | 1992      | 39.36²    | 0.875²|
+| big (720p)| ffmpeg + gifsicle | 114.4    | 11854     | 41.02     | 0.974 |
+| big (720p)| weft --lossy 30   | **3.67** | **11602** | 41.13²    | 0.891²|
+| mandel    | ffmpeg + gifsicle | 39.5     | 11734     | 30.91     | 0.854 |
+| mandel    | weft --lossy 30   | **1.24** | 12710     | 31.33     | 0.821 |
+| gradients | ffmpeg + gifsicle | 10.3     | 1334      | 48.74     | 0.989 |
+| gradients | weft --lossy 30   | **1.16** | **1287**  | 44.87²    | 0.990 |
 
-**7–35× faster than the two-tool pipeline**, at sizes within 3% and
-quality within the dither-default and reference-decoder gaps above (the
-weft rows inherit footnote ²).
+**9–32× faster than the two-tool pipeline**, at sizes between 4% smaller
+and 8% larger, and quality within the dither-default and
+reference-decoder gaps above (the weft rows inherit footnote ²).
 
 Reproduce with:
 
@@ -170,10 +173,12 @@ PSNR, higher SSIM, ~5–10% smaller files, and ~6–38% faster quantization
 wholesale). On pure-gradient content the gate never engages and output is
 bit-identical to `--dither-gate 0`. The gate reads only the source frame,
 so it is exactly as temporally stable as the ungated dither. `sierra2` is error
-diffusion, matching ffmpeg's paletteuse: slightly higher visual quality
-on gradient-heavy content (testsrc: 39.7 dB / 0.8994 SSIM vs bluenoise's
-39.2 dB / 0.8993, 2% larger file) at the cost of speed and temporal
-stability. `bayer` and `none` complete the range. The mask is generated by
+diffusion, matching ffmpeg's paletteuse; with the activity gate in place
+the blue-noise default now measures at or above it (testsrc: 40.1 dB /
+0.8996 SSIM vs sierra2's 39.7 dB / 0.8994, 5% smaller file), though
+sierra2 can still read slightly smoother on gradient-heavy content — at
+the cost of speed and temporal stability. `bayer` and `none` complete the
+range. The mask is generated by
 `bench/gen_bluenoise.py` (Ulichney void-and-cluster) and checked in as
 `src/bluenoise.rs`.
 
@@ -189,10 +194,10 @@ dramatically better. Measured at `--lossy 30` (same clips as above):
 
 | clip      | lossless | --lossy 30 | Δ size | Δ PSNR | gifsicle --lossy=30¹ |
 |-----------|---------:|-----------:|-------:|-------:|---------------------:|
-| gradients | 2086 KB  | **664 KB** | −68%   | −1.3 dB| 665 KB               |
-| mandel    | 16358 KB | **11656 KB**| −29%  | −0.4 dB| 11614 KB             |
-| testsrc   | 2280 KB  | **2084 KB**| −9%    | −0.8 dB| 1944 KB              |
-| big (720p)| 13738 KB | **12096 KB**| −12%  |        |                      |
+| gradients | 4906 KB  | **1287 KB**| −74%   | −1.8 dB| 1335 KB              |
+| mandel    | 16130 KB | **12710 KB**| −21%  | −0.9 dB| 11667 KB             |
+| testsrc   | 2170 KB  | **1992 KB**| −8%    | −0.7 dB| 1858 KB              |
+| big (720p)| 13117 KB | **11602 KB**| −12%  | −0.6 dB| 11424 KB             |
 
 ¹ gifsicle 1.94 `-O3 --lossy=30` applied to weft's lossless output.
 
@@ -232,14 +237,17 @@ Every heavy stage is embarrassingly parallel across frames (rayon):
    a per-thread direct-mapped cache. The build's 262k-cell × 256-color
    distance sweep runs on fearless_simd's portable f32 lanes.
 
-Three hot paths are vectorized with fearless_simd behind runtime dispatch
+Two hot paths are vectorized with fearless_simd behind runtime dispatch
 (SSE4.2/AVX2/AVX-512/NEON picked per machine, so the baseline-CPU static
-binaries lose nothing), all verified byte-identical to the scalar paths:
+binaries lose nothing), both verified byte-identical to the scalar paths:
 the YUV→RGBA row conversion (16 px/iteration through widen/zip, feeding
-both the histogram and quantize passes), the nearest-map distance sweep,
-and bulk histogram run extension (8-pixel block compares, guarded by one
-scalar compare so noisy content skips the overhead). 720p end-to-end:
-2.48 s → 2.13 s. Verified not to help: sierra2 error diffusion (the
+both the histogram and quantize passes) and the nearest-map distance
+sweep. 720p end-to-end: 2.48 s → 2.13 s. Bulk histogram run extension
+(8-pixel blocks, guarded by one scalar compare so noisy content skips the
+overhead) uses branchless u64 word compares rather than slice equality:
+slice `==` lowers to libc `memcmp`, which musl implements as a
+byte-at-a-time loop — that single call site made the static binary's
+histogram pass up to 6× slower. Verified not to help: sierra2 error diffusion (the
 carry→lookup→error chain is latency-bound, not throughput-bound), LZW (a
 serial hash walk), and palette lookups (gather-bound). Known follow-up: a
 radix sort on the cut axis inside median cut (mandel's remaining
@@ -266,7 +274,8 @@ palette exactness, nearest-map-vs-brute-force in OkLab, y4m parsing, delay
 accumulation) and an end-to-end test that decodes weft's output with an
 independent minimal GIF decoder and compares canvases byte-for-byte.
 
-Only dependency: rayon.
+Dependencies: rayon and fearless_simd; the musl static build adds
+mimalloc.
 
 ## License
 
