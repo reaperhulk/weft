@@ -30,6 +30,21 @@ pub fn grid_key(r: u8, g: u8, b: u8) -> usize {
         | ((b as usize) >> 2)
 }
 
+/// Prefetch the cache line holding `slice[idx]` into L1 (a `prefetcht0`
+/// hint on x86_64, a no-op elsewhere). Safe for any `idx`: the pointer
+/// arithmetic wraps instead of assuming in-bounds, and prefetch is
+/// architecturally a hint that cannot fault whatever address it is given.
+#[inline(always)]
+fn prefetch_index<T>(slice: &[T], idx: usize) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(slice.as_ptr().wrapping_add(idx) as *const i8, _MM_HINT_T0);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (slice, idx);
+}
+
 // ---------------------------------------------------------------------------
 // Exact-color histogram
 
@@ -76,18 +91,7 @@ impl ColorHist {
     /// cache miss without this).
     #[inline(always)]
     pub fn prefetch(&self, color: u32) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            _mm_prefetch(
-                self.slots.as_ptr().add(self.home(color)) as *const i8,
-                _MM_HINT_T0,
-            );
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = color;
-        }
+        prefetch_index(&self.slots, self.home(color));
     }
 
     #[inline(always)]
@@ -177,14 +181,7 @@ pub fn accumulate_frame_coarse(
     let has_alpha = scan_runs(rgba, runs);
     for j in 0..runs.len() {
         if let Some(&(c, _)) = runs.get(j + 8) {
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-                let key = grid_key((c >> 16) as u8, (c >> 8) as u8, c as u8);
-                _mm_prefetch(bins.as_ptr().add(key) as *const i8, _MM_HINT_T0);
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            let _ = c;
+            prefetch_index(bins, grid_key((c >> 16) as u8, (c >> 8) as u8, c as u8));
         }
         let (c, n) = runs[j];
         bin_add(bins, c, n);
@@ -1161,17 +1158,9 @@ impl NearestMap {
     /// hash-slot load, and the slot address needs only the color bytes.
     #[inline(always)]
     pub fn prefetch_cache_slot(&self, cache: &IdxCache, r: u8, g: u8, b: u8) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            let color = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
-            let slot = (color.wrapping_mul(0x9E37_79B1) >> 16) as usize;
-            _mm_prefetch(cache.slots.as_ptr().add(slot) as *const i8, _MM_HINT_T0);
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = (cache, r, g, b);
-        }
+        let color = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
+        let slot = (color.wrapping_mul(0x9E37_79B1) >> 16) as usize;
+        prefetch_index(&cache.slots, slot);
     }
 
     /// Prefetch the fast-path cell for a color a few pixels ahead of the
@@ -1181,34 +1170,14 @@ impl NearestMap {
     /// the right cache line almost always.
     #[inline(always)]
     pub fn prefetch(&self, r: u8, g: u8, b: u8) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            let key = grid_key(r, g, b);
-            _mm_prefetch(self.direct.as_ptr().add(key) as *const i8, _MM_HINT_T0);
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = (r, g, b);
-        }
+        prefetch_index(&self.direct, grid_key(r, g, b));
     }
 
     /// Prefetch the fast-path cell for an already-computed grid key (the
     /// staged gather loops run a fixed distance ahead of themselves).
     #[inline(always)]
     pub fn prefetch_key(&self, key: u32) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            _mm_prefetch(
-                self.direct.as_ptr().add(key as usize) as *const i8,
-                _MM_HINT_T0,
-            );
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = key;
-        }
+        prefetch_index(&self.direct, key as usize);
     }
 
     /// Scan the 0xFF-terminated candidate list at `off` for the OkLab
