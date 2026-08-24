@@ -766,6 +766,14 @@ pub fn median_cut(mut entries: Vec<(u32, u32)>, max_colors: usize) -> Vec<[u8; 3
 /// Palette indices never reach it (palettes cap at 255 colors).
 pub const MULTI: u8 = 0xFF;
 
+/// Reserved candidate-list offset meaning "no list was stored for this
+/// cell; scan the whole palette". Only reachable for a palette whose
+/// candidate lists cannot fit the 24-bit offset field even after
+/// interning, which takes hundreds of thousands of *distinct* long lists.
+/// Scanning every color is by definition the true nearest, so this is a
+/// slow path, never a wrong one.
+const SCAN_ALL: u32 = (1 << 24) - 1;
+
 /// Per-grid-cell candidate lists. `lookup` returns the palette index whose
 /// OkLab distance to the query color is minimal; for most cells there is a
 /// single candidate and the search collapses to one load.
@@ -787,6 +795,9 @@ pub struct NearestMap {
     pal_rgb: Vec<u32>,
     pal_lab: Vec<[f32; 3]>,
     cv: LabConverter,
+    /// Mean candidates per cell. Recorded at build time: `cands` no longer
+    /// holds one copy per cell to count, since identical lists are shared.
+    avg_cands: f32,
 }
 
 /// A packed lookup result: `r<<24 | g<<16 | b<<8 | idx`.
@@ -853,39 +864,61 @@ impl NearestMap {
             .collect();
         let mut direct = Vec::with_capacity(GRID_SIZE);
         let mut cands = Vec::new();
+        // Cells whose lists are long are almost always sharing one list
+        // with a lot of other cells: a palette confined to a small region
+        // of OkLab leaves most of the grid far outside it, and out there
+        // the triangle bound admits the whole palette for every cell
+        // alike. Interning collapses those to a single copy, which is
+        // what keeps `cands` small enough to address. Short lists — all
+        // of real content, where cells average a handful of candidates —
+        // skip the hashing.
+        const INTERN_MIN: usize = 16;
+        let mut interned: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
         for l in &cell_lists {
             direct.push(if l.len() == 1 {
                 (pal_rgb[l[0] as usize] << 8) | l[0] as u32
             } else {
-                let off = cands.len() as u32;
-                // 24-bit offset: total list bytes stay far below 16M for
-                // any 255-color palette (avg candidates/cell is single
-                // digits), but guard the packing invariant regardless
-                assert!(off < (1 << 24), "candidate lists exceed 24-bit offsets");
-                cands.extend_from_slice(l);
-                cands.push(MULTI); // terminator
+                // Short lists never touch the map: on real content
+                // cells average a handful of candidates, and hashing
+                // every one of them costs more than the sharing saves.
+                let long = l.len() >= INTERN_MIN;
+                let off = match long.then(|| interned.get(l.as_slice())).flatten() {
+                    Some(&off) => off,
+                    // A list needs its own copy. It only fits if the
+                    // offset is addressable and the terminator lands
+                    // inside the reserved range; otherwise the cell falls
+                    // back to scanning the whole palette, which is slower
+                    // but always the correct answer, so the packing
+                    // invariant holds for any palette whatsoever.
+                    None if cands.len() + l.len() + 1 < SCAN_ALL as usize => {
+                        let off = cands.len() as u32;
+                        cands.extend_from_slice(l);
+                        cands.push(MULTI); // terminator
+                        if long {
+                            interned.insert(l.as_slice(), off);
+                        }
+                        off
+                    }
+                    None => SCAN_ALL,
+                };
                 (off << 8) | MULTI as u32
             });
         }
+        drop(interned);
+        let total: usize = cell_lists.iter().map(Vec::len).sum();
         NearestMap {
             direct,
             cands,
             pal_rgb,
             pal_lab,
             cv,
+            avg_cands: total as f32 / GRID_SIZE as f32,
         }
     }
 
     /// Average candidates per cell — perf diagnostic.
     pub fn avg_candidates(&self) -> f32 {
-        let multi = self
-            .direct
-            .iter()
-            .filter(|&&d| (d & 0xFF) == MULTI as u32)
-            .count();
-        // cands holds one terminator per multi-candidate cell; every other
-        // cell has exactly one candidate.
-        (self.cands.len() - 2 * multi + GRID_SIZE) as f32 / GRID_SIZE as f32
+        self.avg_cands
     }
 
     /// Uncached lookup (tests; `lookup_packed` is the hot path).
@@ -1011,6 +1044,16 @@ impl NearestMap {
         let q = self.cv.srgb_to_oklab_fast(r, g, b);
         let mut best = 0u8;
         let mut best_d = f32::MAX;
+        if off == SCAN_ALL as usize {
+            for (i, lab) in self.pal_lab.iter().enumerate() {
+                let d = dist2(lab, &q);
+                if d < best_d {
+                    best_d = d;
+                    best = i as u8;
+                }
+            }
+            return best;
+        }
         for &i in self.cands[off..].iter() {
             if i == MULTI {
                 break;
@@ -1074,6 +1117,93 @@ mod tests {
         let mut pal = median_cut(hist_from_frame(&frame), 255);
         pal.sort();
         assert_eq!(pal, vec![[0, 0, 255], [0, 255, 0], [255, 0, 0]]);
+    }
+
+    #[test]
+    fn tight_palette_cluster_builds() {
+        // A palette whose colors all sit in one small region of OkLab (a
+        // source with few distinct colors) leaves most of the 64^3 grid
+        // far outside it, and at that distance every palette entry is
+        // within the triangle bound of every other — so nearly every cell
+        // admits nearly the whole palette. That is 262144 cells x ~256
+        // candidates of list data, which used to overflow the 24-bit
+        // offset packing and abort the encoder.
+        let pal: Vec<[u8; 3]> = (0..255u32)
+            .map(|i| [100 + (i % 15) as u8, 100 + (i / 15) as u8, 100])
+            .collect();
+        assert_eq!(
+            pal.iter().collect::<std::collections::HashSet<_>>().len(),
+            pal.len(),
+            "palette colors must be distinct"
+        );
+        let nm = NearestMap::build(&pal);
+        // and it must still answer correctly: brute-force argmin agrees
+        let cv = LabConverter::new();
+        let labs: Vec<[f32; 3]> = pal
+            .iter()
+            .map(|c| cv.srgb_to_oklab(c[0], c[1], c[2]))
+            .collect();
+        for &(r, g, b) in &[
+            (0u8, 0u8, 0u8),
+            (255, 255, 255),
+            (107, 110, 100),
+            (13, 200, 77),
+        ] {
+            let q = cv.srgb_to_oklab(r, g, b);
+            let want = labs
+                .iter()
+                .enumerate()
+                .min_by(|a, b| dist2(a.1, &q).total_cmp(&dist2(b.1, &q)))
+                .unwrap()
+                .0 as u8;
+            assert_eq!(nm.lookup(r, g, b), want, "nearest for {r},{g},{b}");
+        }
+    }
+
+    #[test]
+    fn scan_all_fallback_finds_true_nearest() {
+        // The fallback only arises for a palette that overflows the
+        // offset field even after interning, which is not constructible
+        // cheaply — so exercise the branch directly: resolving against
+        // SCAN_ALL must agree with brute force for any color.
+        let pal: Vec<[u8; 3]> = (0..255u32)
+            .map(|i| {
+                [
+                    (i * 7 % 256) as u8,
+                    (i * 29 % 256) as u8,
+                    (i * 53 % 256) as u8,
+                ]
+            })
+            .collect();
+        let nm = NearestMap::build(&pal);
+        let cv = LabConverter::new();
+        let mut x = 0x1234_5678u32;
+        let mut rng = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for _ in 0..2000 {
+            let (r, g, b) = (
+                (rng() & 255) as u8,
+                (rng() & 255) as u8,
+                (rng() & 255) as u8,
+            );
+            let q = cv.srgb_to_oklab(r, g, b);
+            let want = nm
+                .pal_lab
+                .iter()
+                .enumerate()
+                .min_by(|a, b| dist2(a.1, &q).total_cmp(&dist2(b.1, &q)))
+                .unwrap()
+                .0 as u8;
+            assert_eq!(
+                nm.resolve_off(SCAN_ALL as usize, r, g, b),
+                want,
+                "scan-all nearest for {r},{g},{b}"
+            );
+        }
     }
 
     #[test]
