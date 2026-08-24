@@ -650,9 +650,9 @@ mod tests {
                 let alpha_ref = bn_keys(Level::new(), &cur, &mut keys_ref);
                 assert_eq!(alpha, alpha_ref, "w {w}");
                 assert_eq!(keys, keys_ref, "w {w}");
-                for i in 0..w {
+                for (i, &a) in att.iter().enumerate() {
                     let want = att_scalar(&cur, &prev, i, gate as i32 + 64);
-                    assert_eq!(att[i], want, "w {w} gate {gate} i {i}");
+                    assert_eq!(a, want, "w {w} gate {gate} i {i}");
                 }
             }
         }

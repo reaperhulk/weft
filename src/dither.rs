@@ -678,7 +678,7 @@ mod tests {
         for y in 0..h {
             for x in 0..w {
                 let r = xorshift(&mut seed);
-                if y >= 30 && r % 23 == 0 {
+                if y >= 30 && r.is_multiple_of(23) {
                     rgba.extend_from_slice(&[0, 0, 0, 0]); // transparent
                     continue;
                 }
