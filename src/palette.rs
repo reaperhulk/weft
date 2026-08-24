@@ -109,11 +109,28 @@ impl ColorHist {
     }
 }
 
-/// Accumulate one RGBA frame. Pixels with alpha < 128 are skipped; returns
-/// true when any were, so the pipeline knows the disposal mode (and thus
-/// whether delta encoding is possible) before quantization starts.
-/// Run-length batching keeps hash traffic low on flat content.
+/// Accumulate one RGBA frame into the exact-color histogram. Pixels with
+/// alpha < 128 are skipped; returns true when any were, so the pipeline
+/// knows the disposal mode (and thus whether delta encoding is possible)
+/// before quantization starts.
 pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8]) -> bool {
+    accumulate_frame_with(rgba, |c, n| hist.add(c, n))
+}
+
+/// Accumulate one RGBA frame directly into 6-bit/channel bins (the coarse
+/// mode workers switch to once their exact table outgrows the spill
+/// threshold — see `maybe_fold` for why the grid is quality-sufficient).
+/// A binned add is a key computation plus four u64 adds, with no probing
+/// and no table growth, and bin sums are commutative, so the result is
+/// independent of how frames are scheduled across workers.
+pub fn accumulate_frame_coarse(bins: &mut [[u64; 4]], rgba: &[u8]) -> bool {
+    accumulate_frame_with(rgba, |c, n| bin_add(bins, c, n))
+}
+
+/// Shared RLE scan: run-length batching keeps sink traffic low on flat
+/// content.
+#[inline(always)]
+fn accumulate_frame_with(rgba: &[u8], mut add: impl FnMut(u32, u32)) -> bool {
     let pixels = rgba.as_chunks::<4>().0;
     let n = pixels.len();
     let mut has_alpha = false;
@@ -132,7 +149,7 @@ pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8]) -> bool {
             run += 1;
         } else {
             if run > 0 {
-                hist.add(last, run);
+                add(last, run);
             }
             last = c;
             run = 1;
@@ -157,7 +174,7 @@ pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8]) -> bool {
         }
     }
     if run > 0 {
-        hist.add(last, run);
+        add(last, run);
     }
     has_alpha
 }
@@ -174,19 +191,41 @@ pub fn maybe_fold(entries: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
     if entries.len() <= GRID_SIZE {
         return entries;
     }
-    // [count, r_sum, g_sum, b_sum] per bin
-    let mut bins = vec![[0u64; 4]; GRID_SIZE];
-    for &(c, n) in &entries {
-        let (r, g, b) = (c >> 16, (c >> 8) & 255, c & 255);
-        let key = grid_key(r as u8, g as u8, b as u8);
-        let bin = &mut bins[key];
-        let n = n as u64;
-        bin[0] += n;
-        bin[1] += n * r as u64;
-        bin[2] += n * g as u64;
-        bin[3] += n * b as u64;
-    }
+    let mut bins = new_fold_bins();
+    fold_into_bins(&mut bins, &entries);
     fold_bins_to_entries(&bins)
+}
+
+/// A zeroed bin array: `[count, r_sum, g_sum, b_sum]` per grid cell.
+pub fn new_fold_bins() -> Vec<[u64; 4]> {
+    vec![[0u64; 4]; GRID_SIZE]
+}
+
+#[inline(always)]
+fn bin_add(bins: &mut [[u64; 4]], c: u32, n: u32) {
+    let (r, g, b) = (c >> 16, (c >> 8) & 255, c & 255);
+    let bin = &mut bins[grid_key(r as u8, g as u8, b as u8)];
+    let n = n as u64;
+    bin[0] += n;
+    bin[1] += n * r as u64;
+    bin[2] += n * g as u64;
+    bin[3] += n * b as u64;
+}
+
+/// Sum exact-color entries into the bin array.
+pub fn fold_into_bins(bins: &mut [[u64; 4]], entries: &[(u32, u32)]) {
+    for &(c, n) in entries {
+        bin_add(bins, c, n);
+    }
+}
+
+/// Merge `src`'s sums into `dst` (worker bin arrays at reduce time).
+pub fn merge_bins(dst: &mut [[u64; 4]], src: &[[u64; 4]]) {
+    for (d, s) in dst.iter_mut().zip(src) {
+        for c in 0..4 {
+            d[c] += s[c];
+        }
+    }
 }
 
 /// Emit one (mean color, count) entry per populated bin, in bin order.
@@ -1052,6 +1091,50 @@ mod tests {
             assert_eq!(g as u64, (sum[1] + cnt / 2) / cnt);
             assert_eq!(b as u64, (sum[2] + cnt / 2) / cnt);
         }
+    }
+
+    #[test]
+    fn coarse_accumulate_matches_exact_fold() {
+        // Random rows with runs and transparency: binning while
+        // accumulating must equal folding the exact histogram afterwards.
+        let mut x = 99u32;
+        let mut rng = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let mut rows = Vec::new();
+        for _ in 0..64 {
+            let mut row = Vec::new();
+            let mut i = 0;
+            while i < 512 {
+                let run = 1 + (rng() % 9) as usize;
+                let px = [
+                    (rng() % 256) as u8,
+                    (rng() % 256) as u8,
+                    (rng() % 256) as u8,
+                    if rng() % 11 == 0 { 0 } else { 255 },
+                ];
+                for _ in 0..run.min(512 - i) {
+                    row.extend_from_slice(&px);
+                }
+                i += run;
+            }
+            rows.push(row);
+        }
+        let mut hist = ColorHist::new();
+        let mut bins = new_fold_bins();
+        let mut alpha_exact = false;
+        let mut alpha_coarse = false;
+        for row in &rows {
+            alpha_exact |= accumulate_frame(&mut hist, row);
+            alpha_coarse |= accumulate_frame_coarse(&mut bins, row);
+        }
+        assert_eq!(alpha_exact, alpha_coarse);
+        let mut expect = new_fold_bins();
+        fold_into_bins(&mut expect, &hist.entries());
+        assert_eq!(fold_bins_to_entries(&bins), fold_bins_to_entries(&expect));
     }
 
     #[test]
