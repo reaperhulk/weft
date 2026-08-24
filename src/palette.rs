@@ -261,36 +261,64 @@ pub fn scan_rgb_key_runs_with(keys: &[u32], mut add: impl FnMut(u32, u32)) {
     add(last, run);
 }
 
-/// RLE-scan a row of canonical keys, appending the runs to `all` and
-/// counting them per red byte (pass 1 phase A).
+/// A materialized pass-1 run: `0xRRGGBB << 8 | (len - 1)`. Phase A writes
+/// every run of every frame in a batch and phase B reads them all back,
+/// so on dithered content (runs of a pixel or two) this stream is the
+/// pass's main memory traffic; packing halves it against `(u32, u32)`.
+/// A run longer than 256 pixels is emitted as several entries — the
+/// consumer sums are the same, and adding one color twice in a row
+/// leaves a table in the same state as adding it once. That costs bytes
+/// on flat, wide content (a 1920-pixel flat row is eight entries, 32
+/// bytes, where one 8-byte pair used to do), but such rows are exactly
+/// the ones with almost no runs: the stream is negligible there either
+/// way, and the packing wins where the stream is large.
+pub type PackedRun = u32;
+
+const PACKED_RUN_MAX: u32 = 256;
+
 #[inline(always)]
-pub fn scan_rgb_key_runs_counted(keys: &[u32], all: &mut Vec<(u32, u32)>, counts: &mut [u32; 256]) {
-    scan_rgb_key_runs_with(keys, |c, n| {
-        all.push((c, n));
-        counts[(c >> 16) as usize] += 1;
-    })
+fn push_packed_runs(all: &mut Vec<PackedRun>, counts: &mut [u32; 256], c: u32, mut n: u32) {
+    let bucket = &mut counts[(c >> 16) as usize];
+    while n > PACKED_RUN_MAX {
+        all.push((c << 8) | (PACKED_RUN_MAX - 1));
+        *bucket += 1;
+        n -= PACKED_RUN_MAX;
+    }
+    all.push((c << 8) | (n - 1));
+    *bucket += 1;
 }
 
-/// `scan_rgba_runs`, appending to `all` and counting per red byte;
-/// returns whether any pixel was transparent.
+/// The color and length of a packed run.
+#[inline(always)]
+pub fn unpack_run(e: PackedRun) -> (u32, u32) {
+    (e >> 8, (e & 0xFF) + 1)
+}
+
+/// RLE-scan a row of canonical keys, appending the packed runs to `all`
+/// and counting them per red byte (pass 1 phase A).
+#[inline(always)]
+pub fn scan_rgb_key_runs_counted(keys: &[u32], all: &mut Vec<PackedRun>, counts: &mut [u32; 256]) {
+    scan_rgb_key_runs_with(keys, |c, n| push_packed_runs(all, counts, c, n))
+}
+
+/// `scan_rgba_runs`, appending packed runs to `all` and counting per red
+/// byte; returns whether any pixel was transparent.
 #[inline(always)]
 pub fn scan_rgba_runs_counted(
     rgba: &[u8],
-    all: &mut Vec<(u32, u32)>,
+    all: &mut Vec<PackedRun>,
     counts: &mut [u32; 256],
 ) -> bool {
-    scan_runs_with(rgba, |c, n| {
-        all.push((c, n));
-        counts[(c >> 16) as usize] += 1;
-    })
+    scan_runs_with(rgba, |c, n| push_packed_runs(all, counts, c, n))
 }
 
-/// Scatter a frame's runs by red byte into `sorted` (reused; overwritten)
-/// given their per-bucket counts. Returns the 257 bucket boundaries.
+/// Scatter a frame's packed runs by red byte into `sorted` (reused;
+/// overwritten) given their per-bucket counts. Returns the 257 bucket
+/// boundaries.
 pub fn bucket_runs(
-    runs: &[(u32, u32)],
+    runs: &[PackedRun],
     counts: &[u32; 256],
-    sorted: &mut Vec<(u32, u32)>,
+    sorted: &mut Vec<PackedRun>,
 ) -> Vec<u32> {
     let mut offs = vec![0u32; 257];
     for b in 0..256 {
@@ -298,24 +326,24 @@ pub fn bucket_runs(
     }
     let mut pos = offs.clone();
     sorted.clear();
-    sorted.resize(runs.len(), (0, 0));
+    sorted.resize(runs.len(), 0);
     for &e in runs {
-        let b = (e.0 >> 16) as usize;
+        let b = (e >> 24) as usize;
         sorted[pos[b] as usize] = e;
         pos[b] += 1;
     }
     offs
 }
 
-/// Add runs to an exact table, with the slot for a few runs ahead
+/// Add packed runs to an exact table, with the slot for a few runs ahead
 /// prefetched (bucket tables are small, but a table that has outgrown L1
 /// still serializes behind one miss per add without this).
-pub fn accumulate_runs(hist: &mut ColorHist, runs: &[(u32, u32)]) {
+pub fn accumulate_runs(hist: &mut ColorHist, runs: &[PackedRun]) {
     for j in 0..runs.len() {
-        if let Some(&(c, _)) = runs.get(j + 8) {
-            hist.prefetch(c);
+        if let Some(&e) = runs.get(j + 8) {
+            hist.prefetch(e >> 8);
         }
-        let (c, n) = runs[j];
+        let (c, n) = unpack_run(runs[j]);
         hist.add(c, n);
     }
 }
@@ -331,9 +359,18 @@ pub fn add_run_coarse(bins: &mut [[u64; 4]], c: u32, n: u32) {
     bin[3] += n * (c & 255) as u64;
 }
 
-/// Add runs to a red slab's coarse bins.
-pub fn accumulate_runs_coarse(bins: &mut [[u64; 4]], runs: &[(u32, u32)]) {
-    for &(c, n) in runs {
+/// Add packed runs to a red slab's coarse bins.
+pub fn accumulate_runs_coarse(bins: &mut [[u64; 4]], runs: &[PackedRun]) {
+    for &e in runs {
+        let (c, n) = unpack_run(e);
+        add_run_coarse(bins, c, n);
+    }
+}
+
+/// Add histogram entries (a folded exact table) to a red slab's coarse
+/// bins.
+pub fn accumulate_entries_coarse(bins: &mut [[u64; 4]], entries: &[(u32, u32)]) {
+    for &(c, n) in entries {
         add_run_coarse(bins, c, n);
     }
 }
@@ -1316,6 +1353,50 @@ mod tests {
         let mut bins = new_fold_bins();
         fold_into_bins(&mut bins, &expect);
         assert_eq!(got, fold_bins_to_entries(&bins));
+    }
+
+    /// Runs longer than a packed entry's 8-bit length split into several
+    /// entries whose lengths sum to the run, counted per bucket.
+    #[test]
+    fn packed_runs_split_long_runs() {
+        let mut keys = Vec::new();
+        keys.extend(std::iter::repeat_n(0x00_AB_CD_EFu32, 1000));
+        keys.extend(std::iter::repeat_n(0x00_12_34_56u32, 256));
+        keys.extend(std::iter::repeat_n(0x00_12_00_00u32, 257));
+        keys.push(0x00_FF_FF_FF);
+        let mut all = Vec::new();
+        let mut counts = [0u32; 256];
+        scan_rgb_key_runs_counted(&keys, &mut all, &mut counts);
+        let runs: Vec<(u32, u32)> = all.iter().map(|&e| unpack_run(e)).collect();
+        assert_eq!(
+            runs,
+            vec![
+                (0xAB_CD_EF, 256),
+                (0xAB_CD_EF, 256),
+                (0xAB_CD_EF, 256),
+                (0xAB_CD_EF, 232),
+                (0x12_34_56, 256),
+                (0x12_00_00, 256),
+                (0x12_00_00, 1),
+                (0xFF_FF_FF, 1),
+            ]
+        );
+        assert_eq!(counts[0xAB], 4);
+        assert_eq!(counts[0x12], 3);
+        assert_eq!(counts[0xFF], 1);
+        assert_eq!(counts.iter().sum::<u32>(), all.len() as u32);
+
+        let mut single = ColorHist::new();
+        for &k in &keys {
+            single.add(k, 1);
+        }
+        let mut sorted = Vec::new();
+        let offs = bucket_runs(&all, &counts, &mut sorted);
+        let mut hist = ColorHist::new();
+        for b in 0..256 {
+            accumulate_runs(&mut hist, &sorted[offs[b] as usize..offs[b + 1] as usize]);
+        }
+        assert_eq!(hist.entries(), single.entries());
     }
 
     fn hist_from_frame(frame: &[u8]) -> Vec<(u32, u32)> {
