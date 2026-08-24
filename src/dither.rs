@@ -35,6 +35,14 @@ pub struct Quantizer<'a> {
     /// colors than palette slots): every c1 lookup has zero error, so the
     /// blue-noise mode's per-pixel early-out beats the staged pipeline.
     pub exact_palette: bool,
+    /// Activity gate for the blue-noise mode: dither at full strength
+    /// where local activity (see `simdops::att_scalar`) is at or below
+    /// this, ramp to none over the next 64 units. Smooth gradients stay
+    /// dithered (that's what hides banding); texture and edges — where
+    /// palette error is masked by the content and dither reads as pure
+    /// noise — degrade to plain nearest-color, which also compresses far
+    /// better. 0 disables the gate (dither everywhere error is nonzero).
+    pub gate: u32,
 }
 
 /// Per-thread quantization scratch: RGBA row buffers, memo cache, and the
@@ -50,6 +58,7 @@ pub struct QuantScratch {
     ors: Vec<u32>,
     c2c: Vec<u32>,
     wl: Vec<u32>,
+    att: Vec<u32>,
 }
 
 impl QuantScratch {
@@ -65,6 +74,9 @@ impl QuantScratch {
             ors: vec![0; w],
             c2c: vec![0; w],
             wl: vec![0; w],
+            // 256 = no attenuation: with the gate off this is never
+            // rewritten and the threshold pick reduces to the ungated one
+            att: vec![256; w],
         }
     }
 }
@@ -94,16 +106,25 @@ impl<'a> Quantizer<'a> {
     /// Two-candidate blue-noise ordered dither: c1 = nearest(p); if
     /// quantization error is nonzero, c2 = nearest across the error
     /// direction, and the threshold picks between c1 and c2 in proportion
-    /// to where p sits between them. Pixels with an exact palette match
-    /// never dither, so flat regions stay clean and delta-friendly.
+    /// to where p sits between them, scaled by the activity gate's
+    /// per-pixel attenuation (`gate` > 0). Pixels with an exact palette
+    /// match never dither, so flat regions stay clean and delta-friendly;
+    /// gated pixels degrade to plain nearest-color.
     ///
     /// There is no cross-pixel dependency, so each row runs as staged
-    /// passes: SIMD key computation, a branchless gather of the packed
-    /// fast-path entries, cache/resolve only for a compacted worklist of
-    /// misses, SIMD probe-color math, the same gather/resolve pair for
-    /// the far candidates (skipping exact pixels), and a SIMD threshold
-    /// pick. Results are identical to the per-pixel formulation — the
-    /// lookups and integer math are the same, just reordered.
+    /// passes: an attenuation pass against the previous row (gate on),
+    /// SIMD key computation, a branchless gather of the packed fast-path
+    /// entries, cache/resolve only for a compacted worklist of misses,
+    /// SIMD probe-color math, the same gather/resolve pair for the far
+    /// candidates (skipping exact and fully attenuated pixels), and a
+    /// SIMD threshold pick. Results are identical to the per-pixel
+    /// formulation — the lookups and integer math are the same, just
+    /// reordered. Tiles that can't dither at all — every pixel exact, or
+    /// every pixel fully attenuated — skip the far-candidate stages and
+    /// emit c1 directly.
+    // the gather loops index several parallel stage arrays plus a
+    // compacting worklist cursor; an iterator form would obscure that
+    #[allow(clippy::needless_range_loop)]
     fn quantize_bluenoise(
         &self,
         src: &crate::color::RowSource,
@@ -119,30 +140,53 @@ impl<'a> Quantizer<'a> {
         // to tile starts, small enough that a tile's stage arrays (~28
         // bytes per pixel) stay L1-resident between passes.
         const TILE: usize = 256;
-        let mask = &crate::bluenoise::BLUE_NOISE_64;
+        let mask32 = &crate::bluenoise::BLUE_NOISE_64_U32;
         let level = crate::simdops::level();
+        let gate_on = self.gate > 0;
         let mut has_alpha = false;
-        let mut mrow32 = [0u32; 64];
         for y in 0..h {
             src.fill_row(y, &mut scratch.row);
-            let mrow = &mask[(y & 63) << 6..((y & 63) << 6) + 64];
-            for (d, &s) in mrow32.iter_mut().zip(mrow) {
-                *d = s as u32;
-            }
+            // stage 1 runs row-wide: grid keys + alpha presence, with the
+            // activity attenuation fused into the same pass over the
+            // pixels when the gate is on (row 0 has no upper neighbor, so
+            // it gates on horizontal activity alone)
+            let has_alpha_row = if gate_on {
+                let prev: &[u8] = if y == 0 { &scratch.row } else { &scratch.row2 };
+                crate::simdops::bn_keys_att(
+                    level,
+                    &scratch.row,
+                    prev,
+                    self.gate,
+                    &mut scratch.keys,
+                    &mut scratch.att,
+                )
+            } else {
+                crate::simdops::bn_keys(level, &scratch.row, &mut scratch.keys)
+            };
+            has_alpha |= has_alpha_row;
+            let mrow: &[u32; 64] = mask32[(y & 63) << 6..((y & 63) << 6) + 64]
+                .try_into()
+                .unwrap();
             let mut x0 = 0usize;
             while x0 < w {
                 let tw = TILE.min(w - x0);
                 let row = &scratch.row[x0 * 4..(x0 + tw) * 4];
                 let orow = &mut out[y * w + x0..y * w + x0 + tw];
+                let keys = &scratch.keys[x0..];
+                let att = &scratch.att[x0..x0 + tw];
                 let cache = &mut scratch.cache;
 
-                // stage 1: grid keys + alpha presence
-                let has_alpha_here = crate::simdops::bn_keys(level, row, &mut scratch.keys[..tw]);
-
-                // stage 2: branchless c1 gather; misses go to the worklist
+                // stage 2: branchless c1 gather; misses go to the
+                // worklist. The direct[] table is 1MB, so a lookup 16
+                // pixels ahead is prefetched each step (keys are
+                // row-wide: the tail of one tile prefetches into the
+                // next, and get() falls off the row end cleanly).
                 let mut m1 = 0usize;
                 for i in 0..tw {
-                    let d = self.nearest.direct_lookup(scratch.keys[i]);
+                    if let Some(&k) = keys.get(i + 16) {
+                        self.nearest.prefetch_key(k);
+                    }
+                    let d = self.nearest.direct_lookup(keys[i]);
                     scratch.pk1[i] = d;
                     scratch.wl[m1] = i as u32;
                     m1 += (d == u32::MAX) as usize;
@@ -151,59 +195,74 @@ impl<'a> Quantizer<'a> {
                 for &iu in &scratch.wl[..m1] {
                     let i = iu as usize;
                     let p = &row[i * 4..i * 4 + 4];
-                    scratch.pk1[i] =
-                        self.nearest
-                            .lookup_slow(cache, scratch.keys[i], p[0], p[1], p[2]);
+                    scratch.pk1[i] = self.nearest.lookup_slow(cache, keys[i], p[0], p[1], p[2]);
                 }
 
-                // stage 4: errors, far-probe colors, and their keys
-                crate::simdops::bn_probe(
-                    level,
-                    row,
-                    &scratch.pk1[..tw],
-                    &mut scratch.ors[..tw],
-                    &mut scratch.c2c[..tw],
-                    &mut scratch.keys2[..tw],
-                );
+                // A fully attenuated tile can't flip any pixel to c2, so
+                // stages 4-7 would only reproduce c1 — emit it directly.
+                // (Common on busy content, where the gate is doing its job.)
+                let tile_live = !gate_on || att.iter().any(|&a| a != 0);
 
-                // stage 5: c2 gather; only inexact pixels can enter the
-                // worklist (for exact ones c2 == p, and a stale pk2 entry
-                // is harmless: the threshold math then degenerates to
-                // picking c1)
-                let mut m2 = 0usize;
-                for i in 0..tw {
-                    let d = self.nearest.direct_lookup(scratch.keys2[i]);
-                    scratch.pk2[i] = d;
-                    scratch.wl[m2] = i as u32;
-                    m2 += ((d == u32::MAX) & (scratch.ors[i] != 0)) as usize;
-                }
-                // stage 6: resolve c2 misses
-                for &iu in &scratch.wl[..m2] {
-                    let i = iu as usize;
-                    let c = scratch.c2c[i];
-                    scratch.pk2[i] = self.nearest.lookup_slow(
-                        cache,
-                        scratch.keys2[i],
-                        (c >> 16) as u8,
-                        (c >> 8) as u8,
-                        c as u8,
+                // stage 4: errors, far-probe colors, and their keys; a
+                // tile with all-exact pixels short-circuits the same way
+                let tile_live = tile_live
+                    && crate::simdops::bn_probe(
+                        level,
+                        row,
+                        &scratch.pk1[..tw],
+                        &mut scratch.ors[..tw],
+                        &mut scratch.c2c[..tw],
+                        &mut scratch.keys2[..tw],
                     );
-                }
 
-                // stage 7: threshold pick (x0 is a multiple of 64, so the
-                // kernel's local x & 63 mask indexing stays aligned)
-                crate::simdops::bn_threshold(
-                    level,
-                    row,
-                    &scratch.pk1[..tw],
-                    &scratch.pk2[..tw],
-                    &mrow32,
-                    orow,
-                );
+                if tile_live {
+                    // stage 5: c2 gather (prefetched like stage 2); only
+                    // pixels that are inexact and not fully attenuated can
+                    // enter the worklist (for the rest a stale pk2 entry
+                    // is harmless: the threshold math then degenerates to
+                    // picking c1)
+                    let mut m2 = 0usize;
+                    for i in 0..tw {
+                        if let Some(&k) = scratch.keys2.get(i + 16) {
+                            self.nearest.prefetch_key(k);
+                        }
+                        let d = self.nearest.direct_lookup(scratch.keys2[i]);
+                        scratch.pk2[i] = d;
+                        scratch.wl[m2] = i as u32;
+                        m2 += ((d == u32::MAX) & (scratch.ors[i] != 0) & (att[i] != 0)) as usize;
+                    }
+                    // stage 6: resolve c2 misses
+                    for &iu in &scratch.wl[..m2] {
+                        let i = iu as usize;
+                        let c = scratch.c2c[i];
+                        scratch.pk2[i] = self.nearest.lookup_slow(
+                            cache,
+                            scratch.keys2[i],
+                            (c >> 16) as u8,
+                            (c >> 8) as u8,
+                            c as u8,
+                        );
+                    }
+
+                    // stage 7: threshold pick (x0 is a multiple of 64, so
+                    // the kernel's local x & 63 mask indexing stays aligned)
+                    crate::simdops::bn_threshold(
+                        level,
+                        row,
+                        &scratch.pk1[..tw],
+                        &scratch.pk2[..tw],
+                        mrow,
+                        att,
+                        orow,
+                    );
+                } else {
+                    for (o, &p) in orow.iter_mut().zip(&scratch.pk1[..tw]) {
+                        *o = p as u8;
+                    }
+                }
 
                 // stage 8: transparent pixels override whatever was computed
-                if has_alpha_here {
-                    has_alpha = true;
+                if has_alpha_row {
                     for (o, px) in orow.iter_mut().zip(row.as_chunks::<4>().0) {
                         if px[3] < 128 {
                             *o = self.trans_idx;
@@ -211,6 +270,10 @@ impl<'a> Quantizer<'a> {
                     }
                 }
                 x0 += tw;
+            }
+            if gate_on {
+                // current row becomes the next row's activity reference
+                std::mem::swap(&mut scratch.row, &mut scratch.row2);
             }
         }
         has_alpha
@@ -488,6 +551,7 @@ mod tests {
             nearest: &nm,
             trans_idx: 3,
             exact_palette: false,
+            gate: 0,
         };
         let rgba = vec![
             255u8, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 0,
@@ -501,6 +565,188 @@ mod tests {
         assert_eq!(out, [2, 0, 1, 3]);
     }
 
+    fn xorshift(x: &mut u32) -> u32 {
+        *x ^= *x << 13;
+        *x ^= *x >> 17;
+        *x ^= *x << 5;
+        *x
+    }
+
+    fn quantize_rgba(q: &Quantizer, rgba: Vec<u8>, w: usize, h: usize, mode: Dither) -> Vec<u8> {
+        let mut out = vec![0u8; w * h];
+        let frame = crate::input::Frame::Rgba(rgba);
+        let src = crate::color::RowSource::new(&frame, w, h, None);
+        let mut scratch = QuantScratch::new(w);
+        q.quantize(&src, w, h, mode, &mut scratch, &mut out);
+        out
+    }
+
+    #[test]
+    fn gate_preserves_gradients() {
+        // A smooth ramp's activity sits below the gate, so gated output
+        // must equal ungated output — banding protection is untouched.
+        let (w, h) = (64usize, 64usize);
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for _y in 0..h {
+            for x in 0..w {
+                let v = (x * 2) as u8;
+                rgba.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let colors = vec![[0u8, 0, 0], [64, 64, 64], [128, 128, 128]];
+        let nm = NearestMap::build(&colors);
+        let mk = |gate| Quantizer {
+            nearest: &nm,
+            trans_idx: 3,
+            exact_palette: false,
+            gate,
+        };
+        let ungated = quantize_rgba(&mk(0), rgba.clone(), w, h, Dither::BlueNoise);
+        let gated = quantize_rgba(&mk(16), rgba.clone(), w, h, Dither::BlueNoise);
+        assert_eq!(ungated, gated);
+        // sanity: the ramp actually dithers (both palette neighbors appear
+        // in a middle band)
+        let band: Vec<u8> = ungated
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| (20..44).contains(&(i % w)))
+            .map(|(_, &v)| v)
+            .collect();
+        assert!(band.contains(&0) && band.contains(&1));
+    }
+
+    #[test]
+    fn gate_flattens_busy_content() {
+        // A 1px checkerboard is maximal activity: every pixel except the
+        // top-left corner (which has no left/up neighbor and reads as
+        // flat) is fully attenuated and must match the undithered output.
+        // Ungated blue-noise, by contrast, flips a substantial share.
+        let (w, h) = (64usize, 64usize);
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let v = if (x + y) & 1 == 0 { 64u8 } else { 192 };
+                rgba.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let colors = vec![[0u8, 0, 0], [255, 255, 255]];
+        let nm = NearestMap::build(&colors);
+        let mk = |gate| Quantizer {
+            nearest: &nm,
+            trans_idx: 2,
+            exact_palette: false,
+            gate,
+        };
+        let plain = quantize_rgba(&mk(0), rgba.clone(), w, h, Dither::None);
+        let gated = quantize_rgba(&mk(16), rgba.clone(), w, h, Dither::BlueNoise);
+        let ungated = quantize_rgba(&mk(0), rgba.clone(), w, h, Dither::BlueNoise);
+        assert_eq!(gated[1..], plain[1..]);
+        let flips = ungated.iter().zip(&plain).filter(|(a, b)| a != b).count();
+        assert!(flips > w * h / 10, "expected heavy dither, got {flips}");
+    }
+
+    #[test]
+    fn staged_matches_scalar_reference() {
+        // The staged SIMD pipeline (odd width -> tail lanes; gate on ->
+        // attenuation, row ping-pong, tile fast paths) must reproduce the
+        // per-pixel formulation exactly.
+        let (w, h) = (77usize, 40usize);
+        let gate = 16u32;
+        let mut seed = 0xDEADBEEFu32;
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let r = xorshift(&mut seed);
+                if y >= 30 && r % 23 == 0 {
+                    rgba.extend_from_slice(&[0, 0, 0, 0]); // transparent
+                    continue;
+                }
+                let px = if y < 10 {
+                    // smooth ramp: full dither
+                    let v = (x * 3) as u8;
+                    [v, v.wrapping_add(20), v, 255]
+                } else if y < 20 {
+                    // moderate texture: partial attenuation
+                    let b = (x * 2) as u8;
+                    [
+                        b.wrapping_add((r & 7) as u8),
+                        b.wrapping_add(((r >> 3) & 7) as u8),
+                        b,
+                        255,
+                    ]
+                } else {
+                    // heavy noise: fully attenuated
+                    [
+                        (r & 0xFF) as u8,
+                        ((r >> 8) & 0xFF) as u8,
+                        ((r >> 16) & 0xFF) as u8,
+                        255,
+                    ]
+                };
+                rgba.extend_from_slice(&px);
+            }
+        }
+        let mut colors = Vec::new();
+        for i in 0..13u32 {
+            let c = xorshift(&mut seed);
+            let _ = i;
+            colors.push([
+                (c & 0xFF) as u8,
+                ((c >> 8) & 0xFF) as u8,
+                ((c >> 16) & 0xFF) as u8,
+            ]);
+        }
+        let nm = NearestMap::build(&colors);
+        let trans_idx = colors.len() as u8;
+        let q = Quantizer {
+            nearest: &nm,
+            trans_idx,
+            exact_palette: false,
+            gate,
+        };
+        let got = quantize_rgba(&q, rgba.clone(), w, h, Dither::BlueNoise);
+
+        // scalar reference
+        let mask = &crate::bluenoise::BLUE_NOISE_64;
+        let mut cache = crate::palette::IdxCache::default();
+        let mut want = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let o = (y * w + x) * 4;
+                let px = &rgba[o..o + 4];
+                if px[3] < 128 {
+                    want[y * w + x] = trans_idx;
+                    continue;
+                }
+                let cur = &rgba[y * w * 4..(y + 1) * w * 4];
+                let prev = &rgba[y.saturating_sub(1) * w * 4..][..w * 4];
+                let att = crate::simdops::att_scalar(cur, prev, x, gate as i32 + 64) as i32;
+                let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
+                let p1 = nm.lookup_packed(&mut cache, px[0], px[1], px[2]);
+                let idx1 = p1 as u8;
+                let er = r - (p1 >> 24) as i32;
+                let eg = g - ((p1 >> 16) & 0xFF) as i32;
+                let eb = b - ((p1 >> 8) & 0xFF) as i32;
+                if er == 0 && eg == 0 && eb == 0 {
+                    want[y * w + x] = idx1;
+                    continue;
+                }
+                let r2 = (r + 2 * er).clamp(0, 255) as u8;
+                let g2 = (g + 2 * eg).clamp(0, 255) as u8;
+                let b2 = (b + 2 * eb).clamp(0, 255) as u8;
+                let p2 = nm.lookup_packed(&mut cache, r2, g2, b2);
+                let dr = (p2 >> 24) as i32 - (p1 >> 24) as i32;
+                let dg = ((p2 >> 16) & 0xFF) as i32 - ((p1 >> 16) & 0xFF) as i32;
+                let db = ((p2 >> 8) & 0xFF) as i32 - ((p1 >> 8) & 0xFF) as i32;
+                let num = (er * dr + eg * dg + eb * db).max(0);
+                let den = dr * dr + dg * dg + db * db;
+                let m = mask[((y & 63) << 6) + (x & 63)] as i32;
+                want[y * w + x] = if m * den < num * att { p2 as u8 } else { idx1 };
+            }
+        }
+        assert_eq!(got, want);
+    }
+
     #[test]
     fn diffuse_no_error_when_exact() {
         // With an exact palette, dithering must be a no-op.
@@ -510,6 +756,7 @@ mod tests {
             nearest: &nm,
             trans_idx: 2,
             exact_palette: false,
+            gate: 0,
         };
         let mut rgba = Vec::new();
         for i in 0..64 {

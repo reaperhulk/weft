@@ -40,6 +40,8 @@ weft --colors 64 --dither none --no-loop < input.y4m > out.gif
                    reserved for transparency, so 256 means 255 colors)
 --dither D         bluenoise | sierra2 | fs | bayer | none
                    (default: bluenoise)
+--dither-gate N    activity gate for bluenoise, 0-720 (default: 16;
+                   0 = off): busy regions get progressively less dither
 --loop N           loop count, 0 = forever    (default: 0)
 --lossy N          lossy LZW compression, 0-200 (default: 0 = lossless
                    encoding of the quantized frames; ~30 is subtle and
@@ -139,7 +141,22 @@ palette color, and only when quantization error exists, lets the
 threshold pick between the two palette colors spanning that error — so
 exact matches never dither and flat regions stay clean. Because it has no
 serial error-diffusion chain it is much faster to quantize, perfectly
-temporally stable, and usually a bit smaller. `sierra2` is error
+temporally stable, and usually a bit smaller.
+
+By default blue-noise is also *activity-gated*: per pixel, a cheap local
+activity measure (summed channel differences against the left and upper
+neighbors) attenuates the dither, at full strength up to `--dither-gate`
+and ramping to none over the next 64 units. Smooth gradients — the only
+place ordered dither is needed to hide banding — sit far below the gate
+and keep full dither, while texture and edges, where palette error is
+visually masked and dither reads as churning speckle, degrade to plain
+nearest-color. On real-world content this measures better on every axis:
+on random frinkiac cartoon clips the default gate is worth +1.2–1.9 dB
+PSNR, higher SSIM, ~5–10% smaller files, and ~6–38% faster quantization
+(gated pixels skip the far-candidate work; fully gated tiles skip it
+wholesale). On pure-gradient content the gate never engages and output is
+bit-identical to `--dither-gate 0`. The gate reads only the source frame,
+so it is exactly as temporally stable as the ungated dither. `sierra2` is error
 diffusion, matching ffmpeg's paletteuse: slightly higher visual quality
 on gradient-heavy content (testsrc: 39.7 dB / 0.8994 SSIM vs bluenoise's
 39.2 dB / 0.8993, 2% larger file) at the cost of speed and temporal

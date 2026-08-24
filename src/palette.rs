@@ -895,6 +895,24 @@ impl NearestMap {
         }
     }
 
+    /// Prefetch the fast-path cell for an already-computed grid key (the
+    /// staged gather loops run a fixed distance ahead of themselves).
+    #[inline(always)]
+    pub fn prefetch_key(&self, key: u32) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch(
+                self.direct.as_ptr().add(key as usize) as *const i8,
+                _MM_HINT_T0,
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = key;
+        }
+    }
+
     #[inline(never)]
     fn resolve_cell(&self, key: usize, r: u8, g: u8, b: u8) -> u8 {
         let s = self.starts[key] as usize;
