@@ -32,6 +32,21 @@ const BAYER8: [[u8; 8]; 8] = [
     [63, 31, 55, 23, 61, 29, 53, 21],
 ];
 
+/// True when every one of the `n` bits from `start` is set. Tiles start
+/// on a multiple of 64 pixels, so this is a whole number of words except
+/// in the row's last, short tile.
+#[inline(always)]
+fn all_set(bits: &[u64], start: usize, n: usize) -> bool {
+    debug_assert_eq!(start % 64, 0);
+    let w0 = start >> 6;
+    let full = n >> 6;
+    if !bits[w0..w0 + full].iter().all(|&v| v == !0) {
+        return false;
+    }
+    let rest = n & 63;
+    rest == 0 || bits[w0 + full] & ((1u64 << rest) - 1) == (1u64 << rest) - 1
+}
+
 /// The 24-bit colour of an RGBA pixel, in the `r<<16 | g<<8 | b` packing
 /// the nearest-map's memo cache and probe colours use.
 #[inline(always)]
@@ -281,6 +296,16 @@ impl<'a> Quantizer<'a> {
                 // (grid first, cache only for multi-candidate cells) paid
                 // two random loads for the common pixel, since 80-95% of
                 // pixels land on a multi-candidate cell.
+                // A tile every one of whose pixels is reusable is just a
+                // copy of last frame's indices: none of the staged passes
+                // would compute anything else.
+                if let Some(prev_row) = prev_row {
+                    if all_set(sf, x0, tw) {
+                        orow.copy_from_slice(prev_row);
+                        x0 += tw;
+                        continue;
+                    }
+                }
                 let mut m1 = 0usize;
                 match prev_row {
                     // Reusable pixels — index unchanged from last frame —
