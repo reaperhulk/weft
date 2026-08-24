@@ -145,15 +145,23 @@ impl<'a> Quantizer<'a> {
                     let d = self.nearest.direct_lookup(scratch.keys[i]);
                     scratch.pk1[i] = d;
                     scratch.wl[m1] = i as u32;
-                    m1 += (d == u32::MAX) as usize;
+                    m1 += ((d & 0xFF) == crate::palette::MULTI as u32) as usize;
                 }
-                // stage 3: resolve c1 misses through the memo cache
-                for &iu in &scratch.wl[..m1] {
-                    let i = iu as usize;
+                // stage 3: resolve c1 misses through the memo cache (the
+                // gathered entry's high bits carry the candidate-list
+                // offset, so no cell metadata reload); prefetching the
+                // slot a few misses ahead hides the hash-probe latency
+                for j in 0..m1 {
+                    if let Some(&fu) = scratch.wl[..m1].get(j + 8) {
+                        let f = fu as usize;
+                        let p = &row[f * 4..f * 4 + 4];
+                        self.nearest.prefetch_cache_slot(cache, p[0], p[1], p[2]);
+                    }
+                    let i = scratch.wl[j] as usize;
                     let p = &row[i * 4..i * 4 + 4];
                     scratch.pk1[i] =
                         self.nearest
-                            .lookup_slow(cache, scratch.keys[i], p[0], p[1], p[2]);
+                            .lookup_slow(cache, scratch.pk1[i] >> 8, p[0], p[1], p[2]);
                 }
 
                 // stage 4: errors, far-probe colors, and their keys
@@ -175,15 +183,25 @@ impl<'a> Quantizer<'a> {
                     let d = self.nearest.direct_lookup(scratch.keys2[i]);
                     scratch.pk2[i] = d;
                     scratch.wl[m2] = i as u32;
-                    m2 += ((d == u32::MAX) & (scratch.ors[i] != 0)) as usize;
+                    m2 += (((d & 0xFF) == crate::palette::MULTI as u32)
+                        & (scratch.ors[i] != 0)) as usize;
                 }
-                // stage 6: resolve c2 misses
-                for &iu in &scratch.wl[..m2] {
-                    let i = iu as usize;
+                // stage 6: resolve c2 misses (same lookahead as stage 3)
+                for j in 0..m2 {
+                    if let Some(&fu) = scratch.wl[..m2].get(j + 8) {
+                        let c = scratch.c2c[fu as usize];
+                        self.nearest.prefetch_cache_slot(
+                            cache,
+                            (c >> 16) as u8,
+                            (c >> 8) as u8,
+                            c as u8,
+                        );
+                    }
+                    let i = scratch.wl[j] as usize;
                     let c = scratch.c2c[i];
                     scratch.pk2[i] = self.nearest.lookup_slow(
                         cache,
-                        scratch.keys2[i],
+                        scratch.pk2[i] >> 8,
                         (c >> 16) as u8,
                         (c >> 8) as u8,
                         c as u8,

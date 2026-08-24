@@ -334,23 +334,24 @@ fn run(args: &Args) -> io::Result<()> {
                         palette::ColorHist::new(),
                         None::<Vec<[u64; 4]>>,
                         Vec::new(),
-                        vec![0u8; w * 4],
+                        (vec![0u8; w * 4], Vec::new()),
                         false,
                     )
                 },
-                |(mut hist, mut coarse, mut frames, mut row, mut alpha), (i, f)| {
+                |(mut hist, mut coarse, mut frames, mut scratch, mut alpha), (i, f)| {
+                    let (row, runs) = &mut scratch;
                     let src = color::RowSource::new(&f, w, h, meta_ref.chroma);
                     match &mut coarse {
                         Some(bins) => {
                             for y in 0..h {
-                                src.fill_row(y, &mut row);
-                                alpha |= palette::accumulate_frame_coarse(bins, &row);
+                                src.fill_row(y, row);
+                                alpha |= palette::accumulate_frame_coarse(bins, row, runs);
                             }
                         }
                         None => {
                             for y in 0..h {
-                                src.fill_row(y, &mut row);
-                                alpha |= palette::accumulate_frame(&mut hist, &row);
+                                src.fill_row(y, row);
+                                alpha |= palette::accumulate_frame(&mut hist, row, runs);
                             }
                             if hist.len() > HIST_SPILL {
                                 let mut bins = palette::new_fold_bins();
@@ -361,10 +362,10 @@ fn run(args: &Args) -> io::Result<()> {
                         }
                     }
                     frames.push((i, f));
-                    (hist, coarse, frames, row, alpha)
+                    (hist, coarse, frames, scratch, alpha)
                 },
             )
-            .reduce_with(|(ha, ca, mut fa, row, aa), (hb, cb, fb, _, ab)| {
+            .reduce_with(|(ha, ca, mut fa, scratch, aa), (hb, cb, fb, _, ab)| {
                 // Flush instead of hash-merging: reductions run while other
                 // workers still accumulate, and a table-into-table merge of
                 // millions of colors would serialize them behind cache-miss
@@ -383,7 +384,7 @@ fn run(args: &Args) -> io::Result<()> {
                     (a, b) => a.or(b),
                 };
                 fa.extend(fb);
-                (ha, coarse, fa, row, aa | ab)
+                (ha, coarse, fa, scratch, aa | ab)
             });
         (reader_handle.join().expect("reader thread panicked"), acc)
     });
