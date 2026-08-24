@@ -102,20 +102,43 @@ def bench(binaries, names, runs, extra, outdir):
     return res
 
 
+_FPS_CACHE = {}
+
+
+def src_fps(name):
+    """Source frame rate, for resampling the GIF back onto it."""
+    if name not in _FPS_CACHE:
+        p = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=r_frame_rate", "-of", "csv=p=0", str(clip_path(name))],
+            capture_output=True, text=True)
+        _FPS_CACHE[name] = p.stdout.strip() or "30"
+    return _FPS_CACHE[name]
+
+
 def quality(name, gif):
-    """PSNR/SSIM of the decoded GIF against the source clip."""
+    """PSNR/SSIM of the decoded GIF against the source clip.
+
+    The GIF is resampled to the source rate and both sides get sequential
+    PTS first: weft merges duplicate frames into longer delays, so without
+    that the two streams drift apart and the metric measures misalignment
+    instead of quality (same method as bench/run.sh).
+    """
     src = clip_path(name)
-    def metric(kind, extra):
+    fps = src_fps(name)
+
+    def metric(kind):
         p = subprocess.run(
             ["ffmpeg", "-v", "info", "-i", str(gif), "-i", str(src),
-             "-lavfi", f"[0:v]format=rgb24[a];[1:v]format=rgb24[b];[a][b]{kind}{extra}",
+             "-filter_complex",
+             f"[0:v]fps={fps},format=rgb24,setpts=N[a];"
+             f"[1:v]format=rgb24,setpts=N[b];[a][b]{kind}",
              "-f", "null", "-"], capture_output=True, text=True)
         return p.stderr
-    out = metric("psnr", "")
-    m = re.search(r"average:([\d.inf]+)", out)
+
+    m = re.search(r"average:([\d.inf]+)", metric("psnr"))
     psnr = float(m.group(1)) if m and m.group(1) != "inf" else float("inf")
-    out = metric("ssim", "")
-    m = re.search(r"All:([\d.]+)", out)
+    m = re.search(r"All:([\d.]+)", metric("ssim"))
     return psnr, (float(m.group(1)) if m else 0.0)
 
 

@@ -186,6 +186,87 @@ fn grid_key_scalar(r: u8, g: u8, b: u8) -> u32 {
     (((r as u32) >> 2) << 12) | (((g as u32) >> 2) << 6) | ((b as u32) >> 2)
 }
 
+/// Run-length scan of an opaque RGBA row into `runs` (cleared first).
+///
+/// Returns `None` if the row contains a transparent pixel, which has
+/// skip-don't-break semantics the vector form can't express; the caller
+/// falls back to the scalar scan for those rows (only reachable from RGBA
+/// input — decoded YUV is opaque by construction).
+///
+/// Run boundaries come from one 16-lane compare against the row shifted
+/// by a pixel, reduced to a bitmask. Real content runs ~1.7 pixels, so
+/// the scalar "does this pixel equal the last one?" branch is a coin
+/// flip and mispredicts on most pixels; here the only branch left is one
+/// iteration per *run* over the set bits.
+pub fn scan_runs(level: Level, rgba: &[u8], runs: &mut Vec<(u32, u32)>) -> Option<bool> {
+    fearless_simd::dispatch!(level, simd => scan_runs_impl(simd, rgba, runs))
+}
+
+#[inline(always)]
+fn rgb24(p: [u8; 4]) -> u32 {
+    ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32
+}
+
+#[inline(always)]
+fn scan_runs_impl<S: Simd>(simd: S, rgba: &[u8], runs: &mut Vec<(u32, u32)>) -> Option<bool> {
+    let pixels = rgba.as_chunks::<4>().0;
+    let n = pixels.len();
+    runs.clear();
+    if n == 0 {
+        return Some(false);
+    }
+    if pixels[0][3] < 128 {
+        return None;
+    }
+    let mut last = rgb24(pixels[0]);
+    let mut run = 1u32;
+    let mut i = 1usize;
+    while i + 16 <= n {
+        let a = px16(simd, &rgba[i * 4..]);
+        // alpha lanes are <= 255, so a signed min is safe
+        let amin: [i32; 16] = i32x16::splat(simd, 255)
+            .min((a >> 24u32).bitcast::<i32x16<S>>())
+            .into();
+        if amin.iter().any(|&v| v < 128) {
+            return None;
+        }
+        let b = px16(simd, &rgba[(i - 1) * 4..]);
+        let mut diff = !simd.simd_eq_u32x16(a, b).to_bitmask() as u32 & 0xFFFF;
+        // bit k set => pixel i+k differs from its left neighbour, i.e. it
+        // opens a run; the pixels between two set bits continue the run
+        // the earlier one opened.
+        let mut prev = -1i32;
+        while diff != 0 {
+            let k = diff.trailing_zeros() as i32;
+            run += (k - prev - 1) as u32;
+            runs.push((last, run));
+            last = rgb24(pixels[i + k as usize]);
+            run = 1;
+            prev = k;
+            diff &= diff - 1;
+        }
+        run += (15 - prev) as u32;
+        i += 16;
+    }
+    while i < n {
+        let p = pixels[i];
+        if p[3] < 128 {
+            return None;
+        }
+        let c = rgb24(p);
+        if c == last {
+            run += 1;
+        } else {
+            runs.push((last, run));
+            last = c;
+            run = 1;
+        }
+        i += 1;
+    }
+    runs.push((last, run));
+    Some(false)
+}
+
 /// Stage 1: grid key per pixel; returns true if any alpha byte < 128.
 pub fn bn_keys(level: Level, rgba: &[u8], keys: &mut [u32]) -> bool {
     fearless_simd::dispatch!(level, simd => bn_keys_impl(simd, rgba, keys))

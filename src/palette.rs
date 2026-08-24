@@ -180,6 +180,9 @@ pub fn accumulate_frame_coarse(
 /// sink traffic low on flat content.
 #[inline(always)]
 fn scan_runs(rgba: &[u8], runs: &mut Vec<(u32, u32)>) -> bool {
+    if let Some(alpha) = crate::simdops::scan_runs(crate::simdops::level(), rgba, runs) {
+        return alpha;
+    }
     runs.clear();
     scan_runs_with(rgba, |c, n| runs.push((c, n)))
 }
