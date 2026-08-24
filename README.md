@@ -198,7 +198,9 @@ Every heavy stage is embarrassingly parallel across frames (rayon):
 1. **Read + histogram, overlapped.** A reader thread streams frames into a
    bounded channel while workers accumulate per-thread exact-color
    histograms (open-addressed hash keyed by 24-bit color, run-length
-   batched). Palette statistics cost ~nothing beyond input I/O.
+   batched). Palette statistics cost ~nothing beyond input I/O. RGBA rows
+   are hashed in place, straight out of the frame; only y4m pays a
+   conversion into a scratch row.
 2. **Palette: variance median cut in OkLab**, mirroring ffmpeg ≥5.x
    palettegen: the box with the largest single-channel squared error (in
    Lab) splits at its count-weighted median along that channel; each box

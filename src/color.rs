@@ -40,6 +40,18 @@ impl<'a> RowSource<'a> {
         }
     }
 
+    /// Borrow row `y` as RGBA when the frame is stored that way, so hot
+    /// callers can read it in place instead of copying it into scratch.
+    /// Returns None for the formats that need conversion; those callers
+    /// fall back to `fill_row`.
+    #[inline]
+    pub fn rgba_row(&self, y: usize) -> Option<&'a [u8]> {
+        match self.frame {
+            Frame::Rgba(buf) => Some(&buf[y * self.w * 4..(y + 1) * self.w * 4]),
+            Frame::Yuv(_) => None,
+        }
+    }
+
     /// Fill `out` (len w*4) with RGBA for row `y`.
     #[inline]
     pub fn fill_row(&self, y: usize, out: &mut [u8]) {
@@ -147,6 +159,18 @@ mod tests {
         let buf = vec![16, 16, 16, 16, 128, 128];
         frame_to_rgba(&Frame::Yuv(buf), w, h, Some(Chroma::C420), &mut out);
         assert_eq!(&out[..4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn rgba_rows_are_borrowed_from_input() {
+        let frame = Frame::Rgba((0..32).collect());
+        let src = RowSource::new(&frame, 4, 2, None);
+        assert_eq!(src.rgba_row(1).unwrap(), &(16..32).collect::<Vec<_>>());
+        assert!(
+            RowSource::new(&Frame::Yuv(vec![0; 6]), 2, 2, Some(Chroma::C420))
+                .rgba_row(0)
+                .is_none()
+        );
     }
 
     #[test]

@@ -389,14 +389,20 @@ fn run(args: &Args) -> io::Result<()> {
                         match &mut coarse {
                             Some(bins) => {
                                 for y in 0..h {
-                                    src.fill_row(y, row);
-                                    alpha |= palette::accumulate_frame_coarse(bins, row, runs);
+                                    alpha |= palette::accumulate_frame_coarse(
+                                        bins,
+                                        rgba_row(&src, y, row),
+                                        runs,
+                                    );
                                 }
                             }
                             None => {
                                 for y in 0..h {
-                                    src.fill_row(y, row);
-                                    alpha |= palette::accumulate_frame(&mut hist, row, runs);
+                                    alpha |= palette::accumulate_frame(
+                                        &mut hist,
+                                        rgba_row(&src, y, row),
+                                        runs,
+                                    );
                                 }
                                 if hist.len() > palette::GRID_SIZE {
                                     go_coarse.store(true, Ordering::Relaxed);
@@ -648,6 +654,21 @@ fn run(args: &Args) -> io::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Row `y` of `src` as RGBA: borrowed straight from the frame when it is
+/// already stored that way, otherwise converted into `scratch` (len w*4).
+/// RGBA input is by far the hot case, and copying every source byte into a
+/// scratch row just to read it back is pure overhead.
+#[inline]
+fn rgba_row<'r>(src: &color::RowSource<'r>, y: usize, scratch: &'r mut [u8]) -> &'r [u8] {
+    match src.rgba_row(y) {
+        Some(borrowed) => borrowed,
+        None => {
+            src.fill_row(y, scratch);
+            scratch
+        }
+    }
 }
 
 /// Passthrough writer that counts bytes for the --stats report.
