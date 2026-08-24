@@ -408,3 +408,46 @@ fn y4m_smoke() {
     let px = &dec.frames[0].0[..3];
     assert!(px.iter().all(|&c| (129..=131).contains(&c)), "{px:?}");
 }
+
+/// A source whose colors all fit in the palette has no quantization error
+/// to hide, so every dither mode must reproduce it exactly — including
+/// `bayer`, whose threshold offset would otherwise push closely spaced
+/// grays onto their neighbors (the shape of any soft gradient).
+#[test]
+fn bayer_is_lossless_on_exact_palette() {
+    let (w, h, n) = (32usize, 32usize, 4usize);
+    let fg = [200u8, 30, 30, 255];
+    let mut raw = Vec::new();
+    let mut expect: Vec<Vec<u8>> = Vec::new();
+    for f in 0..n {
+        let mut frame = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                // vertical gradient in steps of 4 — closer together than
+                // the Bayer mask's +/-8 offset — plus a moving box
+                let v = (y as u8) * 4;
+                let inside = x >= f * 4 && x < f * 4 + 8 && (8..16).contains(&y);
+                let c = if inside { fg } else { [v, v, v, 255] };
+                frame.extend_from_slice(&c);
+            }
+        }
+        expect.push(
+            frame
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|p| [p[0], p[1], p[2]])
+                .collect(),
+        );
+        raw.extend_from_slice(&frame);
+    }
+    let gif = run_weft(
+        &["--size", "32x32", "--fps", "10", "--dither", "bayer"],
+        &raw,
+    );
+    let dec = decode_gif(&gif);
+    assert_eq!(dec.frames.len(), n, "one visible frame per input frame");
+    for (i, ((got, _), want)) in dec.frames.iter().zip(&expect).enumerate() {
+        assert_eq!(got, want, "frame {i} was dithered despite an exact palette");
+    }
+}

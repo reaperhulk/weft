@@ -6,9 +6,9 @@
 pub enum Dither {
     /// Sierra-2-4A ("filter lite"): ffmpeg paletteuse's default.
     Sierra2_4a,
-    /// Floyd–Steinberg.
-    FloydSteinberg,
-    /// 8x8 ordered Bayer: fastest dithered mode, fully branch-predictable.
+    /// 8x8 ordered Bayer: a fixed threshold matrix, so it compresses
+    /// better and is more temporally stable than blue noise, at the cost
+    /// of visible cross-hatch structure.
     Bayer,
     /// 64x64 void-and-cluster blue-noise two-candidate ordered dither: no
     /// serial error-diffusion chain, temporally stable, far less visible
@@ -98,8 +98,7 @@ impl<'a> Quantizer<'a> {
             Dither::None => self.quantize_plain(src, w, h, scratch, out),
             Dither::Bayer => self.quantize_bayer(src, w, h, scratch, out),
             Dither::BlueNoise => self.quantize_bluenoise(src, w, h, scratch, out),
-            Dither::Sierra2_4a => self.quantize_diffuse(src, w, h, scratch, out, false),
-            Dither::FloydSteinberg => self.quantize_diffuse(src, w, h, scratch, out, true),
+            Dither::Sierra2_4a => self.quantize_diffuse(src, w, h, scratch, out),
         }
     }
 
@@ -396,6 +395,11 @@ impl<'a> Quantizer<'a> {
         has_alpha
     }
 
+    /// 8x8 ordered Bayer: offset each channel by the cell's threshold
+    /// before the nearest-color lookup. Pixels the palette already
+    /// reproduces exactly are left alone — there is no quantization error
+    /// to hide there, so perturbing them would only introduce error and
+    /// break up runs the encoder would otherwise keep.
     fn quantize_bayer(
         &self,
         src: &crate::color::RowSource,
@@ -404,6 +408,11 @@ impl<'a> Quantizer<'a> {
         scratch: &mut QuantScratch,
         out: &mut [u8],
     ) -> bool {
+        // Every source color is in the palette: no pixel has error to
+        // dither, so the whole frame takes the plain path.
+        if self.exact_palette {
+            return self.quantize_plain(src, w, h, scratch, out);
+        }
         let mut has_alpha = false;
         let cache = &mut scratch.cache;
         for y in 0..h {
@@ -419,6 +428,15 @@ impl<'a> Quantizer<'a> {
                 if px[3] < 128 {
                     *o = self.trans_idx;
                     has_alpha = true;
+                    continue;
+                }
+                // An exact palette match has no error to hide: emit it
+                // as-is rather than letting the threshold push it onto a
+                // neighboring color (packed color is bits 8..32).
+                let c1 = self.nearest.lookup_packed(cache, px[0], px[1], px[2]);
+                let rgb = ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | px[2] as u32;
+                if (c1 >> 8) == rgb {
+                    *o = c1 as u8;
                     continue;
                 }
                 // Threshold offset in [-8, 8): matches ffmpeg's default
@@ -443,18 +461,17 @@ impl<'a> Quantizer<'a> {
         h: usize,
         scratch: &mut QuantScratch,
         out: &mut [u8],
-        fs: bool,
     ) -> bool {
         let mut has_alpha = false;
         let cache = &mut scratch.cache;
         // Error buffers flowing into rows y, y+1, y+2 (one pad cell each
         // side). Rows are processed in stripes of two, interleaved with the
         // lower row trailing the upper by two columns: pixel (x, y+1) only
-        // depends on row-y pixels up to column x+1 (both Sierra-2-4A and
-        // Floyd-Steinberg reach at most one column right on the row below),
-        // so the lag keeps the arithmetic — and thus the output — exactly
-        // the row-serial result while giving the CPU two independent
-        // dependency chains to overlap. Error diffusion's serial chain
+        // depends on row-y pixels up to column x+1 (Sierra-2-4A reaches
+        // at most one column right on the row below), so the lag keeps the
+        // arithmetic — and thus the output — exactly the row-serial result
+        // while giving the CPU two independent dependency chains to
+        // overlap. Error diffusion's serial chain
         // (clamp -> table lookup -> error -> next pixel) is what bounds
         // this stage, so the second in-flight chain is nearly free.
         let mut err_a: Vec<[i32; 3]> = vec![[0; 3]; w + 2];
@@ -484,39 +501,21 @@ impl<'a> Quantizer<'a> {
                     let er = r - (p >> 24) as i32;
                     let eg = g - ((p >> 16) & 0xFF) as i32;
                     let eb = b - ((p >> 8) & 0xFF) as i32;
-                    if fs {
-                        // Floyd–Steinberg: 7/16 right, 3/16 down-left,
-                        // 5/16 down, 1/16 down-right
-                        $carry = [er * 7 / 16, eg * 7 / 16, eb * 7 / 16];
-                        let dl = &mut $next[x];
-                        dl[0] += er * 3 / 16;
-                        dl[1] += eg * 3 / 16;
-                        dl[2] += eb * 3 / 16;
-                        let d = &mut $next[x + 1];
-                        d[0] += er * 5 / 16;
-                        d[1] += eg * 5 / 16;
-                        d[2] += eb * 5 / 16;
-                        let dr = &mut $next[x + 2];
-                        dr[0] += er / 16;
-                        dr[1] += eg / 16;
-                        dr[2] += eb / 16;
-                    } else {
-                        // Sierra-2-4A: 2/4 right, 1/4 down-left, 1/4 down.
-                        // Truncating division (like ffmpeg's
-                        // `err*scale/(1<<n)`) — an arithmetic shift would
-                        // round negative errors toward -inf and diffuse
-                        // more than 100% of the error, which diverges
-                        // into noise.
-                        $carry = [er / 2, eg / 2, eb / 2];
-                        let dl = &mut $next[x];
-                        dl[0] += er / 4;
-                        dl[1] += eg / 4;
-                        dl[2] += eb / 4;
-                        let d = &mut $next[x + 1];
-                        d[0] += er / 4;
-                        d[1] += eg / 4;
-                        d[2] += eb / 4;
-                    }
+                    // Sierra-2-4A: 2/4 right, 1/4 down-left, 1/4 down.
+                    // Truncating division (like ffmpeg's
+                    // `err*scale/(1<<n)`) — an arithmetic shift would
+                    // round negative errors toward -inf and diffuse
+                    // more than 100% of the error, which diverges
+                    // into noise.
+                    $carry = [er / 2, eg / 2, eb / 2];
+                    let dl = &mut $next[x];
+                    dl[0] += er / 4;
+                    dl[1] += eg / 4;
+                    dl[2] += eb / 4;
+                    let d = &mut $next[x + 1];
+                    d[0] += er / 4;
+                    d[1] += eg / 4;
+                    d[2] += eb / 4;
                 }
             }};
         }
@@ -798,6 +797,96 @@ mod tests {
         q.quantize(&src, 8, 8, Dither::Sierra2_4a, &mut scratch, &mut out);
         for (i, &o) in out.iter().enumerate() {
             assert_eq!(o as usize, i % 2);
+        }
+    }
+
+    /// Bayer must leave pixels the palette reproduces exactly alone:
+    /// there is no quantization error to hide, so offsetting them before
+    /// the lookup only moves them onto a neighboring color (and breaks up
+    /// runs the encoder would otherwise keep).
+    #[test]
+    fn bayer_keeps_exact_matches() {
+        // 8 grays, 32 apart: an off-palette midpoint sits between two.
+        let colors: Vec<[u8; 3]> = (0..8u8).map(|i| [i * 32, i * 32, i * 32]).collect();
+        let nm = NearestMap::build(&colors);
+        let (w, h) = (64usize, 8usize);
+        // even columns are exactly a palette color, odd columns sit
+        // halfway between two of them
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let step = ((x / 2 + y) % 8) as u8;
+                let v = if x % 2 == 0 {
+                    step * 32
+                } else {
+                    step.min(6) * 32 + 16
+                };
+                rgba.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let q = Quantizer {
+            nearest: &nm,
+            trans_idx: 8,
+            exact_palette: false,
+            gate: 0,
+        };
+        let out = quantize_rgba(&q, rgba.clone(), w, h, Dither::Bayer);
+        for y in 0..h {
+            for x in (0..w).step_by(2) {
+                let want = ((x / 2 + y) % 8) as u8;
+                assert_eq!(
+                    out[y * w + x],
+                    want,
+                    "exact pixel at ({x}, {y}) was dithered off its own color"
+                );
+            }
+        }
+        // ...while the off-palette columns still dither, so the exact
+        // check has not simply switched dithering off: the same frame
+        // differs from the undithered result.
+        let plain = quantize_rgba(&q, rgba, w, h, Dither::None);
+        assert_ne!(out, plain, "bayer stopped dithering off-palette pixels");
+
+        // and a uniform color halfway between two palette entries lands
+        // on both of them, per mask cell
+        let v = 112u8; // between palette entries 3 (96) and 4 (128)
+        let flat: Vec<u8> = std::iter::repeat_n([v, v, v, 255], 64).flatten().collect();
+        let mut got = quantize_rgba(&q, flat, 8, 8, Dither::Bayer);
+        got.sort_unstable();
+        got.dedup();
+        assert_eq!(got, [3, 4]);
+    }
+
+    /// The whole-frame shortcut: when every source color is in the
+    /// palette, bayer is the plain nearest-color path.
+    #[test]
+    fn bayer_exact_palette_is_lossless() {
+        // grays 4 apart: closer together than the mask's +/-8 offset, so
+        // an offset lookup would land on a neighboring entry (this is the
+        // shape of a soft gradient that fits in the palette exactly)
+        let colors: Vec<[u8; 3]> = (0..64u8).map(|i| [i * 4, i * 4, i * 4]).collect();
+        let nm = NearestMap::build(&colors);
+        let (w, h) = (16usize, 16usize);
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let c = colors[(x + y) % 64];
+                rgba.extend_from_slice(&[c[0], c[1], c[2], 255]);
+            }
+        }
+        let q = Quantizer {
+            nearest: &nm,
+            trans_idx: 64,
+            exact_palette: true,
+            gate: 0,
+        };
+        let out = quantize_rgba(&q, rgba.clone(), w, h, Dither::Bayer);
+        let plain = quantize_rgba(&q, rgba, w, h, Dither::None);
+        assert_eq!(out, plain);
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(out[y * w + x] as usize, (x + y) % 64);
+            }
         }
     }
 }
