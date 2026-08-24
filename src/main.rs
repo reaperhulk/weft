@@ -5,32 +5,6 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// Make mimalloc give freed pages back to the OS promptly. The pipeline
-/// frees in large phase-sized bursts (raw frames as pass 2 consumes them,
-/// histogram tables after the palette, index buffers per block), and with the default
-/// 10ms purge delay + no abandoned-page purging those bursts linger and the
-/// static binary peaks 20-30% above the glibc build. A 1ms delay recovers
-/// nearly all of that while still letting the reader's hot frame buffers
-/// recycle without madvise churn (0 costs real throughput on fast inputs);
-/// abandoned-page purging matters because the reader thread — which
-/// allocates every raw frame — exits after pass 1, and its heap's pages
-/// otherwise stay resident until another thread happens to reclaim them.
-#[cfg(target_env = "musl")]
-fn tune_mimalloc() {
-    // Indices into mimalloc's mi_option_t enum; libmimalloc-sys names only
-    // a subset of the options, but the layout is fixed by the mimalloc
-    // release the locked libmimalloc-sys bundles.
-    const MI_OPTION_ABANDONED_PAGE_PURGE: i32 = 12;
-    const MI_OPTION_PURGE_DELAY: i32 = 15; // milliseconds
-    unsafe {
-        libmimalloc_sys::mi_option_set(MI_OPTION_ABANDONED_PAGE_PURGE, 1);
-        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 1);
-    }
-}
-
-#[cfg(not(target_env = "musl"))]
-fn tune_mimalloc() {}
-
 mod bluenoise;
 mod color;
 mod dither;
@@ -196,7 +170,6 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() {
-    tune_mimalloc();
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {

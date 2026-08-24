@@ -10,13 +10,9 @@ fearless_simd = "0.7.0"
 rayon = "1.10"
 
 # musl's malloc is slow under multithreaded allocation; swap it out so the
-# static binary matches the glibc build's speed. The sys crate's `extended`
-# feature exposes mi_option_set, used at startup to make mimalloc return
-# freed memory promptly (see main.rs) — without it the static binary's peak
-# RSS runs far above the glibc build's.
+# static binary matches the glibc build's speed.
 [target.'cfg(target_env = "musl")'.dependencies]
-mimalloc = { version = "0.1", default-features = false, features = ["extended"] }
-libmimalloc-sys = { version = "0.1", features = ["extended"] }
+mimalloc = { version = "0.1", default-features = false }
 
 [lints.clippy]
 # The OkLab coefficients deliberately carry the reference implementation's
