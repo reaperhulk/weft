@@ -212,9 +212,9 @@ Every heavy stage is parallel across frames or across bands of a frame
    itself shifted by a pixel, reduced to a bitmask: real content averages
    under two pixels per run, so the scalar "same as the last one?" test
    was a coin flip that mispredicted on most pixels. Once a worker's table
-   outgrows the fold grid it switches to summing 5-bit/channel bins — 1 MB
-   per worker, an L2-resident random-write target, where matching the
-   6-bit lookup grid meant 8 MB and a cache miss per run.
+   outgrows the fold grid it switches to summing 6-bit/channel bins, so a
+   palette built from true-color content costs one indexed add per run
+   rather than a hash probe.
 2. **Palette: variance median cut in OkLab**, mirroring ffmpeg ≥5.x
    palettegen: the box with the largest single-channel squared error (in
    Lab) splits at its count-weighted median along that channel; each box
@@ -241,8 +241,8 @@ Hot paths are vectorized with fearless_simd behind runtime dispatch
 binaries lose nothing), all verified byte-identical to the scalar paths:
 the YUV→RGBA row conversion (16 px/iteration through widen/zip, feeding
 both the histogram and quantize passes), the nearest-map distance sweep,
-histogram run extraction, inter-frame change masks, and the transition
-count that picks a delta encoding. Verified not to help: sierra2 error
+histogram run extraction, and inter-frame change masks. Verified not to
+help: sierra2 error
 diffusion (the carry→lookup→error chain is latency-bound, not
 throughput-bound), LZW (a serial hash walk), and palette lookups
 (gather-bound).
@@ -268,9 +268,9 @@ throughput-bound), LZW (a serial hash walk), and palette lookups
    barrier.
 5. **Delta + LZW, parallel per frame.** Frames crop to the changed
    bounding box; the rect is encoded transparency-punched or plain opaque,
-   whichever will compress better — byte-to-byte transition count ranks
-   the two candidates the way LZW does, for a fraction of a percent of the
-   cost of encoding both and measuring. Identical frames fold their delay
+   whichever encodes smaller — both are tried and measured, except where
+   the punched fraction settles it outright. Identical frames fold their
+   delay
    into the predecessor. With disposal "none" the decoded canvas after
    frame *i−1* equals indexed frame *i−1*, so frame *i*'s delta needs only
    its neighbor — no serial canvas walk. LZW uses a generation-stamped
