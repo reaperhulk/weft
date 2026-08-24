@@ -25,6 +25,13 @@ libmimalloc-sys = { version = "0.1", features = ["extended"] }
 excessive_precision = "allow"
 
 [profile.release]
+# Leave target-cpu alone: the SIMD kernels are runtime-dispatched
+# (fearless_simd), and building with -C target-cpu=x86-64-v3 or =native
+# measured ~2.7x SLOWER end to end (quantize+lzw 0.49s -> 1.81s on the
+# gradients bench clip) — global target features defeat the dispatched
+# kernels' specialization. PGO was also measured: neutral, since fat LTO
+# + codegen-units=1 already settle layout. The default baseline build is
+# the fast configuration.
 opt-level = 3
 lto = "fat"
 codegen-units = 1
