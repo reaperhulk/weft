@@ -49,11 +49,20 @@ pub struct ColorHist {
 }
 
 impl ColorHist {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new() -> Self {
+        Self::with_capacity(INITIAL_CAP)
+    }
+
+    /// A table with `cap` slots (rounded up to a power of two); it grows
+    /// as needed. Small initial tables matter when there are hundreds of
+    /// them (one per color bucket in pass 1).
+    pub fn with_capacity(cap: usize) -> Self {
+        let cap = cap.max(2).next_power_of_two();
         ColorHist {
-            slots: vec![EMPTY_SLOT; INITIAL_CAP],
+            slots: vec![EMPTY_SLOT; cap],
             len: 0,
-            mask: INITIAL_CAP - 1,
+            mask: cap - 1,
         }
     }
 
@@ -139,6 +148,7 @@ impl ColorHist {
 /// is RLE-scanned into it first, then added with the table slot for a few
 /// runs ahead prefetched — the adds are otherwise serialized behind one
 /// cache miss each on noisy content.
+#[cfg(test)]
 pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8], runs: &mut Vec<(u32, u32)>) -> bool {
     let has_alpha = scan_runs(rgba, runs);
     for j in 0..runs.len() {
@@ -151,20 +161,6 @@ pub fn accumulate_frame(hist: &mut ColorHist, rgba: &[u8], runs: &mut Vec<(u32, 
     has_alpha
 }
 
-/// Accumulate an intrinsically opaque row already expressed as canonical
-/// `0xRRGGBB` keys. YUV conversion can produce these lanes directly,
-/// avoiding an RGBA store followed immediately by another RGB unpack.
-pub fn accumulate_rgb_keys(hist: &mut ColorHist, keys: &[u32], runs: &mut Vec<(u32, u32)>) {
-    scan_rgb_key_runs(keys, runs);
-    for j in 0..runs.len() {
-        if let Some(&(c, _)) = runs.get(j + 8) {
-            hist.prefetch(c);
-        }
-        let (c, n) = runs[j];
-        hist.add(c, n);
-    }
-}
-
 /// Accumulate one RGBA frame directly into 6-bit/channel bins (the coarse
 /// mode workers switch to once their exact table outgrows the spill
 /// threshold — see `maybe_fold` for why the grid is quality-sufficient).
@@ -172,6 +168,7 @@ pub fn accumulate_rgb_keys(hist: &mut ColorHist, keys: &[u32], runs: &mut Vec<(u
 /// and no table growth, and bin sums are commutative, so the result is
 /// independent of how frames are scheduled across workers. Same
 /// prefetched two-pass shape as `accumulate_frame` (the bin array is 8MB).
+#[cfg(test)]
 pub fn accumulate_frame_coarse(
     bins: &mut [[u64; 4]],
     rgba: &[u8],
@@ -195,27 +192,11 @@ pub fn accumulate_frame_coarse(
     has_alpha
 }
 
-/// Coarse-bin counterpart of `accumulate_rgb_keys`.
-pub fn accumulate_rgb_keys_coarse(bins: &mut [[u64; 4]], keys: &[u32], runs: &mut Vec<(u32, u32)>) {
-    scan_rgb_key_runs(keys, runs);
-    for j in 0..runs.len() {
-        if let Some(&(c, _)) = runs.get(j + 8) {
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-                let key = grid_key((c >> 16) as u8, (c >> 8) as u8, c as u8);
-                _mm_prefetch(bins.as_ptr().add(key) as *const i8, _MM_HINT_T0);
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            let _ = c;
-        }
-        let (c, n) = runs[j];
-        bin_add(bins, c, n);
-    }
-}
-
+/// RLE-scan a row of canonical `0xRRGGBB` keys into `runs` (cleared
+/// first). Run-length batching keeps histogram traffic low on flat
+/// content.
 #[inline(always)]
-fn scan_rgb_key_runs(keys: &[u32], runs: &mut Vec<(u32, u32)>) {
+pub fn scan_rgb_key_runs(keys: &[u32], runs: &mut Vec<(u32, u32)>) {
     runs.clear();
     if keys.is_empty() {
         return;
@@ -234,12 +215,130 @@ fn scan_rgb_key_runs(keys: &[u32], runs: &mut Vec<(u32, u32)>) {
     runs.push((last, run));
 }
 
-/// Shared RLE scan into `runs` (cleared first): run-length batching keeps
-/// sink traffic low on flat content.
+/// RLE-scan an RGBA row into `runs` (cleared first). Pixels with alpha
+/// < 128 are skipped; returns true when any were, so the pipeline knows
+/// the disposal mode (and thus whether delta encoding is possible) before
+/// quantization starts.
 #[inline(always)]
-fn scan_runs(rgba: &[u8], runs: &mut Vec<(u32, u32)>) -> bool {
+pub fn scan_rgba_runs(rgba: &[u8], runs: &mut Vec<(u32, u32)>) -> bool {
     runs.clear();
     scan_runs_with(rgba, |c, n| runs.push((c, n)))
+}
+
+#[cfg(test)]
+#[inline(always)]
+fn scan_runs(rgba: &[u8], runs: &mut Vec<(u32, u32)>) -> bool {
+    scan_rgba_runs(rgba, runs)
+}
+
+// ---------------------------------------------------------------------------
+// Color-partitioned accumulation (pass 1)
+
+/// Bins per red slab: one red-byte bucket's colors all fall in the same
+/// `r >> 2` slab of the fold grid, so its coarse bins need only the
+/// (g >> 2, b >> 2) cells.
+pub const SLAB_BINS: usize = 1 << (2 * GRID_BITS);
+
+#[inline(always)]
+fn slab_key(c: u32) -> usize {
+    (((((c >> 8) & 255) as usize) >> 2) << GRID_BITS) | (((c & 255) as usize) >> 2)
+}
+
+/// RLE-scan a row of canonical `0xRRGGBB` keys, handing each run to `add`.
+#[inline(always)]
+pub fn scan_rgb_key_runs_with(keys: &[u32], mut add: impl FnMut(u32, u32)) {
+    if keys.is_empty() {
+        return;
+    }
+    let mut last = keys[0];
+    let mut run = 1u32;
+    for &key in &keys[1..] {
+        if key == last {
+            run += 1;
+        } else {
+            add(last, run);
+            last = key;
+            run = 1;
+        }
+    }
+    add(last, run);
+}
+
+/// RLE-scan a row of canonical keys, appending the runs to `all` and
+/// counting them per red byte (pass 1 phase A).
+#[inline(always)]
+pub fn scan_rgb_key_runs_counted(
+    keys: &[u32],
+    all: &mut Vec<(u32, u32)>,
+    counts: &mut [u32; 256],
+) {
+    scan_rgb_key_runs_with(keys, |c, n| {
+        all.push((c, n));
+        counts[(c >> 16) as usize] += 1;
+    })
+}
+
+/// `scan_rgba_runs`, appending to `all` and counting per red byte;
+/// returns whether any pixel was transparent.
+#[inline(always)]
+pub fn scan_rgba_runs_counted(
+    rgba: &[u8],
+    all: &mut Vec<(u32, u32)>,
+    counts: &mut [u32; 256],
+) -> bool {
+    scan_runs_with(rgba, |c, n| {
+        all.push((c, n));
+        counts[(c >> 16) as usize] += 1;
+    })
+}
+
+/// Scatter a frame's runs by red byte into `sorted` (reused; overwritten)
+/// given their per-bucket counts. Returns the 257 bucket boundaries.
+pub fn bucket_runs(runs: &[(u32, u32)], counts: &[u32; 256], sorted: &mut Vec<(u32, u32)>) -> Vec<u32> {
+    let mut offs = vec![0u32; 257];
+    for b in 0..256 {
+        offs[b + 1] = offs[b] + counts[b];
+    }
+    let mut pos = offs.clone();
+    sorted.clear();
+    sorted.resize(runs.len(), (0, 0));
+    for &e in runs {
+        let b = (e.0 >> 16) as usize;
+        sorted[pos[b] as usize] = e;
+        pos[b] += 1;
+    }
+    offs
+}
+
+/// Add runs to an exact table, with the slot for a few runs ahead
+/// prefetched (bucket tables are small, but a table that has outgrown L1
+/// still serializes behind one miss per add without this).
+pub fn accumulate_runs(hist: &mut ColorHist, runs: &[(u32, u32)]) {
+    for j in 0..runs.len() {
+        if let Some(&(c, _)) = runs.get(j + 8) {
+            hist.prefetch(c);
+        }
+        let (c, n) = runs[j];
+        hist.add(c, n);
+    }
+}
+
+/// Add one run to a red slab's coarse bins.
+#[inline(always)]
+pub fn add_run_coarse(bins: &mut [[u64; 4]], c: u32, n: u32) {
+    let bin = &mut bins[slab_key(c)];
+    let n = n as u64;
+    bin[0] += n;
+    bin[1] += n * (c >> 16) as u64;
+    bin[2] += n * ((c >> 8) & 255) as u64;
+    bin[3] += n * (c & 255) as u64;
+}
+
+/// Add runs to a red slab's coarse bins.
+pub fn accumulate_runs_coarse(bins: &mut [[u64; 4]], runs: &[(u32, u32)]) {
+    for &(c, n) in runs {
+        add_run_coarse(bins, c, n);
+    }
 }
 
 #[inline(always)]
@@ -329,15 +428,6 @@ fn bin_add(bins: &mut [[u64; 4]], c: u32, n: u32) {
 pub fn fold_into_bins(bins: &mut [[u64; 4]], entries: &[(u32, u32)]) {
     for &(c, n) in entries {
         bin_add(bins, c, n);
-    }
-}
-
-/// Merge `src`'s sums into `dst` (worker bin arrays at reduce time).
-pub fn merge_bins(dst: &mut [[u64; 4]], src: &[[u64; 4]]) {
-    for (d, s) in dst.iter_mut().zip(src) {
-        for c in 0..4 {
-            d[c] += s[c];
-        }
     }
 }
 
@@ -1165,6 +1255,55 @@ fn dist2(a: &[f32; 3], b: &[f32; 3]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pass 1's color-partitioned path (runs scattered by red byte into
+    /// per-bucket tables, then per-bucket sorted entries concatenated;
+    /// or slab bins once coarse) must reproduce the single-table result.
+    #[test]
+    fn bucketed_accumulation_matches_single_table() {
+        let mut rgba = Vec::new();
+        let mut x = 12345u32;
+        for _ in 0..50_000 {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            let c = (x >> 8) & 0xFF_FF_FF;
+            let rep = 1 + (x >> 29) as usize;
+            for _ in 0..rep {
+                rgba.extend_from_slice(&[(c >> 16) as u8, (c >> 8) as u8, c as u8, 255]);
+            }
+        }
+        let mut single = ColorHist::new();
+        accumulate_frame(&mut single, &rgba, &mut Vec::new());
+        let mut expect = single.entries();
+        expect.sort_unstable();
+
+        let mut all = Vec::new();
+        let mut counts = [0u32; 256];
+        assert!(!scan_rgba_runs_counted(&rgba, &mut all, &mut counts));
+        let mut sorted = Vec::new();
+        let offs = bucket_runs(&all, &counts, &mut sorted);
+        let mut hists: Vec<ColorHist> = (0..256).map(|_| ColorHist::with_capacity(4)).collect();
+        for (b, h) in hists.iter_mut().enumerate() {
+            accumulate_runs(h, &sorted[offs[b] as usize..offs[b + 1] as usize]);
+        }
+        let mut got = Vec::new();
+        for h in &hists {
+            let mut e = h.entries();
+            e.sort_unstable();
+            got.extend(e);
+        }
+        assert_eq!(got, expect);
+
+        // coarse: slab bins from the bucket runs == folding the exact table
+        let mut slabs = vec![vec![[0u64; 4]; SLAB_BINS]; 64];
+        for g in 0..64 {
+            let s = &sorted[offs[4 * g] as usize..offs[4 * g + 4] as usize];
+            accumulate_runs_coarse(&mut slabs[g], s);
+        }
+        let got: Vec<(u32, u32)> = slabs.iter().flat_map(|b| fold_bins_to_entries(b)).collect();
+        let mut bins = new_fold_bins();
+        fold_into_bins(&mut bins, &expect);
+        assert_eq!(got, fold_bins_to_entries(&bins));
+    }
 
     fn hist_from_frame(frame: &[u8]) -> Vec<(u32, u32)> {
         let mut h = ColorHist::new();
