@@ -568,6 +568,14 @@ fn run(args: &Args) -> io::Result<()> {
     // faults each buffer's pages once instead of allocating, zeroing, and
     // freeing ~w*h bytes per frame.
     let mut idx_block: Vec<Vec<u8>> = Vec::new();
+    // One quantize scratch per worker, created once. Building them per
+    // rayon chunk meant allocating and zeroing a 512KB memo cache over
+    // and over, and worse, throwing away everything it had learned: each
+    // new scratch started cold and re-resolved colours the clip had
+    // already seen.
+    let scratches: Vec<Mutex<dither::QuantScratch>> = (0..nthreads)
+        .map(|_| Mutex::new(dither::QuantScratch::new(w)))
+        .collect();
     while start < nread {
         let chunk: Vec<Frame> = frames_it.by_ref().take(block).collect();
         let cn = chunk.len();
@@ -612,31 +620,36 @@ fn run(args: &Args) -> io::Result<()> {
             let chunk_ref = &chunk;
             let prev_frame_ref = prev_frame.as_ref();
             let prev_last_ref = prev_last.as_deref();
-            taken.par_iter_mut().for_each_init(
-                || dither::QuantScratch::new(w),
-                |scratch, (j, idx)| {
-                    let j = *j;
-                    let reuse = if !reuse_block {
-                        None
-                    } else if j > 0 && j % waves != 0 {
-                        Some(dither::Reuse {
-                            prev_src: &chunk_ref[j - 1],
-                            prev_idx: &idx_ref[j - 1],
+            let scratches = &scratches;
+            taken.par_iter_mut().for_each(|(j, idx)| {
+                let j = *j;
+                // one slot per worker: rayon runs a single task per
+                // thread at a time, so the lock is never contended
+                let mut scratch = scratches
+                    [rayon::current_thread_index().unwrap_or(0) % scratches.len()]
+                .lock()
+                .expect("quantize scratch");
+                let scratch = &mut *scratch;
+                let reuse = if !reuse_block {
+                    None
+                } else if j > 0 && j % waves != 0 {
+                    Some(dither::Reuse {
+                        prev_src: &chunk_ref[j - 1],
+                        prev_idx: &idx_ref[j - 1],
+                    })
+                } else if j == 0 {
+                    prev_frame_ref
+                        .zip(prev_last_ref)
+                        .map(|(f, i)| dither::Reuse {
+                            prev_src: f,
+                            prev_idx: i,
                         })
-                    } else if j == 0 {
-                        prev_frame_ref
-                            .zip(prev_last_ref)
-                            .map(|(f, i)| dither::Reuse {
-                                prev_src: f,
-                                prev_idx: i,
-                            })
-                    } else {
-                        None
-                    };
-                    let src = color::RowSource::new(&chunk_ref[j], w, h, meta.chroma);
-                    quant.quantize(&src, w, h, args.dither, scratch, idx, reuse);
-                },
-            );
+                } else {
+                    None
+                };
+                let src = color::RowSource::new(&chunk_ref[j], w, h, meta.chroma);
+                quant.quantize(&src, w, h, args.dither, scratch, idx, reuse);
+            });
             for (j, buf) in taken {
                 idx_block[j] = buf;
             }
