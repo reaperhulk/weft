@@ -1119,31 +1119,49 @@ impl NearestMap {
         self.lookup_slow(cache, d >> 8, r, g, b)
     }
 
-    /// The direct[] entry for a precomputed grid key (staged gather loops).
+    /// Nearest palette entry for a color whose grid key is already known
+    /// (the staged blue-noise loops), memo cache first. On dithered content
+    /// the single-candidate `direct[]` fast path almost never hits — 90-98 %
+    /// of pixels land in multi-candidate cells on measured clips — so
+    /// probing the memo cache first turns the common case into one probe
+    /// of a per-thread table; the 1 MB `direct[]` table is only touched on
+    /// a memo miss, where it either answers outright (single-candidate
+    /// cell) or supplies the candidate-list offset for the resolve. Same
+    /// result as `lookup_packed`: a memo entry is only ever a resolve
+    /// result, and single-candidate cells never get one.
     #[inline(always)]
-    pub fn direct_lookup(&self, key: u32) -> u32 {
-        self.direct[key as usize]
-    }
-
-    /// The multi-candidate path of `lookup_packed`, for callers that
-    /// already saw `direct_lookup` return a multi-candidate entry on this
-    /// color's cell; `off` is that entry's high 24 bits (the candidate
-    /// list offset), so no further cell metadata load is needed.
-    #[inline]
-    pub fn lookup_slow(
+    pub fn lookup_cache_first(
         &self,
         cache: &mut IdxCache,
-        off: u32,
+        key: u32,
         r: u8,
         g: u8,
         b: u8,
     ) -> PackedNearest {
-        let color = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
-        let slot = (color.wrapping_mul(0x9E37_79B1) >> 16) as usize;
+        let (slot, color) = IdxCache::slot(r, g, b);
         let e = cache.slots[slot];
         // the e != MAX guard keeps the empty sentinel (whose tag bits read
         // as 0xFFFFFF) from false-hitting on white; a real white entry has
         // an index byte below 0xFF and never equals MAX
+        if (e >> 40) == color as u64 && e != u64::MAX {
+            return e as u32;
+        }
+        let d = self.direct[key as usize];
+        if (d & 0xFF) != MULTI as u32 {
+            return d;
+        }
+        let idx = self.resolve_off((d >> 8) as usize, r, g, b);
+        let packed = (self.pal_rgb[idx as usize] << 8) | idx as u32;
+        cache.slots[slot] = ((color as u64) << 40) | packed as u64;
+        packed
+    }
+
+    /// The multi-candidate path of `lookup_packed`: `off` is the direct[]
+    /// entry's high 24 bits (the candidate list offset).
+    #[inline]
+    fn lookup_slow(&self, cache: &mut IdxCache, off: u32, r: u8, g: u8, b: u8) -> PackedNearest {
+        let (slot, color) = IdxCache::slot(r, g, b);
+        let e = cache.slots[slot];
         if (e >> 40) == color as u64 && e != u64::MAX {
             return e as u32;
         }
@@ -1158,9 +1176,7 @@ impl NearestMap {
     /// hash-slot load, and the slot address needs only the color bytes.
     #[inline(always)]
     pub fn prefetch_cache_slot(&self, cache: &IdxCache, r: u8, g: u8, b: u8) {
-        let color = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
-        let slot = (color.wrapping_mul(0x9E37_79B1) >> 16) as usize;
-        prefetch_index(&cache.slots, slot);
+        prefetch_index(&cache.slots, IdxCache::slot(r, g, b).0);
     }
 
     /// Prefetch the fast-path cell for a color a few pixels ahead of the
@@ -1171,13 +1187,6 @@ impl NearestMap {
     #[inline(always)]
     pub fn prefetch(&self, r: u8, g: u8, b: u8) {
         prefetch_index(&self.direct, grid_key(r, g, b));
-    }
-
-    /// Prefetch the fast-path cell for an already-computed grid key (the
-    /// staged gather loops run a fixed distance ahead of themselves).
-    #[inline(always)]
-    pub fn prefetch_key(&self, key: u32) {
-        prefetch_index(&self.direct, key as usize);
     }
 
     /// Scan the 0xFF-terminated candidate list at `off` for the OkLab
@@ -1225,6 +1234,15 @@ impl Default for IdxCache {
         IdxCache {
             slots: vec![u64::MAX; 1 << 16],
         }
+    }
+}
+
+impl IdxCache {
+    /// Slot index and packed 24-bit color for a query.
+    #[inline(always)]
+    fn slot(r: u8, g: u8, b: u8) -> (usize, u32) {
+        let color = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
+        ((color.wrapping_mul(0x9E37_79B1) >> 16) as usize, color)
     }
 }
 
