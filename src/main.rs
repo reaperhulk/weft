@@ -289,7 +289,7 @@ fn run(args: &Args) -> io::Result<()> {
     let nthreads = rayon::current_num_threads().max(1);
     // A batch is whatever the reader has queued when the previous batch
     // finishes — small on a slow source (maximum overlap with input), the
-    // cap on a fast one. The cap bounds the routed runs, which can reach 8
+    // cap on a fast one. The cap bounds the routed runs, which can reach 4
     // bytes per pixel on noisy content, to a modest transient.
     let batch_cap = 2 * nthreads;
     let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(batch_cap);
@@ -316,7 +316,7 @@ fn run(args: &Args) -> io::Result<()> {
             .map(|slab| {
                 let mut b = vec![[0u64; 4]; palette::SLAB_BINS];
                 for h in slab {
-                    palette::accumulate_runs_coarse(&mut b, &h.entries());
+                    palette::accumulate_entries_coarse(&mut b, &h.entries());
                 }
                 b
             })
@@ -326,14 +326,14 @@ fn run(args: &Args) -> io::Result<()> {
         idx: usize,
         frame: Frame,
         alpha: bool,
-        runs: Vec<(u32, u32)>, // this frame's runs, bucket-sorted
-        offs: Vec<u32>,        // BUCKETS + 1 bucket boundaries into runs
+        runs: Vec<palette::PackedRun>, // this frame's runs, bucket-sorted
+        offs: Vec<u32>,                // BUCKETS + 1 bucket boundaries into runs
     }
     let mut coarse = false;
     // Per-frame run buffers are recycled between batches: a fresh ~MB
     // allocation per frame (an mmap plus a page fault per 4 KiB) costs
     // more than the hashing itself at low thread counts.
-    let run_pool: Mutex<Vec<Vec<(u32, u32)>>> = Mutex::new(Vec::new());
+    let run_pool: Mutex<Vec<Vec<palette::PackedRun>>> = Mutex::new(Vec::new());
     let (read_res, mut indexed_frames, any_alpha) = std::thread::scope(|scope| {
         let meta_ref = &meta;
         let reader_handle = scope.spawn(move || -> io::Result<usize> {
