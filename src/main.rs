@@ -43,7 +43,6 @@ mod simdops;
 
 use dither::{Dither, Quantizer};
 use input::{Frame, VideoIn};
-use lzw::LzwEncoder;
 use rayon::prelude::*;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::Mutex;
@@ -506,25 +505,31 @@ fn run(args: &Args) -> io::Result<()> {
     let mut prev_last: Option<Vec<u8>> = None;
     let mut frames_it = frames.into_iter();
     let mut start = 0usize;
+    // Index buffers persist across blocks (every quantize mode overwrites
+    // all w*h bytes, so recycling needs no clearing): a clip-length run
+    // faults each buffer's pages once instead of allocating, zeroing, and
+    // freeing ~w*h bytes per frame.
+    let mut idx_block: Vec<Vec<u8>> = Vec::new();
     while start < nread {
         let chunk: Vec<Frame> = frames_it.by_ref().take(block).collect();
         let cn = chunk.len();
-        let idx_block: Vec<Vec<u8>> = chunk
+        while idx_block.len() < cn {
+            idx_block.push(vec![0u8; w * h]);
+        }
+        chunk
             .into_par_iter()
-            .map_init(
+            .zip(idx_block[..cn].par_iter_mut())
+            .for_each_init(
                 || dither::QuantScratch::new(w),
-                |scratch, f| {
-                    let mut idx = vec![0u8; w * h];
+                |scratch, (f, idx)| {
                     let src = color::RowSource::new(&f, w, h, meta.chroma);
-                    quant.quantize(&src, w, h, args.dither, scratch, &mut idx);
-                    idx
+                    quant.quantize(&src, w, h, args.dither, scratch, idx);
                 },
-            )
-            .collect();
+            );
         encoded.par_extend(
             (0..cn)
                 .into_par_iter()
-                .map_init(LzwEncoder::default, |enc, j| {
+                .map_init(gif::EncodeCtx::default, |ctx, j| {
                     let i = start + j;
                     let prev = if any_alpha || i == 0 {
                         None
@@ -543,11 +548,16 @@ fn run(args: &Args) -> io::Result<()> {
                         delays[i],
                         disposal,
                         lossy_map.as_ref(),
-                        enc,
+                        ctx,
                     )
                 }),
         );
-        prev_last = idx_block.into_iter().next_back();
+        // The block's last indexed frame seeds the next block's first
+        // delta; swap keeps both buffers in the recycled pool.
+        match prev_last.as_mut() {
+            Some(pl) => std::mem::swap(pl, &mut idx_block[cn - 1]),
+            None => prev_last = Some(std::mem::replace(&mut idx_block[cn - 1], vec![0u8; w * h])),
+        }
         start += cn;
     }
     let t_qlzw = t3.elapsed();
