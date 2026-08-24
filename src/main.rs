@@ -45,7 +45,7 @@ use dither::{Dither, Quantizer};
 use input::{Frame, VideoIn};
 use rayon::prelude::*;
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 struct Args {
@@ -608,22 +608,24 @@ fn run(args: &Args) -> io::Result<()> {
     // operation. Since the block loop launches two new operations per
     // block, using them here would repeatedly allocate and zero the 512 KiB
     // nearest-color cache and recreate the encoder buffers. Keep one state
-    // bundle per Rayon worker for the whole clip instead. A worker executes
-    // only one closure at a time, so these locks are uncontended; they just
-    // provide safe indexed ownership across independent parallel calls.
+    // bundle per Rayon worker for the whole clip instead. Initialize each
+    // half lazily on the worker that first uses it: eagerly constructing
+    // nthreads caches here serializes tens of MiB of first-touch writes on
+    // large machines, and an encode-only worker never needs QuantScratch.
+    // A worker executes only one closure at a time, so these locks are
+    // uncontended; they provide safe indexed ownership across independent
+    // parallel calls.
     struct WorkerCtx {
-        quant: dither::QuantScratch,
-        encode: gif::EncodeCtx,
+        quant: OnceLock<Mutex<dither::QuantScratch>>,
+        encode: OnceLock<Mutex<gif::EncodeCtx>>,
     }
     // The extra slot covers Rayon's single-item/sequential fast path, which
     // can execute the closure on the calling thread (and therefore has no
     // Rayon worker index).
-    let worker_ctx: Vec<Mutex<WorkerCtx>> = (0..=nthreads)
-        .map(|_| {
-            Mutex::new(WorkerCtx {
-                quant: dither::QuantScratch::new(w),
-                encode: gif::EncodeCtx::default(),
-            })
+    let worker_ctx: Vec<WorkerCtx> = (0..=nthreads)
+        .map(|_| WorkerCtx {
+            quant: OnceLock::new(),
+            encode: OnceLock::new(),
         })
         .collect();
     while start < nread {
@@ -637,13 +639,21 @@ fn run(args: &Args) -> io::Result<()> {
             .zip(idx_block[..cn].par_iter_mut())
             .for_each(|(f, idx)| {
                 let wi = rayon::current_thread_index().unwrap_or(nthreads);
-                let mut ctx = worker_ctx[wi].lock().unwrap();
+                let mut scratch = worker_ctx[wi]
+                    .quant
+                    .get_or_init(|| Mutex::new(dither::QuantScratch::new(w)))
+                    .lock()
+                    .unwrap();
                 let src = color::RowSource::new(&f, w, h, meta.chroma);
-                quant.quantize(&src, w, h, args.dither, &mut ctx.quant, idx);
+                quant.quantize(&src, w, h, args.dither, &mut scratch, idx);
             });
         encoded.par_extend((0..cn).into_par_iter().map(|j| {
             let wi = rayon::current_thread_index().unwrap_or(nthreads);
-            let mut ctx = worker_ctx[wi].lock().unwrap();
+            let mut encode = worker_ctx[wi]
+                .encode
+                .get_or_init(|| Mutex::new(gif::EncodeCtx::default()))
+                .lock()
+                .unwrap();
             let i = start + j;
             let prev = if any_alpha || i == 0 {
                 None
@@ -662,7 +672,7 @@ fn run(args: &Args) -> io::Result<()> {
                 delays[i],
                 disposal,
                 lossy_map.as_ref(),
-                &mut ctx.encode,
+                &mut encode,
             )
         }));
         // The block's last indexed frame seeds the next block's first
