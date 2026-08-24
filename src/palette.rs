@@ -313,6 +313,8 @@ struct Box_ {
     start: usize,
     len: usize,
     count: u64,
+    sum: [f64; 3],
+    dominant: HBin,
     cut_score: f64,
     cut_axis: usize,
 }
@@ -327,67 +329,56 @@ const BOX_CHUNK: usize = 8192;
 
 fn make_box(bins: &[HBin], start: usize, len: usize) -> Box_ {
     let slice = &bins[start..start + len];
-    let (count, sum) = if len >= PAR_BOX {
-        slice
-            .par_chunks(BOX_CHUNK)
-            .map(|ch| {
-                let mut count = 0u64;
-                let mut sum = [0f64; 3];
-                for b in ch {
-                    count += b.count as u64;
-                    for (s, &l) in sum.iter_mut().zip(&b.lab) {
-                        *s += b.count as f64 * l as f64;
-                    }
-                }
-                (count, sum)
-            })
-            .collect::<Vec<_>>()
-            .iter()
-            .fold((0u64, [0f64; 3]), |(ac, asum), &(c, s)| {
-                (ac + c, [asum[0] + s[0], asum[1] + s[1], asum[2] + s[2]])
-            })
-    } else {
-        let mut count = 0u64;
-        let mut sum = [0f64; 3];
-        for b in slice {
-            count += b.count as u64;
-            for (s, &l) in sum.iter_mut().zip(&b.lab) {
-                *s += b.count as f64 * l as f64;
+    #[derive(Clone, Copy)]
+    struct Moments {
+        count: u64,
+        sum: [f64; 3],
+        sum2: [f64; 3],
+        dominant: HBin,
+    }
+    let accumulate = |ch: &[HBin]| {
+        let mut moments = Moments {
+            count: 0,
+            sum: [0.0; 3],
+            sum2: [0.0; 3],
+            dominant: ch[0],
+        };
+        for b in ch {
+            moments.count += b.count as u64;
+            if b.count > moments.dominant.count {
+                moments.dominant = *b;
             }
-        }
-        (count, sum)
-    };
-    let mean = [
-        sum[0] / count as f64,
-        sum[1] / count as f64,
-        sum[2] / count as f64,
-    ];
-    let er2 = if len >= PAR_BOX {
-        slice
-            .par_chunks(BOX_CHUNK)
-            .map(|ch| {
-                let mut er2 = [0f64; 3];
-                for b in ch {
-                    for c in 0..3 {
-                        let d = b.lab[c] as f64 - mean[c];
-                        er2[c] += b.count as f64 * d * d;
-                    }
-                }
-                er2
-            })
-            .collect::<Vec<_>>()
-            .iter()
-            .fold([0f64; 3], |a, e| [a[0] + e[0], a[1] + e[1], a[2] + e[2]])
-    } else {
-        let mut er2 = [0f64; 3];
-        for b in slice {
             for c in 0..3 {
-                let d = b.lab[c] as f64 - mean[c];
-                er2[c] += b.count as f64 * d * d;
+                let v = b.lab[c] as f64;
+                let w = b.count as f64;
+                moments.sum[c] += w * v;
+                moments.sum2[c] += w * v * v;
             }
         }
-        er2
+        moments
     };
+    let moments = if len >= PAR_BOX {
+        let parts: Vec<Moments> = slice.par_chunks(BOX_CHUNK).map(accumulate).collect();
+        let mut parts = parts.into_iter();
+        let mut total = parts.next().unwrap();
+        for b in parts {
+            total.count += b.count;
+            for c in 0..3 {
+                total.sum[c] += b.sum[c];
+                total.sum2[c] += b.sum2[c];
+            }
+            if b.dominant.count > total.dominant.count {
+                total.dominant = b.dominant;
+            }
+        }
+        total
+    } else {
+        accumulate(slice)
+    };
+    let mut er2 = [0.0; 3];
+    for (c, e) in er2.iter_mut().enumerate() {
+        *e = (moments.sum2[c] - moments.sum[c] * moments.sum[c] / moments.count as f64).max(0.0);
+    }
     // palettegen: split axis and box choice both follow the single largest
     // per-channel squared error
     let mut cut_axis = 0;
@@ -399,7 +390,9 @@ fn make_box(bins: &[HBin], start: usize, len: usize) -> Box_ {
     Box_ {
         start,
         len,
-        count,
+        count: moments.count,
+        sum: moments.sum,
+        dominant: moments.dominant,
         cut_score: er2[cut_axis],
         cut_axis,
     }
@@ -731,28 +724,16 @@ pub fn median_cut(mut entries: Vec<(u32, u32)>, max_colors: usize) -> Vec<[u8; 3
                 let c = slice[0].srgb;
                 return [(c >> 16) as u8, (c >> 8) as u8, c as u8];
             }
-            let mut count = 0u64;
-            let mut sum = [0f64; 3];
-            let mut dominant = &slice[0];
-            for b in slice {
-                count += b.count as u64;
-                if b.count > dominant.count {
-                    dominant = b;
-                }
-                for (s, &l) in sum.iter_mut().zip(&b.lab) {
-                    *s += b.count as f64 * l as f64;
-                }
-            }
             // Same reasoning when one color overwhelms the box: the weighted
             // average is that color, so snap to its exact sRGB.
-            if dominant.count as u64 * 100 >= count * 99 {
-                let c = dominant.srgb;
+            if bx.dominant.count as u64 * 100 >= bx.count * 99 {
+                let c = bx.dominant.srgb;
                 return [(c >> 16) as u8, (c >> 8) as u8, c as u8];
             }
             oklab_to_srgb([
-                (sum[0] / count as f64) as f32,
-                (sum[1] / count as f64) as f32,
-                (sum[2] / count as f64) as f32,
+                (bx.sum[0] / bx.count as f64) as f32,
+                (bx.sum[1] / bx.count as f64) as f32,
+                (bx.sum[2] / bx.count as f64) as f32,
             ])
         })
         .collect()
