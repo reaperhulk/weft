@@ -287,21 +287,41 @@ fn run(args: &Args) -> io::Result<()> {
     // first frame is quantized.
     let t1 = Instant::now();
     let nthreads = rayon::current_num_threads().max(1);
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(2 * nthreads);
-    // Once a worker's exact table exceeds this many distinct colors, the
-    // content is true-color (far past any lossless-palette case) and the
-    // worker switches to coarse 6-bit binning: it folds its table into a
-    // per-worker bin array and every later add is a direct indexed sum —
-    // no probing, no growth, no giant tables. Workers that never cross the
-    // threshold keep exact tables; whatever exact entries remain (worker
-    // tables flushed at reduce time) are folded into the bins at the end
-    // if anyone went coarse, or sorted + deduped exactly as before if not.
-    // Bin sums are commutative integers, so the folded result is identical
-    // however frames are scheduled — and identical to folding the full
-    // exact histogram after the fact (what maybe_fold does when the total
-    // crosses the grid size without any single worker crossing the spill
-    // threshold).
-    const HIST_SPILL: usize = 1 << 20;
+    // Histogram accumulation is bounded by the single reader thread (frame
+    // parse + copy tops out around 1-2 GB/s) and one worker hashes roughly
+    // 0.3 GB/s on the worst true-color content, so ~8 workers saturate any
+    // input source. Past that, extra workers add no throughput and only
+    // multiply per-worker state — exact tables and 8 MB bin arrays — which
+    // on 40+ logical-CPU machines made pass 1 slower and several times
+    // larger than the 4-thread run. Cap pass 1 at 8 workers (a scoped pool
+    // when the global pool is wider); pass 2+3 still uses every thread.
+    const HIST_THREADS: usize = 8;
+    let hist_threads = nthreads.min(HIST_THREADS);
+    let hist_pool = (hist_threads < nthreads).then(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(hist_threads)
+            .build()
+            .expect("hist pool")
+    });
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(2 * hist_threads);
+    // Once a worker's exact table exceeds GRID_SIZE distinct colors, the
+    // full histogram must exceed it too, so the palette input is getting
+    // grid-folded regardless (see maybe_fold) and exact tables buy nothing:
+    // the worker switches to coarse 6-bit binning — it folds its table into
+    // a per-worker bin array and every later add is a direct indexed sum,
+    // no probing, no growth, no giant tables — and raises a shared flag so
+    // the other workers switch at their next frame instead of each growing
+    // a duplicate table past the same colors. Workers that never see the
+    // flag keep exact tables; whatever exact entries remain (worker tables
+    // flushed at reduce time) are folded into the bins at the end if anyone
+    // went coarse, or sorted + deduped exactly as before if not. Bin sums
+    // are commutative integers and folding exact entries into bins yields
+    // the same sums as binning the pixels directly, so the folded result is
+    // identical however frames are scheduled and whenever each worker
+    // switches — and identical to folding the full exact histogram after
+    // the fact (what maybe_fold does when the total crosses the grid size
+    // without any single worker crossing it).
+    let go_coarse = std::sync::atomic::AtomicBool::new(false);
     let spilled: Mutex<Vec<Vec<(u32, u32)>>> = Mutex::new(Vec::new());
     let (read_res, acc) = std::thread::scope(|scope| {
         let meta_ref = &meta;
@@ -324,67 +344,82 @@ fn run(args: &Args) -> io::Result<()> {
             }
             Ok(n)
         });
-        let acc = rx
-            .into_iter()
-            .par_bridge()
-            .fold(
-                || {
-                    (
-                        palette::ColorHist::new(),
-                        None::<Vec<[u64; 4]>>,
-                        Vec::new(),
-                        (vec![0u8; w * 4], Vec::new()),
-                        false,
-                    )
-                },
-                |(mut hist, mut coarse, mut frames, mut scratch, mut alpha), (i, f)| {
-                    let (row, runs) = &mut scratch;
-                    let src = color::RowSource::new(&f, w, h, meta_ref.chroma);
-                    match &mut coarse {
-                        Some(bins) => {
-                            for y in 0..h {
-                                src.fill_row(y, row);
-                                alpha |= palette::accumulate_frame_coarse(bins, row, runs);
+        let spilled = &spilled;
+        let go_coarse = &go_coarse;
+        let accumulate = move || {
+            rx.into_iter()
+                .par_bridge()
+                .fold(
+                    || {
+                        (
+                            palette::ColorHist::new(),
+                            None::<Vec<[u64; 4]>>,
+                            Vec::new(),
+                            (vec![0u8; w * 4], Vec::new()),
+                            false,
+                        )
+                    },
+                    |(mut hist, mut coarse, mut frames, mut scratch, mut alpha), (i, f)| {
+                        use std::sync::atomic::Ordering;
+                        let (row, runs) = &mut scratch;
+                        if coarse.is_none() && go_coarse.load(Ordering::Relaxed) {
+                            let mut bins = palette::new_fold_bins();
+                            palette::fold_into_bins(&mut bins, &hist.entries());
+                            hist = palette::ColorHist::new();
+                            coarse = Some(bins);
+                        }
+                        let src = color::RowSource::new(&f, w, h, meta_ref.chroma);
+                        match &mut coarse {
+                            Some(bins) => {
+                                for y in 0..h {
+                                    src.fill_row(y, row);
+                                    alpha |= palette::accumulate_frame_coarse(bins, row, runs);
+                                }
+                            }
+                            None => {
+                                for y in 0..h {
+                                    src.fill_row(y, row);
+                                    alpha |= palette::accumulate_frame(&mut hist, row, runs);
+                                }
+                                if hist.len() > palette::GRID_SIZE {
+                                    go_coarse.store(true, Ordering::Relaxed);
+                                    let mut bins = palette::new_fold_bins();
+                                    palette::fold_into_bins(&mut bins, &hist.entries());
+                                    hist = palette::ColorHist::new();
+                                    coarse = Some(bins);
+                                }
                             }
                         }
-                        None => {
-                            for y in 0..h {
-                                src.fill_row(y, row);
-                                alpha |= palette::accumulate_frame(&mut hist, row, runs);
-                            }
-                            if hist.len() > HIST_SPILL {
-                                let mut bins = palette::new_fold_bins();
-                                palette::fold_into_bins(&mut bins, &hist.entries());
-                                hist = palette::ColorHist::new();
-                                coarse = Some(bins);
-                            }
+                        frames.push((i, f));
+                        (hist, coarse, frames, scratch, alpha)
+                    },
+                )
+                .reduce_with(|(ha, ca, mut fa, scratch, aa), (hb, cb, fb, _, ab)| {
+                    // Flush instead of hash-merging: reductions run while other
+                    // workers still accumulate, and a table-into-table merge of
+                    // millions of colors would serialize them behind cache-miss
+                    // heavy rehashing. The final sort (or bin fold) dedups
+                    // across runs. Bin arrays do merge here — a fixed 262144
+                    // integer adds, cheap and allocation-free.
+                    let run = hb.entries();
+                    if !run.is_empty() {
+                        spilled.lock().unwrap().push(run);
+                    }
+                    let coarse = match (ca, cb) {
+                        (Some(mut a), Some(b)) => {
+                            palette::merge_bins(&mut a, &b);
+                            Some(a)
                         }
-                    }
-                    frames.push((i, f));
-                    (hist, coarse, frames, scratch, alpha)
-                },
-            )
-            .reduce_with(|(ha, ca, mut fa, scratch, aa), (hb, cb, fb, _, ab)| {
-                // Flush instead of hash-merging: reductions run while other
-                // workers still accumulate, and a table-into-table merge of
-                // millions of colors would serialize them behind cache-miss
-                // heavy rehashing. The final sort (or bin fold) dedups
-                // across runs. Bin arrays do merge here — a fixed 262144
-                // integer adds, cheap and allocation-free.
-                let run = hb.entries();
-                if !run.is_empty() {
-                    spilled.lock().unwrap().push(run);
-                }
-                let coarse = match (ca, cb) {
-                    (Some(mut a), Some(b)) => {
-                        palette::merge_bins(&mut a, &b);
-                        Some(a)
-                    }
-                    (a, b) => a.or(b),
-                };
-                fa.extend(fb);
-                (ha, coarse, fa, scratch, aa | ab)
-            });
+                        (a, b) => a.or(b),
+                    };
+                    fa.extend(fb);
+                    (ha, coarse, fa, scratch, aa | ab)
+                })
+        };
+        let acc = match &hist_pool {
+            Some(pool) => pool.install(accumulate),
+            None => accumulate(),
+        };
         (reader_handle.join().expect("reader thread panicked"), acc)
     });
     let nread = read_res?;
