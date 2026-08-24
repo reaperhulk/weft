@@ -807,6 +807,8 @@ pub struct NearestMap {
     cv: LabConverter,
     /// Mean candidates per cell before interning — perf diagnostic.
     avg_cands: f32,
+    /// `rgb << 8 | idx` per palette index, padded to 256.
+    pal_packed: Box<[u32; 256]>,
 }
 
 /// Two-level candidate build geometry: `SUPER_BITS` bits per channel at
@@ -1086,6 +1088,10 @@ impl NearestMap {
             };
         }
         drop(interned);
+        let mut pal_packed = Box::new([0u32; 256]);
+        for (i, &rgb) in pal_rgb.iter().enumerate() {
+            pal_packed[i] = (rgb << 8) | i as u32;
+        }
         let total: usize = cell_lists.iter().map(Vec::len).sum();
         NearestMap {
             direct,
@@ -1094,6 +1100,7 @@ impl NearestMap {
             pal_lab,
             cv,
             avg_cands: total as f32 / GRID_SIZE as f32,
+            pal_packed,
         }
     }
 
@@ -1127,6 +1134,12 @@ impl NearestMap {
             return d;
         }
         self.lookup_slow(cache, d >> 8, r, g, b)
+    }
+
+    /// `rgb << 8 | idx` for every palette index, padded to 256 so a byte
+    /// index addresses it in range.
+    pub fn packed_palette(&self) -> &[u32; 256] {
+        &self.pal_packed
     }
 
     /// Probe the memo cache for a colour, returning the packed nearest

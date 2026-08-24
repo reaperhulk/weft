@@ -554,8 +554,13 @@ fn run(args: &Args) -> io::Result<()> {
     // small enough that the block's index buffers stay a modest, clip-
     // length-independent working set.
     let block = 4 * nthreads;
+    // Interleaving factor for the quantize passes (see below).
+    const WAVE: usize = 2;
     let mut encoded: Vec<gif::EncodedFrame> = Vec::with_capacity(nread);
     let mut prev_last: Option<Vec<u8>> = None;
+    // Source frame matching `prev_last`, so a block's first frame can
+    // reuse indices across the block boundary.
+    let mut prev_frame: Option<Frame> = None;
     let mut frames_it = frames.into_iter();
     let mut start = 0usize;
     // Index buffers persist across blocks (every quantize mode overwrites
@@ -569,16 +574,75 @@ fn run(args: &Args) -> io::Result<()> {
         while idx_block.len() < cn {
             idx_block.push(vec![0u8; w * h]);
         }
-        chunk
-            .into_par_iter()
-            .zip(idx_block[..cn].par_iter_mut())
-            .for_each_init(
+        // Quantize in `WAVE` interleaved passes so that all but every
+        // WAVE-th frame has its predecessor's indices already in hand:
+        // pixels whose source colour and gate neighbourhood are unchanged
+        // quantize to exactly the index they did last frame, and skip
+        // both random lookups. Frames within a wave stay independent, so
+        // each pass still spreads across every worker.
+        //
+        // Reuse only pays where most of the frame holds still; deciding
+        // per block from one sampled frame pair keeps high-motion content
+        // on the original single-pass schedule, which parallelizes a
+        // little better than interleaved waves.
+        // Sources with few enough distinct colours to skip the coarse
+        // fold also have a near-perfect memo-cache hit rate, so their
+        // lookups are already cheap and there is nothing for reuse to
+        // save — only masks to pay for.
+        let still = if coarse_binned && cn > 1 {
+            color::unchanged_pct(&chunk[1], &chunk[0], w, h, meta.chroma)
+        } else {
+            0
+        };
+        // The stiller the block, the more waves are worth interleaving:
+        // each extra wave gives another 1/waves of the frames a
+        // predecessor, at the cost of a shorter parallel pass.
+        let waves = if still >= 80 {
+            4
+        } else if still >= dither::REUSE_MIN_PCT {
+            WAVE
+        } else {
+            1
+        };
+        let reuse_block = waves > 1;
+        for wave in 0..waves {
+            let mut taken: Vec<(usize, Vec<u8>)> = (wave..cn)
+                .step_by(waves)
+                .map(|j| (j, std::mem::take(&mut idx_block[j])))
+                .collect();
+            let idx_ref = &idx_block;
+            let chunk_ref = &chunk;
+            let prev_frame_ref = prev_frame.as_ref();
+            let prev_last_ref = prev_last.as_deref();
+            taken.par_iter_mut().for_each_init(
                 || dither::QuantScratch::new(w),
-                |scratch, (f, idx)| {
-                    let src = color::RowSource::new(&f, w, h, meta.chroma);
-                    quant.quantize(&src, w, h, args.dither, scratch, idx);
+                |scratch, (j, idx)| {
+                    let j = *j;
+                    let reuse = if !reuse_block {
+                        None
+                    } else if j > 0 && j % waves != 0 {
+                        Some(dither::Reuse {
+                            prev_src: &chunk_ref[j - 1],
+                            prev_idx: &idx_ref[j - 1],
+                        })
+                    } else if j == 0 {
+                        prev_frame_ref
+                            .zip(prev_last_ref)
+                            .map(|(f, i)| dither::Reuse {
+                                prev_src: f,
+                                prev_idx: i,
+                            })
+                    } else {
+                        None
+                    };
+                    let src = color::RowSource::new(&chunk_ref[j], w, h, meta.chroma);
+                    quant.quantize(&src, w, h, args.dither, scratch, idx, reuse);
                 },
             );
+            for (j, buf) in taken {
+                idx_block[j] = buf;
+            }
+        }
         encoded.par_extend(
             (0..cn)
                 .into_par_iter()
@@ -611,6 +675,8 @@ fn run(args: &Args) -> io::Result<()> {
             Some(pl) => std::mem::swap(pl, &mut idx_block[cn - 1]),
             None => prev_last = Some(std::mem::replace(&mut idx_block[cn - 1], vec![0u8; w * h])),
         }
+        let mut chunk = chunk;
+        prev_frame = chunk.drain(cn - 1..).next();
         start += cn;
     }
     let t_qlzw = t3.elapsed();

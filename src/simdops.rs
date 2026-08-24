@@ -186,6 +186,78 @@ fn grid_key_scalar(r: u8, g: u8, b: u8) -> u32 {
     (((r as u32) >> 2) << 12) | (((g as u32) >> 2) << 6) | ((b as u32) >> 2)
 }
 
+/// Bits of `out` set where the two byte slices differ, 64 bytes per word.
+/// `n` bytes are compared; bits past `n` in the last word are cleared.
+pub fn diff_bits(level: Level, a: &[u8], b: &[u8], n: usize, out: &mut [u64]) {
+    fearless_simd::dispatch!(level, simd => diff_bits_impl(simd, a, b, n, out))
+}
+
+#[inline(always)]
+fn diff_bits_impl<S: Simd>(simd: S, a: &[u8], b: &[u8], n: usize, out: &mut [u64]) {
+    let mut i = 0usize;
+    let mut w = 0usize;
+    while i + 64 <= n {
+        let x = u8x64::from_slice(simd, &a[i..i + 64]);
+        let y = u8x64::from_slice(simd, &b[i..i + 64]);
+        out[w] = !simd.simd_eq_u8x64(x, y).to_bitmask();
+        i += 64;
+        w += 1;
+    }
+    if i < n {
+        let mut m = 0u64;
+        for k in 0..n - i {
+            m |= ((a[i + k] != b[i + k]) as u64) << k;
+        }
+        out[w] = m;
+        w += 1;
+    }
+    out[w..].fill(0);
+}
+
+/// Bits of `out` set where two RGBA rows differ, one bit per pixel.
+pub fn diff_bits_rgba(level: Level, a: &[u8], b: &[u8], w: usize, out: &mut [u64]) {
+    fearless_simd::dispatch!(level, simd => diff_bits_rgba_impl(simd, a, b, w, out))
+}
+
+#[inline(always)]
+fn diff_bits_rgba_impl<S: Simd>(simd: S, a: &[u8], b: &[u8], w: usize, out: &mut [u64]) {
+    let mut x = 0usize;
+    let mut word = 0usize;
+    while x < w {
+        let mut m = 0u64;
+        let mut k = 0usize;
+        while k < 64 && x + k + 16 <= w {
+            let pa = px16(simd, &a[(x + k) * 4..]);
+            let pb = px16(simd, &b[(x + k) * 4..]);
+            m |= (!simd.simd_eq_u32x16(pa, pb).to_bitmask() & 0xFFFF) << k;
+            k += 16;
+        }
+        while k < 64 && x + k < w {
+            let i = (x + k) * 4;
+            m |= ((a[i..i + 4] != b[i..i + 4]) as u64) << k;
+            k += 1;
+        }
+        out[word] = m;
+        word += 1;
+        x += 64;
+    }
+    out[word..].fill(0);
+}
+
+/// Duplicate each of the low 32 bits into an adjacent pair, so a mask at
+/// chroma resolution becomes one at pixel resolution for 2x-subsampled
+/// chroma.
+#[inline(always)]
+pub fn spread2(m: u32) -> u64 {
+    let mut x = m as u64;
+    x = (x | (x << 16)) & 0x0000_FFFF_0000_FFFF;
+    x = (x | (x << 8)) & 0x00FF_00FF_00FF_00FF;
+    x = (x | (x << 4)) & 0x0F0F_0F0F_0F0F_0F0F;
+    x = (x | (x << 2)) & 0x3333_3333_3333_3333;
+    x = (x | (x << 1)) & 0x5555_5555_5555_5555;
+    x * 3
+}
+
 /// Count positions where a byte differs from its predecessor.
 ///
 /// A cheap stand-in for "how well will LZW compress this?" — used to pick

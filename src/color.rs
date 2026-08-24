@@ -40,6 +40,16 @@ impl<'a> RowSource<'a> {
         }
     }
 
+    /// The frame these rows come from.
+    pub fn frame(&self) -> &'a Frame {
+        self.frame
+    }
+
+    /// The frame's chroma layout (None for RGBA input).
+    pub fn chroma(&self) -> Option<Chroma> {
+        self.chroma
+    }
+
     /// Fill `out` (len w*4) with RGBA for row `y`.
     #[inline]
     pub fn fill_row(&self, y: usize, out: &mut [u8]) {
@@ -48,6 +58,97 @@ impl<'a> RowSource<'a> {
             Frame::Rgba(buf) => out.copy_from_slice(&buf[y * w * 4..(y + 1) * w * 4]),
             Frame::Yuv(buf) => fill_row_yuv(buf, w, self.h, self.chroma.unwrap(), y, out),
         }
+    }
+}
+
+/// Fraction (in percent) of sampled pixels that are unchanged between two
+/// frames — every 16th row, so a sixteenth of the cost of the full
+/// comparison. Deterministic in the two frames, so decisions made from it
+/// cannot make the output depend on scheduling.
+pub fn unchanged_pct(
+    cur: &Frame,
+    prev: &Frame,
+    w: usize,
+    h: usize,
+    chroma: Option<Chroma>,
+) -> usize {
+    let mut bits = vec![0u64; w.div_ceil(64)];
+    let (mut changed, mut total) = (0usize, 0usize);
+    for y in (0..h).step_by(16) {
+        changed_row(cur, prev, w, h, chroma, y, &mut bits);
+        changed += bits.iter().map(|c| c.count_ones() as usize).sum::<usize>();
+        total += w;
+    }
+    if total == 0 {
+        return 0;
+    }
+    100 - (changed * 100 / total).min(100)
+}
+
+/// Set a bit in `out` per pixel of row `y` that differs between two
+/// frames of the same geometry (64 pixels per word).
+///
+/// Compared in the source's own domain — planar YUV is 1.5 bytes per
+/// pixel against RGBA's 4, and needs no conversion — because this runs
+/// for every row of every frame to find the pixels whose quantized index
+/// cannot have changed.
+pub fn changed_row(
+    cur: &Frame,
+    prev: &Frame,
+    w: usize,
+    h: usize,
+    chroma: Option<Chroma>,
+    y: usize,
+    out: &mut [u64],
+) {
+    let level = crate::simdops::level();
+    match (cur, prev) {
+        (Frame::Rgba(a), Frame::Rgba(b)) => crate::simdops::diff_bits_rgba(
+            level,
+            &a[y * w * 4..(y + 1) * w * 4],
+            &b[y * w * 4..(y + 1) * w * 4],
+            w,
+            out,
+        ),
+        (Frame::Yuv(a), Frame::Yuv(b)) => {
+            let chroma = chroma.expect("yuv frame without chroma");
+            let cw = w.div_ceil(2);
+            let (ya, ra) = a.split_at(w * h);
+            let (yb, rb) = b.split_at(w * h);
+            crate::simdops::diff_bits(level, &ya[y * w..y * w + w], &yb[y * w..y * w + w], w, out);
+            let (csize, crow, cn, sub) = match chroma {
+                Chroma::Mono => return,
+                Chroma::C420 => (cw * h.div_ceil(2), (y >> 1) * cw, cw, true),
+                Chroma::C422 => (cw * h, y * cw, cw, true),
+                Chroma::C444 => (w * h, y * w, w, false),
+            };
+            let ((ua, va), (ub, vb)) = (ra.split_at(csize), rb.split_at(csize));
+            // Chroma changes invalidate every pixel they cover, so the
+            // chroma-resolution mask is spread back out to pixels.
+            let words = cn.div_ceil(64);
+            let mut cbits = [0u64; 64];
+            let mut vbits = [0u64; 64];
+            let cb = &mut cbits[..words];
+            let vb2 = &mut vbits[..words];
+            crate::simdops::diff_bits(level, &ua[crow..crow + cn], &ub[crow..crow + cn], cn, cb);
+            crate::simdops::diff_bits(level, &va[crow..crow + cn], &vb[crow..crow + cn], cn, vb2);
+            if sub {
+                for (i, o) in out[..w.div_ceil(64)].iter_mut().enumerate() {
+                    let m = cb[i / 2] | vb2[i / 2];
+                    let half = if i % 2 == 0 {
+                        m as u32
+                    } else {
+                        (m >> 32) as u32
+                    };
+                    *o |= crate::simdops::spread2(half);
+                }
+            } else {
+                for (o, (&c, &v)) in out[..words].iter_mut().zip(cb.iter().zip(vb2.iter())) {
+                    *o |= c | v;
+                }
+            }
+        }
+        _ => out.fill(!0),
     }
 }
 

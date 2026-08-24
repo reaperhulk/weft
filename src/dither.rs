@@ -17,6 +17,10 @@ pub enum Dither {
     None,
 }
 
+/// Minimum percentage of unchanged pixels (sampled) for the reuse path to
+/// pay for its change masks.
+pub const REUSE_MIN_PCT: usize = 50;
+
 const BAYER8: [[u8; 8]; 8] = [
     [0, 32, 8, 40, 2, 34, 10, 42],
     [48, 16, 56, 24, 50, 18, 58, 26],
@@ -33,6 +37,14 @@ const BAYER8: [[u8; 8]; 8] = [
 #[inline(always)]
 fn rgb24(p: &[u8]) -> u32 {
     ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32
+}
+
+/// The previous frame's source and quantized indices, for reusing the
+/// indices of pixels whose quantization cannot have changed.
+#[derive(Clone, Copy)]
+pub struct Reuse<'a> {
+    pub prev_src: &'a crate::input::Frame,
+    pub prev_idx: &'a [u8],
 }
 
 pub struct Quantizer<'a> {
@@ -65,6 +77,13 @@ pub struct QuantScratch {
     ors: Vec<u32>,
     c2c: Vec<u32>,
     wl: Vec<u32>,
+    /// Per-pixel changed-vs-previous-frame flags for this row and the one above.
+    /// One bit per pixel: does it differ from the previous frame? For
+    /// this row and the one above.
+    chg: Vec<u64>,
+    chg_prev: Vec<u64>,
+    /// One bit per pixel: can its index be reused verbatim?
+    sf: Vec<u64>,
     wl2: Vec<u32>,
     att: Vec<u32>,
 }
@@ -82,6 +101,9 @@ impl QuantScratch {
             ors: vec![0; w],
             c2c: vec![0; w],
             wl: vec![0; w],
+            chg: vec![!0u64; w.div_ceil(64)],
+            chg_prev: vec![!0u64; w.div_ceil(64)],
+            sf: vec![0u64; w.div_ceil(64)],
             wl2: vec![0; w],
             // 256 = no attenuation: with the gate off this is never
             // rewritten and the threshold pick reduces to the ungated one
@@ -94,6 +116,7 @@ impl<'a> Quantizer<'a> {
     /// Quantize a frame (accessed row-by-row via `src`, so YUV conversion
     /// stays fused and cache-resident) into palette indices. Returns true
     /// if any pixel was alpha-transparent.
+    #[allow(clippy::too_many_arguments)]
     pub fn quantize(
         &self,
         src: &crate::color::RowSource,
@@ -102,11 +125,12 @@ impl<'a> Quantizer<'a> {
         mode: Dither,
         scratch: &mut QuantScratch,
         out: &mut [u8],
+        reuse: Option<Reuse>,
     ) -> bool {
         match mode {
             Dither::None => self.quantize_plain(src, w, h, scratch, out),
             Dither::Bayer => self.quantize_bayer(src, w, h, scratch, out),
-            Dither::BlueNoise => self.quantize_bluenoise(src, w, h, scratch, out),
+            Dither::BlueNoise => self.quantize_bluenoise(src, w, h, scratch, out, reuse),
             Dither::Sierra2_4a => self.quantize_diffuse(src, w, h, scratch, out, false),
             Dither::FloydSteinberg => self.quantize_diffuse(src, w, h, scratch, out, true),
         }
@@ -141,6 +165,7 @@ impl<'a> Quantizer<'a> {
         h: usize,
         scratch: &mut QuantScratch,
         out: &mut [u8],
+        reuse: Option<Reuse>,
     ) -> bool {
         if self.exact_palette {
             return self.quantize_bluenoise_scalar(src, w, h, scratch, out);
@@ -149,11 +174,52 @@ impl<'a> Quantizer<'a> {
         // to tile starts, small enough that a tile's stage arrays (~28
         // bytes per pixel) stay L1-resident between passes.
         const TILE: usize = 256;
+        // `rgb << 8 | idx` per palette index, for turning a reused index
+        // straight back into the pair the threshold pick expects.
+        let pal = self.nearest.packed_palette();
         let mask32 = &crate::bluenoise::BLUE_NOISE_64_U32;
         let level = crate::simdops::level();
         let gate_on = self.gate > 0;
+        // Sample every 16th row before committing to the reuse path: on
+        // content where most pixels change every frame, building the
+        // change masks costs more than the lookups it saves. The sample
+        // is 1/16th of that cost and is a deterministic function of the
+        // two frames, so it cannot make the output depend on scheduling.
+        let reuse = reuse.filter(|r| {
+            crate::color::unchanged_pct(r.prev_src, src.frame(), w, h, src.chroma())
+                >= REUSE_MIN_PCT
+        });
         let mut has_alpha = false;
+        if reuse.is_none() {
+            // no predecessor: nothing is reusable, and the flags persist
+            // across frames in the shared scratch
+            scratch.sf.fill(0);
+        }
         for y in 0..h {
+            // Which pixels of this row differ from the previous frame's.
+            // A pixel whose own source colour, its left neighbour and the
+            // pixel above it are all unchanged quantizes to exactly the
+            // index it did last frame: the two-candidate pick reads only
+            // the colour, the blue-noise mask (fixed per position) and
+            // the activity gate (which reads those two neighbours). Such
+            // pixels skip both random lookups entirely.
+            if let Some(r) = reuse {
+                std::mem::swap(&mut scratch.chg, &mut scratch.chg_prev);
+                crate::color::changed_row(
+                    r.prev_src,
+                    src.frame(),
+                    w,
+                    h,
+                    src.chroma(),
+                    y,
+                    &mut scratch.chg,
+                );
+                if y == 0 {
+                    // row 0 gates against itself, so it has no upper
+                    // neighbour to invalidate it
+                    scratch.chg_prev.copy_from_slice(&scratch.chg);
+                }
+            }
             src.fill_row(y, &mut scratch.row);
             // stage 1 runs row-wide: grid keys + alpha presence, with the
             // activity attenuation fused into the same pass over the
@@ -172,6 +238,27 @@ impl<'a> Quantizer<'a> {
             } else {
                 crate::simdops::bn_keys(level, &scratch.row, &mut scratch.keys)
             };
+            // A pixel is reusable when its own source colour is unchanged
+            // and so are the two neighbours the activity gate reads. With
+            // the gate off only its own colour matters.
+            if reuse.is_some() {
+                let (chg, sf) = (&scratch.chg, &mut scratch.sf);
+                if gate_on {
+                    // shifting the row mask left by one pixel folds in the
+                    // left neighbour, carrying across word boundaries
+                    let up = &scratch.chg_prev;
+                    let mut carry = 0u64;
+                    for i in 0..sf.len() {
+                        let c = chg[i];
+                        sf[i] = !(c | (c << 1) | carry | up[i]);
+                        carry = c >> 63;
+                    }
+                } else {
+                    for (o, &c) in sf.iter_mut().zip(chg.iter()) {
+                        *o = !c;
+                    }
+                }
+            }
             has_alpha |= has_alpha_row;
             let mrow: &[u32; 64] = mask32[(y & 63) << 6..((y & 63) << 6) + 64]
                 .try_into()
@@ -183,6 +270,8 @@ impl<'a> Quantizer<'a> {
                 let orow = &mut out[y * w + x0..y * w + x0 + tw];
                 let keys = &scratch.keys[x0..];
                 let att = &scratch.att[x0..x0 + tw];
+                let sf = &scratch.sf[..];
+                let prev_row = reuse.map(|r| &r.prev_idx[y * w + x0..y * w + x0 + tw]);
                 let cache = &mut scratch.cache;
 
                 // stage 2: memo-cache probe for every pixel, misses
@@ -193,15 +282,40 @@ impl<'a> Quantizer<'a> {
                 // two random loads for the common pixel, since 80-95% of
                 // pixels land on a multi-candidate cell.
                 let mut m1 = 0usize;
-                for i in 0..tw {
-                    if i + 16 < tw {
-                        self.nearest
-                            .prefetch_color_slot(cache, rgb24(&row[(i + 16) * 4..]));
+                match prev_row {
+                    // Reusable pixels — index unchanged from last frame —
+                    // skip both lookups and hand the threshold pick two
+                    // identical candidates. The two loops are written out
+                    // rather than sharing a per-pixel test, which cost a
+                    // few percent on the frames that have no predecessor.
+                    Some(prev_row) => {
+                        for i in 0..tw {
+                            if i + 16 < tw {
+                                self.nearest
+                                    .prefetch_color_slot(cache, rgb24(&row[(i + 16) * 4..]));
+                            }
+                            if (sf[(x0 + i) >> 6] >> ((x0 + i) & 63)) & 1 != 0 {
+                                scratch.pk1[i] = pal[prev_row[i] as usize];
+                                continue;
+                            }
+                            let hit = self.nearest.cache_probe(cache, rgb24(&row[i * 4..]));
+                            scratch.pk1[i] = hit.unwrap_or(0);
+                            scratch.wl[m1] = i as u32;
+                            m1 += hit.is_none() as usize;
+                        }
                     }
-                    let hit = self.nearest.cache_probe(cache, rgb24(&row[i * 4..]));
-                    scratch.pk1[i] = hit.unwrap_or(0);
-                    scratch.wl[m1] = i as u32;
-                    m1 += hit.is_none() as usize;
+                    None => {
+                        for i in 0..tw {
+                            if i + 16 < tw {
+                                self.nearest
+                                    .prefetch_color_slot(cache, rgb24(&row[(i + 16) * 4..]));
+                            }
+                            let hit = self.nearest.cache_probe(cache, rgb24(&row[i * 4..]));
+                            scratch.pk1[i] = hit.unwrap_or(0);
+                            scratch.wl[m1] = i as u32;
+                            m1 += hit.is_none() as usize;
+                        }
+                    }
                 }
                 // stage 3: resolve the misses through the grid table
                 // (prefetching the cell a few misses ahead hides the load)
@@ -243,9 +357,19 @@ impl<'a> Quantizer<'a> {
                     // threshold pick keep c1 (identical candidates).
                     scratch.pk2[..tw].copy_from_slice(&scratch.pk1[..tw]);
                     let mut nlive = 0usize;
-                    for i in 0..tw {
-                        scratch.wl2[nlive] = i as u32;
-                        nlive += ((scratch.ors[i] != 0) & (att[i] != 0)) as usize;
+                    if prev_row.is_some() {
+                        // reused pixels keep c1 as c2, so they never enter
+                        for i in 0..tw {
+                            scratch.wl2[nlive] = i as u32;
+                            let reusable = (sf[(x0 + i) >> 6] >> ((x0 + i) & 63)) & 1;
+                            nlive +=
+                                ((scratch.ors[i] != 0) & (att[i] != 0) & (reusable == 0)) as usize;
+                        }
+                    } else {
+                        for i in 0..tw {
+                            scratch.wl2[nlive] = i as u32;
+                            nlive += ((scratch.ors[i] != 0) & (att[i] != 0)) as usize;
+                        }
                     }
                     // stage 5b: c2 cache probe over the live list
                     let mut m2 = 0usize;
@@ -589,7 +713,7 @@ mod tests {
         let src = crate::color::RowSource::new(&frame, 4, 1, None);
         let mut out = [9u8; 4];
         let mut scratch = QuantScratch::new(4);
-        let has_alpha = q.quantize(&src, 4, 1, Dither::None, &mut scratch, &mut out);
+        let has_alpha = q.quantize(&src, 4, 1, Dither::None, &mut scratch, &mut out, None);
         assert!(has_alpha);
         assert_eq!(out, [2, 0, 1, 3]);
     }
@@ -606,7 +730,7 @@ mod tests {
         let frame = crate::input::Frame::Rgba(rgba);
         let src = crate::color::RowSource::new(&frame, w, h, None);
         let mut scratch = QuantScratch::new(w);
-        q.quantize(&src, w, h, mode, &mut scratch, &mut out);
+        q.quantize(&src, w, h, mode, &mut scratch, &mut out, None);
         out
     }
 
@@ -797,7 +921,7 @@ mod tests {
         let frame = crate::input::Frame::Rgba(rgba);
         let src = crate::color::RowSource::new(&frame, 8, 8, None);
         let mut scratch = QuantScratch::new(8);
-        q.quantize(&src, 8, 8, Dither::Sierra2_4a, &mut scratch, &mut out);
+        q.quantize(&src, 8, 8, Dither::Sierra2_4a, &mut scratch, &mut out, None);
         for (i, &o) in out.iter().enumerate() {
             assert_eq!(o as usize, i % 2);
         }
