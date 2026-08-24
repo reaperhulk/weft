@@ -33,36 +33,33 @@ pub fn grid_key(r: u8, g: u8, b: u8) -> usize {
 // ---------------------------------------------------------------------------
 // Exact-color histogram
 
-const EMPTY: u32 = u32::MAX;
+/// Open-addressing table of `color << 32 | count` words; an empty slot is
+/// all ones (a real key is 24-bit, so its high word is never 0xFFFFFFFF).
+/// Key and count share a word so a probe — and the prefetch that runs
+/// ahead of it — touches one cache line instead of two: with several
+/// workers each growing a multi-MB table, the tables live in L3/DRAM and
+/// the second line per add was a second miss.
+const EMPTY_SLOT: u64 = u64::MAX;
+const INITIAL_CAP: usize = 1 << 16;
 
 pub struct ColorHist {
-    keys: Vec<u32>, // 24-bit color or EMPTY
-    counts: Vec<u32>,
+    slots: Vec<u64>,
     len: usize,
     mask: usize,
 }
 
 impl ColorHist {
     pub fn new() -> Self {
-        let cap = 1 << 16;
         ColorHist {
-            keys: vec![EMPTY; cap],
-            counts: vec![0; cap],
+            slots: vec![EMPTY_SLOT; INITIAL_CAP],
             len: 0,
-            mask: cap - 1,
+            mask: INITIAL_CAP - 1,
         }
     }
 
     #[inline(always)]
-    fn slot_of(&self, color: u32) -> usize {
-        let mut slot = (color.wrapping_mul(0x9E37_79B1) as usize >> 8) & self.mask;
-        loop {
-            let k = self.keys[slot];
-            if k == color || k == EMPTY {
-                return slot;
-            }
-            slot = (slot + 1) & self.mask;
-        }
+    fn home(&self, color: u32) -> usize {
+        (color.wrapping_mul(0x9E37_79B1) as usize >> 8) & self.mask
     }
 
     /// Prefetch the home slot for `color` (the add loop runs a few runs
@@ -73,9 +70,10 @@ impl ColorHist {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            let slot = (color.wrapping_mul(0x9E37_79B1) as usize >> 8) & self.mask;
-            _mm_prefetch(self.keys.as_ptr().add(slot) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(self.counts.as_ptr().add(slot) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(
+                self.slots.as_ptr().add(self.home(color)) as *const i8,
+                _MM_HINT_T0,
+            );
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -85,29 +83,37 @@ impl ColorHist {
 
     #[inline(always)]
     pub fn add(&mut self, color: u32, n: u32) {
-        let slot = self.slot_of(color);
-        if self.keys[slot] == EMPTY {
-            self.keys[slot] = color;
-            self.counts[slot] = n;
-            self.len += 1;
-            if self.len * 10 > self.keys.len() * 7 {
-                self.grow();
+        let mut slot = self.home(color);
+        loop {
+            let s = self.slots[slot];
+            if (s >> 32) as u32 == color {
+                let c = (s as u32).saturating_add(n);
+                self.slots[slot] = ((color as u64) << 32) | c as u64;
+                return;
             }
-        } else {
-            self.counts[slot] = self.counts[slot].saturating_add(n);
+            if s == EMPTY_SLOT {
+                self.slots[slot] = ((color as u64) << 32) | n as u64;
+                self.len += 1;
+                if self.len * 10 > self.slots.len() * 7 {
+                    self.grow();
+                }
+                return;
+            }
+            slot = (slot + 1) & self.mask;
         }
     }
 
     fn grow(&mut self) {
-        let new_cap = self.keys.len() * 2;
-        let old_keys = std::mem::replace(&mut self.keys, vec![EMPTY; new_cap]);
-        let old_counts = std::mem::replace(&mut self.counts, vec![0; new_cap]);
+        let new_cap = self.slots.len() * 2;
+        let old = std::mem::replace(&mut self.slots, vec![EMPTY_SLOT; new_cap]);
         self.mask = new_cap - 1;
-        for (k, c) in old_keys.into_iter().zip(old_counts) {
-            if k != EMPTY {
-                let slot = self.slot_of(k);
-                self.keys[slot] = k;
-                self.counts[slot] = c;
+        for s in old {
+            if s != EMPTY_SLOT {
+                let mut slot = self.home((s >> 32) as u32);
+                while self.slots[slot] != EMPTY_SLOT {
+                    slot = (slot + 1) & self.mask;
+                }
+                self.slots[slot] = s;
             }
         }
     }
@@ -118,11 +124,10 @@ impl ColorHist {
     }
 
     pub fn entries(&self) -> Vec<(u32, u32)> {
-        self.keys
+        self.slots
             .iter()
-            .zip(self.counts.iter())
-            .filter(|(&k, _)| k != EMPTY)
-            .map(|(&k, &c)| (k, c))
+            .filter(|&&s| s != EMPTY_SLOT)
+            .map(|&s| ((s >> 32) as u32, s as u32))
             .collect()
     }
 }

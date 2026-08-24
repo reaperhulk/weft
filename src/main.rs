@@ -343,23 +343,54 @@ fn run(args: &Args) -> io::Result<()> {
     let (read_res, acc) = std::thread::scope(|scope| {
         let meta_ref = &meta;
         let reader_handle = scope.spawn(move || -> io::Result<usize> {
-            let mut n = 0usize;
-            loop {
-                let frame = match &mut source {
-                    Source::Y4m(r) => input::read_y4m_frame(r, meta_ref)?,
-                    Source::Rgba(r) => input::read_rgba_frame(r, w, h)?,
+            // On a fast source (tmpfs, a pipe from a decoder already
+            // ahead of us) most of the reader's time is page-faulting the
+            // fresh buffer for each frame, not copying into it. A helper
+            // thread allocates and first-touches the buffers a few frames
+            // ahead so the reader only does the read.
+            let fsize = match &source {
+                Source::Y4m(_) => meta_ref.chroma.unwrap().frame_bytes(w, h),
+                Source::Rgba(_) => w * h * 4,
+            };
+            let (btx, brx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+            let prefault = std::thread::spawn(move || loop {
+                // Deliberately not `vec![0; fsize]`: that is calloc, whose
+                // pages stay unmapped until first written, i.e. the fault
+                // would land on the reader after all. resize() stores the
+                // zeros itself, which is the first touch we want here.
+                #[allow(clippy::slow_vector_initialization)]
+                let v: Vec<u8> = {
+                    let mut v = Vec::with_capacity(fsize);
+                    v.resize(fsize, 0);
+                    v
                 };
-                match frame {
-                    Some(f) => {
-                        if tx.send((n, f)).is_err() {
-                            break; // consumer died; its error surfaces below
-                        }
-                        n += 1;
-                    }
-                    None => break,
+                if btx.send(v).is_err() {
+                    break;
                 }
-            }
-            Ok(n)
+            });
+            let mut n = 0usize;
+            let res = (|| {
+                loop {
+                    let buf = brx.recv().expect("prefault thread died");
+                    let frame = match &mut source {
+                        Source::Y4m(r) => input::read_y4m_frame(r, buf)?,
+                        Source::Rgba(r) => input::read_rgba_frame(r, buf)?,
+                    };
+                    match frame {
+                        Some(f) => {
+                            if tx.send((n, f)).is_err() {
+                                break; // consumer died; its error surfaces below
+                            }
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                Ok(n)
+            })();
+            drop(brx); // unblocks the helper's pending send
+            prefault.join().expect("prefault thread panicked");
+            res
         });
         let spilled = &spilled;
         let go_coarse = &go_coarse;
@@ -504,33 +535,10 @@ fn run(args: &Args) -> io::Result<()> {
         drop(runs);
         palette::fold_bins_to_entries(&bins)
     } else {
-        // Concatenate all flushed runs plus the surviving accumulator,
-        // then sum duplicate colors with one parallel sort + adjacent
-        // merge. median_cut canonicalizes its input by the same sort, so
-        // this costs nothing extra beyond the (already tight)
-        // concatenated allocation.
-        let mut entries = Vec::with_capacity(runs.iter().map(Vec::len).sum());
-        while let Some(r) = runs.pop() {
-            entries.extend_from_slice(&r); // pop + drop each run: concat
-                                           // never holds two full copies
-        }
-        drop(runs);
-        if entries.len() > 16384 {
-            entries.par_sort_unstable();
-        } else {
-            entries.sort_unstable();
-        }
-        entries.dedup_by(|cur, prev| {
-            if cur.0 == prev.0 {
-                prev.1 = prev.1.saturating_add(cur.1);
-                true
-            } else {
-                false
-            }
-        });
-        entries.shrink_to_fit(); // drops the duplicates' share before the
-                                 // palette build allocates its scratch
-        entries
+        // Sum duplicate colors across all flushed runs plus the surviving
+        // accumulator (sorted output; median_cut's canonicalizing sort is
+        // then a no-op).
+        merge_runs(runs)
     };
     let t_read = t0.elapsed();
     let t_hist = t1.elapsed();
@@ -631,8 +639,15 @@ fn run(args: &Args) -> io::Result<()> {
     while start < nread {
         let chunk: Vec<Frame> = frames_it.by_ref().take(block).collect();
         let cn = chunk.len();
-        while idx_block.len() < cn {
-            idx_block.push(vec![0u8; w * h]);
+        if idx_block.len() < cn {
+            // Allocate (and first-touch) the block's index buffers in
+            // parallel: done serially this is several ms of page faults
+            // per clip on a wide machine, all before any worker starts.
+            let extra: Vec<Vec<u8>> = (idx_block.len()..cn)
+                .into_par_iter()
+                .map(|_| vec![0u8; w * h])
+                .collect();
+            idx_block.extend(extra);
         }
         chunk
             .into_par_iter()
@@ -725,6 +740,73 @@ fn run(args: &Args) -> io::Result<()> {
 /// RGBA input is by far the hot case, and copying every source byte into a
 /// scratch row just to read it back is pure overhead.
 #[inline]
+/// Sum duplicate colors across the per-worker histogram runs into one
+/// sorted, deduplicated entry list — the result of concatenating, sorting
+/// and adjacent-merging everything, but partitioned by the red byte first
+/// so the sort and the merge run per bucket in parallel (bucket order is
+/// sorted order: red is the key's high byte). With 8 workers each holding
+/// most of a 300K-color clip, the concatenated input runs to millions of
+/// entries, and the serial concat + dedup + shrink was tens of ms on the
+/// critical path between pass 1 and the palette.
+fn merge_runs(runs: Vec<Vec<(u32, u32)>>) -> Vec<(u32, u32)> {
+    const B: usize = 256;
+    let total: usize = runs.iter().map(Vec::len).sum();
+    if total <= 16384 {
+        let mut entries: Vec<(u32, u32)> = runs.into_iter().flatten().collect();
+        entries.sort_unstable();
+        dedup_sum(&mut entries);
+        return entries;
+    }
+    let parts: Vec<Vec<Vec<(u32, u32)>>> = runs
+        .par_iter()
+        .map(|r| {
+            let mut counts = [0usize; B];
+            for &(c, _) in r {
+                counts[(c >> 16) as usize] += 1;
+            }
+            let mut v: Vec<Vec<(u32, u32)>> =
+                counts.iter().map(|&n| Vec::with_capacity(n)).collect();
+            for &e in r {
+                v[(e.0 >> 16) as usize].push(e);
+            }
+            v
+        })
+        .collect();
+    drop(runs);
+    let buckets: Vec<Vec<(u32, u32)>> = (0..B)
+        .into_par_iter()
+        .map(|b| {
+            let n: usize = parts.iter().map(|p| p[b].len()).sum();
+            let mut v = Vec::with_capacity(n);
+            for p in &parts {
+                v.extend_from_slice(&p[b]);
+            }
+            v.sort_unstable();
+            dedup_sum(&mut v);
+            v
+        })
+        .collect();
+    drop(parts);
+    let n: usize = buckets.iter().map(Vec::len).sum();
+    let mut out = Vec::with_capacity(n);
+    for b in &buckets {
+        out.extend_from_slice(b);
+    }
+    out
+}
+
+/// Merge adjacent equal colors of a sorted entry list, summing counts.
+fn dedup_sum(entries: &mut Vec<(u32, u32)>) {
+    entries.dedup_by(|cur, prev| {
+        if cur.0 == prev.0 {
+            prev.1 = prev.1.saturating_add(cur.1);
+            true
+        } else {
+            false
+        }
+    });
+}
+
 fn rgba_row<'r>(src: &color::RowSource<'r>, y: usize, scratch: &'r mut [u8]) -> &'r [u8] {
     match src.rgba_row(y) {
         Some(borrowed) => borrowed,
