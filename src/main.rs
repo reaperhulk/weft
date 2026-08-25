@@ -31,6 +31,7 @@ struct Args {
     dither_gate: u32,
     loop_count: Option<u16>,
     lossy: u32,
+    hold: u32,
     threads: Option<usize>,
     stats: bool,
 }
@@ -69,6 +70,12 @@ options:
   --lossy N          lossy LZW compression, 0-200 (default: 0 = lossless
                      encoding of the quantized frames; ~30 is subtle and
                      much smaller on dithered content)
+  --hold N           temporal hold, 0-765 (default: 0 = off): a pixel
+                     that moves by less than N (|dR|+|dG|+|dB|) from its
+                     value in the previous frame keeps that value, so
+                     source noise on static regions stops re-rolling the
+                     palette pick every frame. ~8-12 is invisible and
+                     much smaller on compressed-video input
   --no-loop          play once (no NETSCAPE extension)
   --threads N        worker threads             (default: all cores)
   --stats            print timing breakdown to stderr
@@ -84,6 +91,7 @@ fn parse_args() -> Result<Args, String> {
         dither_gate: 16,
         loop_count: Some(0),
         lossy: 0,
+        hold: 0,
         threads: None,
         stats: false,
     };
@@ -151,6 +159,12 @@ fn parse_args() -> Result<Args, String> {
                 a.lossy = val("--lossy")?.parse().map_err(|_| "bad --lossy")?;
                 if a.lossy > 200 {
                     return Err("--lossy must be 0-200".into());
+                }
+            }
+            "--hold" => {
+                a.hold = val("--hold")?.parse().map_err(|_| "bad --hold")?;
+                if a.hold > 765 {
+                    return Err("--hold must be 0-765".into());
                 }
             }
             "--no-loop" => a.loop_count = None,
@@ -336,6 +350,7 @@ fn run(args: &Args) -> io::Result<()> {
     let run_pool: Mutex<Vec<Vec<palette::PackedRun>>> = Mutex::new(Vec::new());
     let (read_res, mut indexed_frames, any_alpha) = std::thread::scope(|scope| {
         let meta_ref = &meta;
+        let hold = args.hold;
         let reader_handle = scope.spawn(move || -> io::Result<usize> {
             // On a fast source (tmpfs, a pipe from a decoder already
             // ahead of us) most of the reader's time is page-faulting the
@@ -363,6 +378,10 @@ fn run(args: &Args) -> io::Result<()> {
                 }
             });
             let mut n = 0usize;
+            // --hold reference: the previous frame after holding. One
+            // frame of extra residency; the compare-and-copy runs on the
+            // reader thread, overlapped with the histogram pass.
+            let mut held_prev: Vec<u8> = Vec::new();
             let res = (|| {
                 loop {
                     let buf = brx.recv().expect("prefault thread died");
@@ -371,7 +390,27 @@ fn run(args: &Args) -> io::Result<()> {
                         Source::Rgba(r) => input::read_rgba_frame(r, buf)?,
                     };
                     match frame {
-                        Some(f) => {
+                        Some(mut f) => {
+                            if hold > 0 {
+                                let is_yuv = matches!(f, Frame::Yuv(_));
+                                let buf = match &mut f {
+                                    Frame::Rgba(b) | Frame::Rgb(b) | Frame::Yuv(b) => b,
+                                };
+                                if n > 0 {
+                                    if is_yuv {
+                                        input::hold::planes(
+                                            buf,
+                                            &held_prev,
+                                            input::hold::plane_threshold(hold),
+                                        );
+                                    } else {
+                                        input::hold::rgba(buf, &held_prev, hold);
+                                    }
+                                    held_prev.copy_from_slice(buf);
+                                } else {
+                                    held_prev = buf.clone();
+                                }
+                            }
                             if tx.send((n, f)).is_err() {
                                 break; // consumer died; its error surfaces below
                             }
