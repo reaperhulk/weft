@@ -357,7 +357,14 @@ pub mod smooth {
     }
 
     /// Smooth an RGBA frame in place.
-    pub fn rgba(level: fearless_simd::Level, frame: &mut [u8], w: usize, h: usize, s: u32, scratch: &mut Vec<u8>) {
+    pub fn rgba(
+        level: fearless_simd::Level,
+        frame: &mut [u8],
+        w: usize,
+        h: usize,
+        s: u32,
+        scratch: &mut Vec<u8>,
+    ) {
         pad(frame, w, h, 4, scratch);
         let padded: &[u8] = scratch;
         for (y, row) in frame.chunks_mut(w * 4).enumerate() {
@@ -399,7 +406,10 @@ mod tests {
         let mut cur = [103u8, 102, 102, 255];
         hold::rgba_mean(&mut cur, &prev, &mut mean, 8, 12);
         assert_eq!(cur, prev, "L1 7 < 8 holds");
-        assert!(hold::mean_round(mean[0]) == 100, "mean moves 1/8 of 3: rounds to 100");
+        assert!(
+            hold::mean_round(mean[0]) == 100,
+            "mean moves 1/8 of 3: rounds to 100"
+        );
         let mut m = mean;
         for _ in 0..40 {
             let mut c = [106u8, 106, 106, 255];
@@ -441,8 +451,14 @@ mod tests {
 
     #[test]
     fn plane_geometry() {
-        assert_eq!(planes(Chroma::C420, 5, 3), vec![(0, 5, 3), (15, 3, 2), (21, 3, 2)]);
-        assert_eq!(planes(Chroma::C444, 4, 2), vec![(0, 4, 2), (8, 4, 2), (16, 4, 2)]);
+        assert_eq!(
+            planes(Chroma::C420, 5, 3),
+            vec![(0, 5, 3), (15, 3, 2), (21, 3, 2)]
+        );
+        assert_eq!(
+            planes(Chroma::C444, 4, 2),
+            vec![(0, 4, 2), (8, 4, 2), (16, 4, 2)]
+        );
         assert_eq!(planes(Chroma::Mono, 4, 2), vec![(0, 4, 2)]);
     }
 

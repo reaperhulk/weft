@@ -4,8 +4,8 @@
 #[allow(unused_imports)]
 use fearless_simd::prelude::*;
 use fearless_simd::{
-    f32x16, f32x8, i16x32, i32x16, i32x8, mask16x32, mask32x16, u16x32, u32x16, u32x8, u8x16, u8x64,
-    Level, Simd,
+    f32x16, f32x8, i16x32, i32x16, i32x8, mask16x32, mask32x16, u16x32, u32x16, u32x8, u8x16,
+    u8x64, Level, Simd,
 };
 use std::sync::OnceLock;
 
@@ -942,7 +942,14 @@ fn mean_round64<S: Simd>(simd: S, lo: i16x32<S>, hi: i16x32<S>) -> u8x64<S> {
 
 /// `--hold` with a running mean, packed RGBA (see `input::hold::rgba_mean`).
 /// `mean` is one i16 per byte of `cur`. Result stored to `cur` and `prev`.
-pub fn hold_rgba_mean(level: Level, cur: &mut [u8], prev: &mut [u8], mean: &mut [i16], t: u32, tmax: u32) {
+pub fn hold_rgba_mean(
+    level: Level,
+    cur: &mut [u8],
+    prev: &mut [u8],
+    mean: &mut [i16],
+    t: u32,
+    tmax: u32,
+) {
     fearless_simd::dispatch!(level, simd => hold_rgba_mean_impl(simd, cur, prev, mean, t, tmax))
 }
 
@@ -985,7 +992,14 @@ fn hold_rgba_mean_impl<S: Simd>(
 }
 
 /// `--hold` with a running mean, planar samples.
-pub fn hold_planes_mean(level: Level, cur: &mut [u8], prev: &mut [u8], mean: &mut [i16], t: u8, tmax: u8) {
+pub fn hold_planes_mean(
+    level: Level,
+    cur: &mut [u8],
+    prev: &mut [u8],
+    mean: &mut [i16],
+    t: u8,
+    tmax: u8,
+) {
     fearless_simd::dispatch!(level, simd => hold_planes_mean_impl(simd, cur, prev, mean, t, tmax))
 }
 
@@ -1044,7 +1058,14 @@ pub fn smooth_rgba_row(level: Level, padded: &[u8], w: usize, y: usize, s: u32, 
 }
 
 #[inline(always)]
-fn smooth_rgba_row_impl<S: Simd>(simd: S, padded: &[u8], w: usize, y: usize, s: u32, out: &mut [u8]) {
+fn smooth_rgba_row_impl<S: Simd>(
+    simd: S,
+    padded: &[u8],
+    w: usize,
+    y: usize,
+    s: u32,
+    out: &mut [u8],
+) {
     use crate::input::smooth::{PAD, WIN};
     let pw = w + 2 * PAD;
     let sv = i32x16::splat(simd, s as i32);
@@ -1081,7 +1102,8 @@ fn smooth_rgba_row_impl<S: Simd>(simd: S, padded: &[u8], w: usize, y: usize, s: 
             | (g.bitcast::<u32x16<S>>() << 8u32)
             | (b.bitcast::<u32x16<S>>() << 16u32)
             | (c & alpha_mask);
-        px.bitcast::<u8x64<S>>().store_slice(&mut out[x * 4..x * 4 + 64]);
+        px.bitcast::<u8x64<S>>()
+            .store_slice(&mut out[x * 4..x * 4 + 64]);
         x += 16;
     }
     if x < w {
@@ -1131,7 +1153,14 @@ pub fn smooth_plane_row(level: Level, padded: &[u8], w: usize, y: usize, t: u8, 
 }
 
 #[inline(always)]
-fn smooth_plane_row_impl<S: Simd>(simd: S, padded: &[u8], w: usize, y: usize, t: u8, out: &mut [u8]) {
+fn smooth_plane_row_impl<S: Simd>(
+    simd: S,
+    padded: &[u8],
+    w: usize,
+    y: usize,
+    t: u8,
+    out: &mut [u8],
+) {
     use crate::input::smooth::{PAD, WIN};
     let pw = w + 2 * PAD;
     let tv = u8x64::splat(simd, t);
@@ -1224,7 +1253,10 @@ mod hold_mean_smooth_tests {
             cur[i] = cur[i].wrapping_add(50);
         }
         cur[3] = 0; // one alpha change
-        let mean: Vec<i16> = base.iter().map(|&b| (b as i16) << hold::MEAN_SHIFT).collect();
+        let mean: Vec<i16> = base
+            .iter()
+            .map(|&b| (b as i16) << hold::MEAN_SHIFT)
+            .collect();
         let mut mean_j = mean.clone();
         for (k, m) in mean_j.iter_mut().enumerate() {
             *m += ((k % 7) as i16 - 3) * 40; // off-centre means
@@ -1244,7 +1276,10 @@ mod hold_mean_smooth_tests {
         let n = 300; // 4 vectors + tail
         let base = noise(n, 3);
         let cur = jitter(&base, 4, 4);
-        let mut mean_j: Vec<i16> = base.iter().map(|&b| (b as i16) << hold::MEAN_SHIFT).collect();
+        let mut mean_j: Vec<i16> = base
+            .iter()
+            .map(|&b| (b as i16) << hold::MEAN_SHIFT)
+            .collect();
         for (k, m) in mean_j.iter_mut().enumerate() {
             *m += ((k % 5) as i16 - 2) * 30;
         }
@@ -1263,7 +1298,13 @@ mod hold_mean_smooth_tests {
         let base: Vec<u8> = (0..w * h * 4)
             .map(|i| {
                 let (x, ch) = ((i / 4) % w, i % 4);
-                if ch == 3 { 255 } else if x < 40 { 90 } else { 170 }
+                if ch == 3 {
+                    255
+                } else if x < 40 {
+                    90
+                } else {
+                    170
+                }
             })
             .collect();
         let mut frame = jitter(&base, 5, 5);
@@ -1284,7 +1325,9 @@ mod hold_mean_smooth_tests {
     #[test]
     fn smooth_plane_row_matches_scalar() {
         let (w, h) = (150usize, 7usize); // 2 vectors + 22 tail
-        let base: Vec<u8> = (0..w * h).map(|i| if i % w < 70 { 60 } else { 200 }).collect();
+        let base: Vec<u8> = (0..w * h)
+            .map(|i| if i % w < 70 { 60 } else { 200 })
+            .collect();
         let frame = jitter(&base, 6, 4);
         let mut pad = Vec::new();
         smooth::pad(&frame, w, h, 1, &mut pad);
