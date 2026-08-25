@@ -184,7 +184,9 @@ pub mod hold {
             .iter_mut()
             .zip(prev.as_chunks::<4>().0)
         {
-            let d = c[0].abs_diff(p[0]) as u32 + c[1].abs_diff(p[1]) as u32 + c[2].abs_diff(p[2]) as u32;
+            let d = c[0].abs_diff(p[0]) as u32
+                + c[1].abs_diff(p[1]) as u32
+                + c[2].abs_diff(p[2]) as u32;
             if d < t && c[3] == p[3] {
                 *c = *p;
             }

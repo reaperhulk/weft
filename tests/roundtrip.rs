@@ -472,8 +472,15 @@ fn hold_folds_noisy_static_frames() {
     raw.extend(std::iter::repeat_n([200u8, 10, 10, 255], w * h).flatten());
     let plain = decode_gif(&run_weft(&["--size", "32x32", "--fps", "10"], &raw));
     assert!(plain.frames.len() > 2, "noise should keep frames distinct");
-    let held = decode_gif(&run_weft(&["--size", "32x32", "--fps", "10", "--hold", "8"], &raw));
+    let held = decode_gif(&run_weft(
+        &["--size", "32x32", "--fps", "10", "--hold", "8"],
+        &raw,
+    ));
     assert_eq!(held.frames.len(), 2, "held frames fold into one");
     assert_eq!(held.frames[0].1, 40, "4 x 10cs");
-    assert_eq!(held.frames[1].0[..3], [200, 10, 10], "large change passes through");
+    assert_eq!(
+        held.frames[1].0[..3],
+        [200, 10, 10],
+        "large change passes through"
+    );
 }
