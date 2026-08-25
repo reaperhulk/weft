@@ -484,3 +484,37 @@ fn hold_folds_noisy_static_frames() {
         "large change passes through"
     );
 }
+
+#[test]
+fn smooth_flattens_grain_and_keeps_edges() {
+    // Two halves of different colours with +-2 grain on every pixel and
+    // a fresh grain roll per frame. --smooth alone makes each frame flat
+    // (so the two frames become identical and fold); the edge between
+    // the halves must stay exactly where it was.
+    let (w, h) = (32usize, 16usize);
+    let mut raw = Vec::new();
+    let mut seed = 0x1234_5678u32;
+    for _ in 0..2 {
+        for y in 0..h {
+            for x in 0..w {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let g = ((seed >> 24) % 5) as u8; // 0..4 -> -2..+2
+                let base: [u8; 3] = if x < 16 { [60, 120, 180] } else { [200, 80, 40] };
+                raw.extend_from_slice(&[base[0] + g - 2, base[1] + g - 2, base[2] + g - 2, 255]);
+                let _ = y;
+            }
+        }
+    }
+    let plain = decode_gif(&run_weft(&["--size", "32x16", "--fps", "10"], &raw));
+    assert_eq!(plain.frames.len(), 2, "grain keeps the frames distinct");
+    let smooth = decode_gif(&run_weft(&["--size", "32x16", "--fps", "10", "--smooth", "24"], &raw));
+    assert_eq!(smooth.frames.len(), 1, "smoothed frames are identical and fold");
+    let f = &smooth.frames[0].0;
+    for y in 0..h {
+        for x in 0..w {
+            let px = &f[(y * w + x) * 3..(y * w + x) * 3 + 3];
+            let want: [u8; 3] = if x < 16 { [60, 120, 180] } else { [200, 80, 40] };
+            assert_eq!(px, &want, "({x},{y})");
+        }
+    }
+}

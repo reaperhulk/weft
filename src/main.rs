@@ -32,6 +32,7 @@ struct Args {
     loop_count: Option<u16>,
     lossy: u32,
     hold: u32,
+    smooth: u32,
     threads: Option<usize>,
     stats: bool,
 }
@@ -71,11 +72,16 @@ options:
                      encoding of the quantized frames; ~30 is subtle and
                      much smaller on dithered content)
   --hold N           temporal hold, 0-765 (default: 0 = off): a pixel
-                     that moves by less than N (|dR|+|dG|+|dB|) from its
-                     value in the previous frame keeps that value, so
-                     source noise on static regions stops re-rolling the
-                     palette pick every frame. ~8-12 is invisible and
-                     much smaller on compressed-video input
+                     that stays within N (|dR|+|dG|+|dB|) of its running
+                     mean, and within 1.5N of its held value, keeps that
+                     value, so source noise on static regions stops
+                     re-rolling the palette pick every frame. ~8-12 is
+                     invisible and much smaller on compressed-video input
+  --smooth N         spatial grain filter, 0-765 (default: 0 = off): each
+                     pixel becomes the mean of its 5x5 neighbours within
+                     N (|dR|+|dG|+|dB|); edges are excluded so outlines
+                     stay crisp. ~24 removes film grain and codec noise,
+                     which then also stops defeating --hold
   --no-loop          play once (no NETSCAPE extension)
   --threads N        worker threads             (default: all cores)
   --stats            print timing breakdown to stderr
@@ -92,6 +98,7 @@ fn parse_args() -> Result<Args, String> {
         loop_count: Some(0),
         lossy: 0,
         hold: 0,
+        smooth: 0,
         threads: None,
         stats: false,
     };
@@ -165,6 +172,12 @@ fn parse_args() -> Result<Args, String> {
                 a.hold = val("--hold")?.parse().map_err(|_| "bad --hold")?;
                 if a.hold > 765 {
                     return Err("--hold must be 0-765".into());
+                }
+            }
+            "--smooth" => {
+                a.smooth = val("--smooth")?.parse().map_err(|_| "bad --smooth")?;
+                if a.smooth > 765 {
+                    return Err("--smooth must be 0-765".into());
                 }
             }
             "--no-loop" => a.loop_count = None,
@@ -351,8 +364,40 @@ fn run(args: &Args) -> io::Result<()> {
     let (read_res, mut indexed_frames, any_alpha) = std::thread::scope(|scope| {
         let meta_ref = &meta;
         let hold = args.hold;
+        let smooth = args.smooth;
         let level = simdops::level();
+        // ---- prefilter pipeline ------------------------------------------
+        // --smooth and --hold run as pipeline stages between the reader and
+        // the histogram pass, so nothing but the read() itself sits on the
+        // reader thread. Smoothing is frame-independent and runs on a small
+        // pool (whole frames per task: the per-row rayon form measured 5x
+        // slower under contention with the histogram workers); the hold
+        // carries state from frame to frame, so one thread applies it in
+        // sequence order, reordering the pool's output as needed. Every
+        // stage hands frames on through bounded channels; the main thread
+        // sorts by index afterwards, so only the hold's order matters.
+        let geom = meta_ref.chroma.map(|c| input::planes(c, w, h));
+        // pool size: the filter costs ~1.5 ms per 480x360 frame, about the
+        // read itself; a quarter of the workers keeps it off the critical
+        // path without starving the histogram (5 measured best on 40 vCPUs)
+        let smoothers = if smooth > 0 { (nthreads / 4).clamp(1, 6) } else { 0 };
+        let staged = smooth > 0 || hold > 0;
+        let stage_cap = 2 * smoothers.max(1);
+        let (stx, srx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(stage_cap);
+        let (htx, hrx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(stage_cap);
+        let srx = std::sync::Arc::new(Mutex::new(srx));
+        let smooth_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // the reader feeds the first live stage
+        let reader_tx = if smoothers > 0 {
+            stx.clone()
+        } else if staged {
+            htx.clone()
+        } else {
+            tx.clone()
+        };
+        drop(stx);
         let reader_handle = scope.spawn(move || -> io::Result<usize> {
+            let tx = reader_tx;
             // On a fast source (tmpfs, a pipe from a decoder already
             // ahead of us) most of the reader's time is page-faulting the
             // fresh buffer for each frame, not copying into it. A helper
@@ -379,10 +424,6 @@ fn run(args: &Args) -> io::Result<()> {
                 }
             });
             let mut n = 0usize;
-            // --hold reference: the previous frame after holding. One
-            // frame of extra residency; the compare-and-copy runs on the
-            // reader thread, overlapped with the histogram pass.
-            let mut held_prev: Vec<u8> = Vec::new();
             let res = (|| {
                 loop {
                     let buf = brx.recv().expect("prefault thread died");
@@ -391,27 +432,7 @@ fn run(args: &Args) -> io::Result<()> {
                         Source::Rgba(r) => input::read_rgba_frame(r, buf)?,
                     };
                     match frame {
-                        Some(mut f) => {
-                            if hold > 0 {
-                                let is_yuv = matches!(f, Frame::Yuv(_));
-                                let buf = match &mut f {
-                                    Frame::Rgba(b) | Frame::Rgb(b) | Frame::Yuv(b) => b,
-                                };
-                                if n > 0 {
-                                    if is_yuv {
-                                        simdops::hold_planes(
-                                            level,
-                                            buf,
-                                            &mut held_prev,
-                                            input::hold::plane_threshold(hold),
-                                        );
-                                    } else {
-                                        simdops::hold_rgba(level, buf, &mut held_prev, hold);
-                                    }
-                                } else {
-                                    held_prev = buf.clone();
-                                }
-                            }
+                        Some(f) => {
                             if tx.send((n, f)).is_err() {
                                 break; // consumer died; its error surfaces below
                             }
@@ -426,6 +447,100 @@ fn run(args: &Args) -> io::Result<()> {
             prefault.join().expect("prefault thread panicked");
             res
         });
+        for _ in 0..smoothers {
+            let srx = srx.clone();
+            let htx = htx.clone();
+            let geom = geom.clone();
+            let smooth_ns = smooth_ns.clone();
+            scope.spawn(move || {
+                let mut scratch: Vec<u8> = Vec::new();
+                let t_plane = input::hold::plane_threshold(smooth);
+                loop {
+                    let item = srx.lock().unwrap().recv();
+                    let Ok((i, mut f)) = item else { break };
+                    let t = Instant::now();
+                    let buf = match &mut f {
+                        Frame::Rgba(b) | Frame::Rgb(b) | Frame::Yuv(b) => b,
+                    };
+                    match &geom {
+                        Some(g) => input::smooth::planes(level, buf, g, t_plane, &mut scratch),
+                        None => input::smooth::rgba(level, buf, w, h, smooth, &mut scratch),
+                    }
+                    smooth_ns.fetch_add(
+                        t.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    if htx.send((i, f)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(htx);
+        drop(srx);
+        let hold_handle = staged.then(|| {
+            let tx = tx.clone();
+            scope.spawn(move || -> std::time::Duration {
+                let is_yuv = geom.is_some();
+                let (t, tmax) = if is_yuv {
+                    (
+                        input::hold::plane_threshold(hold) as u32,
+                        input::hold::plane_threshold(input::hold::max_deviation(hold)) as u32,
+                    )
+                } else {
+                    (hold, input::hold::max_deviation(hold))
+                };
+                let mut held_prev: Vec<u8> = Vec::new();
+                let mut held_mean: Vec<i16> = Vec::new();
+                let mut pending: std::collections::BTreeMap<usize, Frame> =
+                    std::collections::BTreeMap::new();
+                let mut next = 0usize;
+                let mut t_hold = std::time::Duration::ZERO;
+                while let Ok((i, f)) = hrx.recv() {
+                    pending.insert(i, f);
+                    while let Some(mut f) = pending.remove(&next) {
+                        if hold > 0 {
+                            let ts = Instant::now();
+                            let buf = match &mut f {
+                                Frame::Rgba(b) | Frame::Rgb(b) | Frame::Yuv(b) => b,
+                            };
+                            if next == 0 {
+                                held_prev = buf.clone();
+                                held_mean = buf
+                                    .iter()
+                                    .map(|&v| (v as i16) << input::hold::MEAN_SHIFT)
+                                    .collect();
+                            } else if is_yuv {
+                                simdops::hold_planes_mean(
+                                    level,
+                                    buf,
+                                    &mut held_prev,
+                                    &mut held_mean,
+                                    t as u8,
+                                    tmax as u8,
+                                );
+                            } else {
+                                simdops::hold_rgba_mean(
+                                    level,
+                                    buf,
+                                    &mut held_prev,
+                                    &mut held_mean,
+                                    t,
+                                    tmax,
+                                );
+                            }
+                            t_hold += ts.elapsed();
+                        }
+                        if tx.send((next, f)).is_err() {
+                            return t_hold;
+                        }
+                        next += 1;
+                    }
+                }
+                t_hold
+            })
+        });
+        drop(tx);
         let mut frames: Vec<(usize, Frame)> = Vec::new();
         let mut any_alpha = false;
         let (mut row1, mut keys1) = (vec![0u8; w * 4], vec![0u32; w]);
@@ -580,13 +695,16 @@ fn run(args: &Args) -> io::Result<()> {
                 pool.push(r.runs);
             }
         }
-        (
-            reader_handle.join().expect("reader thread panicked"),
-            frames,
-            any_alpha,
-        )
+        let read_res = reader_handle.join().expect("reader thread panicked");
+        let t_hold = hold_handle
+            .map(|h| h.join().expect("hold thread panicked"))
+            .unwrap_or_default();
+        let t_smooth = std::time::Duration::from_nanos(
+            smooth_ns.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        (read_res.map(|n| (n, t_smooth, t_hold)), frames, any_alpha)
     });
-    let nread = read_res?;
+    let (nread, t_smooth, t_hold) = read_res?;
     if indexed_frames.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -813,8 +931,10 @@ fn run(args: &Args) -> io::Result<()> {
             stdout.written
         );
         eprintln!(
-            "  read+hist {:?} (hist span {:?})  palette+lut {:?}  quantize+lzw {:?}  mux+write {:?}  total {:?}",
-            t_read, t_hist, t_pal, t_qlzw, t_mux, t0.elapsed()
+            "  read+hist {:?} (hist span {:?}; prefilter cpu: smooth {:?} hold {:?})  palette+lut {:?}  quantize+lzw {:?}  mux+write {:?}  total {:?}",
+            t_read, t_hist,
+            t_smooth,
+            t_hold, t_pal, t_qlzw, t_mux, t0.elapsed()
         );
     }
     Ok(())
