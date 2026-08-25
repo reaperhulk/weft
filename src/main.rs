@@ -351,6 +351,7 @@ fn run(args: &Args) -> io::Result<()> {
     let (read_res, mut indexed_frames, any_alpha) = std::thread::scope(|scope| {
         let meta_ref = &meta;
         let hold = args.hold;
+        let level = simdops::level();
         let reader_handle = scope.spawn(move || -> io::Result<usize> {
             // On a fast source (tmpfs, a pipe from a decoder already
             // ahead of us) most of the reader's time is page-faulting the
@@ -398,15 +399,15 @@ fn run(args: &Args) -> io::Result<()> {
                                 };
                                 if n > 0 {
                                     if is_yuv {
-                                        input::hold::planes(
+                                        simdops::hold_planes(
+                                            level,
                                             buf,
-                                            &held_prev,
+                                            &mut held_prev,
                                             input::hold::plane_threshold(hold),
                                         );
                                     } else {
-                                        input::hold::rgba(buf, &held_prev, hold);
+                                        simdops::hold_rgba(level, buf, &mut held_prev, hold);
                                     }
-                                    held_prev.copy_from_slice(buf);
                                 } else {
                                     held_prev = buf.clone();
                                 }

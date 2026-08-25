@@ -170,9 +170,11 @@ pub fn read_rgba_frame(r: &mut impl Read, buf: Vec<u8>) -> io::Result<Option<Fra
 /// small (about 8–12 for RGB L1).
 ///
 /// `cur` is rewritten in place and then *is* the reference for the next
-/// frame (the caller copies it into `prev`): a pixel that holds stays at
-/// the reference value, a pixel that moves becomes the new reference, so
-/// drift can never accumulate beyond one threshold.
+/// frame: a pixel that holds stays at the reference value, a pixel that
+/// moves becomes the new reference, so drift can never accumulate beyond
+/// one threshold. These are the scalar reference kernels; the reader
+/// uses the SIMD versions in `simdops` (which also mirror the result into
+/// the reference buffer) and falls back to these for vector tails.
 pub mod hold {
     /// RGBA frames: hold a pixel when the L1 distance over RGB to the
     /// reference is below `t` and alpha is unchanged.
