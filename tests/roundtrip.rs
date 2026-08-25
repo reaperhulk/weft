@@ -499,7 +499,11 @@ fn smooth_flattens_grain_and_keeps_edges() {
             for x in 0..w {
                 seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                 let g = ((seed >> 24) % 5) as u8; // 0..4 -> -2..+2
-                let base: [u8; 3] = if x < 16 { [60, 120, 180] } else { [200, 80, 40] };
+                let base: [u8; 3] = if x < 16 {
+                    [60, 120, 180]
+                } else {
+                    [200, 80, 40]
+                };
                 raw.extend_from_slice(&[base[0] + g - 2, base[1] + g - 2, base[2] + g - 2, 255]);
                 let _ = y;
             }
@@ -509,14 +513,24 @@ fn smooth_flattens_grain_and_keeps_edges() {
     assert_eq!(plain.frames.len(), 2, "grain keeps the frames distinct");
     // smoothing alone: every pixel within 1 of its fill colour (the 5x5
     // mean of +-2 grain), edge column exact
-    let smooth = decode_gif(&run_weft(&["--size", "32x16", "--fps", "10", "--smooth", "24"], &raw));
+    let smooth = decode_gif(&run_weft(
+        &["--size", "32x16", "--fps", "10", "--smooth", "24"],
+        &raw,
+    ));
     for (fi, (f, _)) in smooth.frames.iter().enumerate() {
         for y in 0..h {
             for x in 0..w {
                 let px = &f[(y * w + x) * 3..(y * w + x) * 3 + 3];
-                let want: [u8; 3] = if x < 16 { [60, 120, 180] } else { [200, 80, 40] };
+                let want: [u8; 3] = if x < 16 {
+                    [60, 120, 180]
+                } else {
+                    [200, 80, 40]
+                };
                 for c in 0..3 {
-                    assert!(px[c].abs_diff(want[c]) <= 1, "frame {fi} ({x},{y}): {px:?} vs {want:?}");
+                    assert!(
+                        px[c].abs_diff(want[c]) <= 1,
+                        "frame {fi} ({x},{y}): {px:?} vs {want:?}"
+                    );
                 }
             }
         }
@@ -524,7 +538,9 @@ fn smooth_flattens_grain_and_keeps_edges() {
     // with the hold on top, the residual +-1 is inside the window and the
     // two frames fold into one
     let both = decode_gif(&run_weft(
-        &["--size", "32x16", "--fps", "10", "--smooth", "24", "--hold", "8"],
+        &[
+            "--size", "32x16", "--fps", "10", "--smooth", "24", "--hold", "8",
+        ],
         &raw,
     ));
     assert_eq!(both.frames.len(), 1, "smoothed + held frames fold");

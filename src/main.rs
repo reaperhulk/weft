@@ -380,7 +380,11 @@ fn run(args: &Args) -> io::Result<()> {
         // pool size: the filter costs ~1.5 ms per 480x360 frame, about the
         // read itself; a quarter of the workers keeps it off the critical
         // path without starving the histogram (5 measured best on 40 vCPUs)
-        let smoothers = if smooth > 0 { (nthreads / 4).clamp(1, 6) } else { 0 };
+        let smoothers = if smooth > 0 {
+            (nthreads / 4).clamp(1, 6)
+        } else {
+            0
+        };
         let staged = smooth > 0 || hold > 0;
         let stage_cap = 2 * smoothers.max(1);
         let (stx, srx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(stage_cap);
@@ -699,9 +703,8 @@ fn run(args: &Args) -> io::Result<()> {
         let t_hold = hold_handle
             .map(|h| h.join().expect("hold thread panicked"))
             .unwrap_or_default();
-        let t_smooth = std::time::Duration::from_nanos(
-            smooth_ns.load(std::sync::atomic::Ordering::Relaxed),
-        );
+        let t_smooth =
+            std::time::Duration::from_nanos(smooth_ns.load(std::sync::atomic::Ordering::Relaxed));
         (read_res.map(|n| (n, t_smooth, t_hold)), frames, any_alpha)
     });
     let (nread, t_smooth, t_hold) = read_res?;
