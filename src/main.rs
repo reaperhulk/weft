@@ -32,7 +32,8 @@ struct Args {
     loop_count: Option<u16>,
     lossy: u32,
     hold: u32,
-    smooth: u32,
+    /// None = not given: `--dither auto` then defaults it to 16
+    smooth: Option<u32>,
     threads: Option<usize>,
     stats: bool,
 }
@@ -61,7 +62,8 @@ options:
                      (default: bluenoise, which is fast, temporally
                      stable, and compresses well; auto is bluenoise only
                      in 32x32 tiles where the nearest-colour map shows
-                     banding contours, plain nearest colour elsewhere;
+                     banding contours, plain nearest colour elsewhere,
+                     and implies --smooth 16 unless --smooth is given;
                      sierra2 error diffusion has slightly higher visual
                      quality but is slower and shimmers frame-to-frame)
   --dither-gate N    activity gate for bluenoise, 0-720 (default: 16;
@@ -79,11 +81,12 @@ options:
                      value, so source noise on static regions stops
                      re-rolling the palette pick every frame. ~8-12 is
                      invisible and much smaller on compressed-video input
-  --smooth N         spatial grain filter, 0-765 (default: 0 = off): each
-                     pixel becomes the mean of its 5x5 neighbours within
-                     N (|dR|+|dG|+|dB|); edges are excluded so outlines
-                     stay crisp. ~24 removes film grain and codec noise,
-                     which then also stops defeating --hold
+  --smooth N         spatial grain filter, 0-765 (default: 0 = off, or
+                     16 with --dither auto): each pixel becomes the mean
+                     of its 5x5 neighbours within N (|dR|+|dG|+|dB|);
+                     edges are excluded so outlines stay crisp. ~16-24
+                     removes film grain and codec noise, which otherwise
+                     defeats --hold and misleads the auto dither gate
   --no-loop          play once (no NETSCAPE extension)
   --threads N        worker threads             (default: all cores)
   --stats            print timing breakdown to stderr
@@ -100,7 +103,7 @@ fn parse_args() -> Result<Args, String> {
         loop_count: Some(0),
         lossy: 0,
         hold: 0,
-        smooth: 0,
+        smooth: None,
         threads: None,
         stats: false,
     };
@@ -178,10 +181,11 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--smooth" => {
-                a.smooth = val("--smooth")?.parse().map_err(|_| "bad --smooth")?;
-                if a.smooth > 765 {
+                let v: u32 = val("--smooth")?.parse().map_err(|_| "bad --smooth")?;
+                if v > 765 {
                     return Err("--smooth must be 0-765".into());
                 }
+                a.smooth = Some(v);
             }
             "--no-loop" => a.loop_count = None,
             "--threads" => {
@@ -367,7 +371,14 @@ fn run(args: &Args) -> io::Result<()> {
     let (read_res, mut indexed_frames, any_alpha) = std::thread::scope(|scope| {
         let meta_ref = &meta;
         let hold = args.hold;
-        let smooth = args.smooth;
+        // --dither auto reads structure off the nearest-colour map, and on
+        // grainy input that structure is grain: fills split into blobs
+        // that pass for banding contours and the gate fires everywhere.
+        // Smoothing first is what makes the map meaningful, so auto
+        // defaults it on (16: safe on live action) unless given explicitly.
+        let smooth = args
+            .smooth
+            .unwrap_or(if args.dither == Dither::Auto { 16 } else { 0 });
         let level = simdops::level();
         // ---- prefilter pipeline ------------------------------------------
         // --smooth and --hold run as pipeline stages between the reader and
