@@ -3,7 +3,10 @@
 
 #[allow(unused_imports)]
 use fearless_simd::prelude::*;
-use fearless_simd::{f32x16, f32x8, i32x16, i32x8, u32x16, u32x8, u8x16, u8x64, Level, Simd};
+use fearless_simd::{
+    f32x16, f32x8, i16x32, i32x16, i32x8, mask16x32, mask32x16, u16x32, u32x16, u32x8, u8x16, u8x64,
+    Level, Simd,
+};
 use std::sync::OnceLock;
 
 /// Runtime-detected SIMD level, cached (feature detection once).
@@ -560,6 +563,21 @@ fn sad3<S: Simd>(simd: S, a: u32x16<S>, b: u32x16<S>) -> i32x16<S> {
     ((d & ff) + ((d >> 8u32) & ff) + ((d >> 16u32) & ff)).bitcast()
 }
 
+/// Summed absolute difference over all four bytes of two packed pixels
+/// (alpha included): where alpha is constant this equals `sad3`; where it
+/// changes the difference simply adds to the distance, which is the
+/// intended effect for the prefilters (a pixel whose alpha moved is not
+/// "the same" pixel) and saves the separate alpha compare.
+#[inline(always)]
+fn sad4<S: Simd>(simd: S, a: u32x16<S>, b: u32x16<S>) -> i32x16<S> {
+    let ab = a.bitcast::<u8x64<S>>();
+    let bb = b.bitcast::<u8x64<S>>();
+    let d = (ab.max(bb) - ab.min(bb)).bitcast::<u32x16<S>>();
+    let m = u32x16::splat(simd, 0x00FF_00FF);
+    let pairs = (d & m) + ((d >> 8u32) & m); // r+g in low 16, b+a in high 16
+    ((pairs & u32x16::splat(simd, 0xFFFF)) + (pairs >> 16u32)).bitcast()
+}
+
 /// Scalar `bn_activity` for one pixel (vector-loop edges and tails; also
 /// the reference the parity tests check the lanes against). `g64` is
 /// `gate + 64`.
@@ -885,66 +903,300 @@ mod tests {
     }
 }
 
-/// `--hold` for packed RGBA: hold a pixel at its `prev` value when the
-/// RGB L1 distance is below `t` and alpha is unchanged (see
-/// `input::hold`). Rewrites `cur` in place and mirrors the result into
-/// `prev` in the same pass, so the reference for the next frame costs one
-/// extra store stream instead of a separate full-frame copy. Runs on the
-/// serial reader thread, so it has to be cheap.
-pub fn hold_rgba(level: Level, cur: &mut [u8], prev: &mut [u8], t: u32) {
-    fearless_simd::dispatch!(level, simd => hold_rgba_impl(simd, cur, prev, t))
+// ---------------------------------------------------------------------------
+// --hold with running mean, and --smooth (see input::hold / input::smooth)
+
+use crate::input::hold::{MEAN_RATE, MEAN_SHIFT};
+
+/// A per-pixel 32-bit mask widened to the 16-bit-lane layout of the
+/// running mean (4 lanes per pixel): bytes of the mask are 0xFF/0, so
+/// after widening each u16 lane is 0x00FF/0 and an equality test gives
+/// the full-width lane mask.
+#[inline(always)]
+fn widen_mask<S: Simd>(simd: S, m: mask32x16<S>) -> (mask16x32<S>, mask16x32<S>) {
+    let bytes: u8x64<S> = m
+        .select(u32x16::splat(simd, u32::MAX), u32x16::splat(simd, 0))
+        .bitcast();
+    let (lo, hi): (u16x32<S>, u16x32<S>) = bytes.widen();
+    let ff = u16x32::splat(simd, 0xFF);
+    (lo.simd_eq(ff), hi.simd_eq(ff))
+}
+
+/// Mean update for 32 lanes: while held, m += (cur7 - m) >> 3; on reset
+/// m = cur7 (cur7 = sample << 7).
+#[inline(always)]
+fn mean_step<S: Simd>(cur: u16x32<S>, m: i16x32<S>, keep: mask16x32<S>) -> i16x32<S> {
+    let cur7: i16x32<S> = (cur << MEAN_SHIFT).bitcast();
+    let tracked = m + ((cur7 - m) >> MEAN_RATE);
+    keep.select(tracked, cur7)
+}
+
+/// Rounded 8-bit value of 64 lanes of 8.7 mean (two vectors).
+#[inline(always)]
+fn mean_round64<S: Simd>(simd: S, lo: i16x32<S>, hi: i16x32<S>) -> u8x64<S> {
+    let half = i16x32::splat(simd, 1 << (MEAN_SHIFT - 1));
+    let r_lo: u16x32<S> = ((lo + half) >> MEAN_SHIFT).bitcast();
+    let r_hi: u16x32<S> = ((hi + half) >> MEAN_SHIFT).bitcast();
+    r_lo.narrow(r_hi)
+}
+
+/// `--hold` with a running mean, packed RGBA (see `input::hold::rgba_mean`).
+/// `mean` is one i16 per byte of `cur`. Result stored to `cur` and `prev`.
+pub fn hold_rgba_mean(level: Level, cur: &mut [u8], prev: &mut [u8], mean: &mut [i16], t: u32, tmax: u32) {
+    fearless_simd::dispatch!(level, simd => hold_rgba_mean_impl(simd, cur, prev, mean, t, tmax))
 }
 
 #[inline(always)]
-fn hold_rgba_impl<S: Simd>(simd: S, cur: &mut [u8], prev: &mut [u8], t: u32) {
-    debug_assert_eq!(cur.len(), prev.len());
+fn hold_rgba_mean_impl<S: Simd>(
+    simd: S,
+    cur: &mut [u8],
+    prev: &mut [u8],
+    mean: &mut [i16],
+    t: u32,
+    tmax: u32,
+) {
     let n = cur.len() / 4;
     let tv = i32x16::splat(simd, t as i32);
-    let zero = i32x16::splat(simd, 0);
+    let tmv = i32x16::splat(simd, tmax as i32);
     let mut i = 0usize;
     while i + 16 <= n {
         let a = px16(simd, &cur[i * 4..]);
         let b = px16(simd, &prev[i * 4..]);
-        let close = sad3(simd, a, b).simd_lt(tv);
-        let alpha_same = ((a ^ b) >> 24u32).bitcast::<i32x16<S>>().simd_eq(zero);
-        let r = (close & alpha_same).select(b, a).bitcast::<u8x64<S>>();
+        let m_lo = i16x32::from_slice(simd, &mean[i * 4..i * 4 + 32]);
+        let m_hi = i16x32::from_slice(simd, &mean[i * 4 + 32..i * 4 + 64]);
+        let m8: u32x16<S> = mean_round64(simd, m_lo, m_hi).bitcast();
+        // alpha rides along in the L1 (the mean's alpha lane tracks the
+        // input like any other, so it contributes 0 where alpha is static)
+        let close = sad4(simd, a, m8).simd_lt(tv);
+        let near = sad4(simd, a, b).simd_lt(tmv);
+        let keep = close & near;
+        let r = keep.select(b, a).bitcast::<u8x64<S>>();
         r.store_slice(&mut cur[i * 4..i * 4 + 64]);
         r.store_slice(&mut prev[i * 4..i * 4 + 64]);
+        let (c_lo, c_hi) = a.bitcast::<u8x64<S>>().widen();
+        let (k_lo, k_hi) = widen_mask(simd, keep);
+        mean_step(c_lo, m_lo, k_lo).store_slice(&mut mean[i * 4..i * 4 + 32]);
+        mean_step(c_hi, m_hi, k_hi).store_slice(&mut mean[i * 4 + 32..i * 4 + 64]);
         i += 16;
     }
     let tail = i * 4;
-    crate::input::hold::rgba(&mut cur[tail..], &prev[tail..], t);
+    crate::input::hold::rgba_mean(&mut cur[tail..], &prev[tail..], &mut mean[tail..], t, tmax);
     prev[tail..].copy_from_slice(&cur[tail..]);
 }
 
-/// `--hold` for planar (Y4M) samples: hold each byte at its `prev` value
-/// when |diff| < t; result stored to both `cur` and `prev`.
-pub fn hold_planes(level: Level, cur: &mut [u8], prev: &mut [u8], t: u8) {
-    fearless_simd::dispatch!(level, simd => hold_planes_impl(simd, cur, prev, t))
+/// `--hold` with a running mean, planar samples.
+pub fn hold_planes_mean(level: Level, cur: &mut [u8], prev: &mut [u8], mean: &mut [i16], t: u8, tmax: u8) {
+    fearless_simd::dispatch!(level, simd => hold_planes_mean_impl(simd, cur, prev, mean, t, tmax))
 }
 
 #[inline(always)]
-fn hold_planes_impl<S: Simd>(simd: S, cur: &mut [u8], prev: &mut [u8], t: u8) {
-    debug_assert_eq!(cur.len(), prev.len());
+fn hold_planes_mean_impl<S: Simd>(
+    simd: S,
+    cur: &mut [u8],
+    prev: &mut [u8],
+    mean: &mut [i16],
+    t: u8,
+    tmax: u8,
+) {
     let n = cur.len();
     let tv = u8x64::splat(simd, t);
+    let tmv = u8x64::splat(simd, tmax);
+    let ff = u16x32::splat(simd, 0xFF);
     let mut i = 0usize;
     while i + 64 <= n {
         let a = u8x64::from_slice(simd, &cur[i..i + 64]);
         let b = u8x64::from_slice(simd, &prev[i..i + 64]);
-        let d = a.max(b) - a.min(b);
-        let r = d.simd_lt(tv).select(b, a);
+        let m_lo = i16x32::from_slice(simd, &mean[i..i + 32]);
+        let m_hi = i16x32::from_slice(simd, &mean[i + 32..i + 64]);
+        let m8 = mean_round64(simd, m_lo, m_hi);
+        let close = (a.max(m8) - a.min(m8)).simd_lt(tv);
+        let near = (a.max(b) - a.min(b)).simd_lt(tmv);
+        let keep = close & near;
+        let r = keep.select(b, a);
         r.store_slice(&mut cur[i..i + 64]);
         r.store_slice(&mut prev[i..i + 64]);
+        let (c_lo, c_hi) = a.widen();
+        let kb: u8x64<S> = keep.select(u8x64::splat(simd, 0xFF), u8x64::splat(simd, 0));
+        let (k_lo, k_hi): (u16x32<S>, u16x32<S>) = kb.widen();
+        mean_step(c_lo, m_lo, k_lo.simd_eq(ff)).store_slice(&mut mean[i..i + 32]);
+        mean_step(c_hi, m_hi, k_hi.simd_eq(ff)).store_slice(&mut mean[i + 32..i + 64]);
         i += 64;
     }
-    crate::input::hold::planes(&mut cur[i..], &prev[i..], t);
+    crate::input::hold::planes_mean(&mut cur[i..], &prev[i..], &mut mean[i..], t, tmax);
     prev[i..].copy_from_slice(&cur[i..]);
 }
 
+/// Rounded division of 16 lanes of non-negative sums by counts in
+/// 1..=25: (acc + cnt/2) / cnt, computed in f32. The quotient's
+/// fractional part is a multiple of 1/cnt >= 0.04, so a 0.01 nudge before
+/// truncation makes the result exactly the integer division despite
+/// float rounding.
+#[inline(always)]
+fn div_round16<S: Simd>(simd: S, acc: i32x16<S>, cnt: i32x16<S>, rcp: f32x16<S>) -> i32x16<S> {
+    let q = f32x16::float_from(acc + (cnt >> 1u32)) * rcp + f32x16::splat(simd, 0.01);
+    i32x16::truncate_from(q)
+}
+
+/// One output row of the range-limited 5x5 box filter, packed RGBA (see
+/// `input::smooth::rgba_row`). `padded` is the PAD-replicated frame.
+pub fn smooth_rgba_row(level: Level, padded: &[u8], w: usize, y: usize, s: u32, out: &mut [u8]) {
+    fearless_simd::dispatch!(level, simd => smooth_rgba_row_impl(simd, padded, w, y, s, out))
+}
+
+#[inline(always)]
+fn smooth_rgba_row_impl<S: Simd>(simd: S, padded: &[u8], w: usize, y: usize, s: u32, out: &mut [u8]) {
+    use crate::input::smooth::{PAD, WIN};
+    let pw = w + 2 * PAD;
+    let sv = i32x16::splat(simd, s as i32);
+    let zero_u = u32x16::splat(simd, 0);
+    let rb_mask = u32x16::splat(simd, 0x00FF_00FF);
+    let ff = u32x16::splat(simd, 0xFF);
+    let one_hi = u32x16::splat(simd, 1 << 16);
+    let lo16 = u32x16::splat(simd, 0xFFFF);
+    let alpha_mask = u32x16::splat(simd, 0xFF00_0000);
+    let mut x = 0usize;
+    while x + 16 <= w {
+        let ci = ((y + PAD) * pw + x + PAD) * 4;
+        let c = px16(simd, &padded[ci..]);
+        // r and b sums share one accumulator (each <= 25*255 fits 16
+        // bits); g shares another with the neighbour count in its high
+        // half, so a passing neighbour costs two selects and two adds
+        let mut acc_rb = zero_u;
+        let mut acc_gc = zero_u;
+        for dy in 0..WIN {
+            let base = ((y + dy) * pw + x) * 4;
+            for dx in 0..WIN {
+                let nb = px16(simd, &padded[base + dx * 4..]);
+                let ok = sad4(simd, nb, c).simd_lt(sv);
+                acc_rb += ok.select(nb & rb_mask, zero_u);
+                acc_gc += ok.select(((nb >> 8u32) & ff) | one_hi, zero_u);
+            }
+        }
+        let cnt: i32x16<S> = (acc_gc >> 16u32).bitcast();
+        let rcp = f32x16::splat(simd, 1.0) / f32x16::float_from(cnt);
+        let r = div_round16(simd, (acc_rb & lo16).bitcast(), cnt, rcp);
+        let b = div_round16(simd, (acc_rb >> 16u32).bitcast(), cnt, rcp);
+        let g = div_round16(simd, (acc_gc & lo16).bitcast(), cnt, rcp);
+        let px: u32x16<S> = r.bitcast::<u32x16<S>>()
+            | (g.bitcast::<u32x16<S>>() << 8u32)
+            | (b.bitcast::<u32x16<S>>() << 16u32)
+            | (c & alpha_mask);
+        px.bitcast::<u8x64<S>>().store_slice(&mut out[x * 4..x * 4 + 64]);
+        x += 16;
+    }
+    if x < w {
+        // scalar tail over the padded frame's remaining columns
+        let mut tmp = vec![0u8; (w - x) * 4];
+        tail_rgba(padded, w, y, x, s, &mut tmp);
+        out[x * 4..].copy_from_slice(&tmp);
+    }
+}
+
+/// Scalar tail for `smooth_rgba_row_impl`: columns x0.. of row y.
+fn tail_rgba(padded: &[u8], w: usize, y: usize, x0: usize, s: u32, out: &mut [u8]) {
+    use crate::input::smooth::{PAD, WIN};
+    let pw = w + 2 * PAD;
+    for (k, o) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let x = x0 + k;
+        let ci = ((y + PAD) * pw + x + PAD) * 4;
+        let c = &padded[ci..ci + 4];
+        let mut acc = [0u32; 3];
+        let mut cnt = 0u32;
+        for dy in 0..WIN {
+            for dx in 0..WIN {
+                let ni = ((y + dy) * pw + x + dx) * 4;
+                let n = &padded[ni..ni + 4];
+                let d = n[0].abs_diff(c[0]) as u32
+                    + n[1].abs_diff(c[1]) as u32
+                    + n[2].abs_diff(c[2]) as u32
+                    + n[3].abs_diff(c[3]) as u32;
+                if d < s {
+                    acc[0] += n[0] as u32;
+                    acc[1] += n[1] as u32;
+                    acc[2] += n[2] as u32;
+                    cnt += 1;
+                }
+            }
+        }
+        for ch in 0..3 {
+            o[ch] = ((acc[ch] + cnt / 2) / cnt) as u8;
+        }
+        o[3] = c[3];
+    }
+}
+
+/// One output row of the range-limited 5x5 box filter on a plane.
+pub fn smooth_plane_row(level: Level, padded: &[u8], w: usize, y: usize, t: u8, out: &mut [u8]) {
+    fearless_simd::dispatch!(level, simd => smooth_plane_row_impl(simd, padded, w, y, t, out))
+}
+
+#[inline(always)]
+fn smooth_plane_row_impl<S: Simd>(simd: S, padded: &[u8], w: usize, y: usize, t: u8, out: &mut [u8]) {
+    use crate::input::smooth::{PAD, WIN};
+    let pw = w + 2 * PAD;
+    let tv = u8x64::splat(simd, t);
+    let one8 = u8x64::splat(simd, 1);
+    let zero8 = u8x64::splat(simd, 0);
+    let zero16 = u16x32::splat(simd, 0);
+    let mut x = 0usize;
+    while x + 64 <= w {
+        let c = u8x64::from_slice(simd, &padded[(y + PAD) * pw + x + PAD..][..64]);
+        let mut acc_lo = zero16;
+        let mut acc_hi = zero16;
+        let mut cnt = zero8;
+        for dy in 0..WIN {
+            let base = (y + dy) * pw + x;
+            for dx in 0..WIN {
+                let nb = u8x64::from_slice(simd, &padded[base + dx..base + dx + 64]);
+                let ok = (nb.max(c) - nb.min(c)).simd_lt(tv);
+                let picked = ok.select(nb, zero8);
+                let (lo, hi) = picked.widen();
+                acc_lo += lo;
+                acc_hi += hi;
+                cnt += ok.select(one8, zero8);
+            }
+        }
+        // rounded division in four 16-lane chunks
+        let (cnt_lo, cnt_hi) = cnt.widen();
+        let mut res = [0u8; 64];
+        for (q, (acc, cn)) in [(acc_lo, cnt_lo), (acc_hi, cnt_hi)].into_iter().enumerate() {
+            let (a0, a1) = acc.widen();
+            let (n0, n1) = cn.widen();
+            for (k, (a, n)) in [(a0, n0), (a1, n1)].into_iter().enumerate() {
+                let n_i: i32x16<S> = n.bitcast();
+                let rcp = f32x16::splat(simd, 1.0) / f32x16::float_from(n_i);
+                let v = div_round16(simd, a.bitcast(), n_i, rcp);
+                let arr: [i32; 16] = v.into();
+                for (j, &val) in arr.iter().enumerate() {
+                    res[q * 32 + k * 16 + j] = val as u8;
+                }
+            }
+        }
+        out[x..x + 64].copy_from_slice(&res);
+        x += 64;
+    }
+    // scalar tail
+    for xx in x..w {
+        let c = padded[(y + PAD) * pw + xx + PAD];
+        let mut acc = 0u32;
+        let mut cnt = 0u32;
+        for dy in 0..WIN {
+            for dx in 0..WIN {
+                let n = padded[(y + dy) * pw + xx + dx];
+                if n.abs_diff(c) < t {
+                    acc += n as u32;
+                    cnt += 1;
+                }
+            }
+        }
+        out[xx] = ((acc + cnt / 2) / cnt) as u8;
+    }
+}
+
 #[cfg(test)]
-mod hold_tests {
+mod hold_mean_smooth_tests {
     use super::*;
+    use crate::input::{hold, smooth};
 
     fn noise(n: usize, seed: u32) -> Vec<u8> {
         let mut s = seed;
@@ -955,51 +1207,93 @@ mod hold_tests {
             })
             .collect()
     }
-
-    #[test]
-    fn hold_rgba_matches_scalar() {
-        // 100 pixels: 6 full vectors + a 4-pixel tail; prev = cur + small
-        // noise on most pixels, big jumps and alpha flips sprinkled in
-        let n = 100;
-        let base = noise(n * 4, 1);
-        let jit = noise(n * 4, 2);
-        let mut cur = base.clone();
-        for (i, c) in cur.iter_mut().enumerate() {
-            let j = (jit[i] % 7) as i32 - 3;
-            *c = (*c as i32 + j).clamp(0, 255) as u8;
-            if i % 37 == 0 {
-                *c = c.wrapping_add(60);
-            }
-            if i % 4 == 3 {
-                *c = if i % 41 == 3 { 0 } else { base[i] };
-            }
-        }
-        let mut prev = base.clone();
-        let mut want = cur.clone();
-        crate::input::hold::rgba(&mut want, &base, 6);
-        let mut got = cur.clone();
-        hold_rgba(level(), &mut got, &mut prev, 6);
-        assert_eq!(got, want);
-        assert_eq!(prev, want, "reference must mirror the result");
-        assert_ne!(got, cur, "test input must actually hold something");
+    fn jitter(base: &[u8], seed: u32, amp: i32) -> Vec<u8> {
+        let j = noise(base.len(), seed);
+        base.iter()
+            .zip(&j)
+            .map(|(&b, &r)| (b as i32 + (r as i32 % (2 * amp + 1)) - amp).clamp(0, 255) as u8)
+            .collect()
     }
 
     #[test]
-    fn hold_planes_matches_scalar() {
-        let n = 300; // 4 vectors + 44-byte tail
-        let base = noise(n, 3);
-        let jit = noise(n, 4);
-        let cur: Vec<u8> = base
-            .iter()
-            .zip(&jit)
-            .map(|(&b, &j)| (b as i32 + (j % 9) as i32 - 4).clamp(0, 255) as u8)
-            .collect();
-        let mut want = cur.clone();
-        crate::input::hold::planes(&mut want, &base, 3);
-        let mut got = cur.clone();
-        let mut prev = base.clone();
-        hold_planes(level(), &mut got, &mut prev, 3);
+    fn hold_rgba_mean_matches_scalar() {
+        let n = 100; // 6 vectors + 4-pixel tail
+        let base = noise(n * 4, 1);
+        let mut cur = jitter(&base, 2, 3);
+        for i in (0..n * 4).step_by(37) {
+            cur[i] = cur[i].wrapping_add(50);
+        }
+        cur[3] = 0; // one alpha change
+        let mean: Vec<i16> = base.iter().map(|&b| (b as i16) << hold::MEAN_SHIFT).collect();
+        let mut mean_j = mean.clone();
+        for (k, m) in mean_j.iter_mut().enumerate() {
+            *m += ((k % 7) as i16 - 3) * 40; // off-centre means
+        }
+        let (mut want, mut m_want) = (cur.clone(), mean_j.clone());
+        hold::rgba_mean(&mut want, &base, &mut m_want, 8, 12);
+        let (mut got, mut prev, mut m_got) = (cur.clone(), base.clone(), mean_j.clone());
+        hold_rgba_mean(level(), &mut got, &mut prev, &mut m_got, 8, 12);
         assert_eq!(got, want);
         assert_eq!(prev, want);
+        assert_eq!(m_got, m_want);
+        assert_ne!(got, cur);
+    }
+
+    #[test]
+    fn hold_planes_mean_matches_scalar() {
+        let n = 300; // 4 vectors + tail
+        let base = noise(n, 3);
+        let cur = jitter(&base, 4, 4);
+        let mut mean_j: Vec<i16> = base.iter().map(|&b| (b as i16) << hold::MEAN_SHIFT).collect();
+        for (k, m) in mean_j.iter_mut().enumerate() {
+            *m += ((k % 5) as i16 - 2) * 30;
+        }
+        let (mut want, mut m_want) = (cur.clone(), mean_j.clone());
+        hold::planes_mean(&mut want, &base, &mut m_want, 3, 5);
+        let (mut got, mut prev, mut m_got) = (cur.clone(), base.clone(), mean_j.clone());
+        hold_planes_mean(level(), &mut got, &mut prev, &mut m_got, 3, 5);
+        assert_eq!(got, want);
+        assert_eq!(prev, want);
+        assert_eq!(m_got, m_want);
+    }
+
+    #[test]
+    fn smooth_rgba_row_matches_scalar() {
+        let (w, h) = (83usize, 9usize); // 5 vectors + 3-pixel tail
+        let base: Vec<u8> = (0..w * h * 4)
+            .map(|i| {
+                let (x, ch) = ((i / 4) % w, i % 4);
+                if ch == 3 { 255 } else if x < 40 { 90 } else { 170 }
+            })
+            .collect();
+        let mut frame = jitter(&base, 5, 5);
+        for i in (3..w * h * 4).step_by(4 * 53) {
+            frame[i] = 0; // some alpha holes
+        }
+        let mut pad = Vec::new();
+        smooth::pad(&frame, w, h, 4, &mut pad);
+        for y in 0..h {
+            let mut want = vec![0u8; w * 4];
+            let mut got = vec![0u8; w * 4];
+            smooth::rgba_row(&pad, w, y, 24, &mut want);
+            smooth_rgba_row(level(), &pad, w, y, 24, &mut got);
+            assert_eq!(got, want, "row {y}");
+        }
+    }
+
+    #[test]
+    fn smooth_plane_row_matches_scalar() {
+        let (w, h) = (150usize, 7usize); // 2 vectors + 22 tail
+        let base: Vec<u8> = (0..w * h).map(|i| if i % w < 70 { 60 } else { 200 }).collect();
+        let frame = jitter(&base, 6, 4);
+        let mut pad = Vec::new();
+        smooth::pad(&frame, w, h, 1, &mut pad);
+        for y in 0..h {
+            let mut want = vec![0u8; w];
+            let mut got = vec![0u8; w];
+            smooth::plane_row(&pad, w, y, 8, &mut want);
+            smooth_plane_row(level(), &pad, w, y, 8, &mut got);
+            assert_eq!(got, want, "row {y}");
+        }
     }
 }
