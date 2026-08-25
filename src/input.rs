@@ -153,9 +153,93 @@ pub fn read_rgba_frame(r: &mut impl Read, buf: Vec<u8>) -> io::Result<Option<Fra
     Ok(read_frame_into(r, buf, "raw rgba")?.map(Frame::Rgba))
 }
 
+/// Temporal hold: the per-pixel "keep the previous value" prefilter for
+/// `--hold`. Compressed video carries a few LSB of noise on every pixel
+/// of every frame, and on flat content that noise — not the picture —
+/// decides which of two neighboring palette entries a pixel lands on.
+/// Re-rolled every frame, it turns static fills into per-frame index
+/// churn that defeats the delta encoder (measured on a flat cel-animation
+/// clip: 64% of source pixels change frame-to-frame but only 22% by more
+/// than 6/765, and `--dither none` still re-encoded 27% of pixels per
+/// frame). Holding a pixel at its previous value while it moves by less
+/// than a threshold makes static regions byte-identical across frames, so
+/// they drop out of the delta entirely. A held pixel is never more than
+/// the threshold away from its true value, and any larger change passes
+/// through untouched, so motion and cuts are unaffected. Slow fades step
+/// per pixel by up to the threshold instead of moving smoothly — keep it
+/// small (about 8–12 for RGB L1).
+///
+/// `cur` is rewritten in place and then *is* the reference for the next
+/// frame: a pixel that holds stays at the reference value, a pixel that
+/// moves becomes the new reference, so drift can never accumulate beyond
+/// one threshold. These are the scalar reference kernels; the reader
+/// uses the SIMD versions in `simdops` (which also mirror the result into
+/// the reference buffer) and falls back to these for vector tails.
+pub mod hold {
+    /// RGBA frames: hold a pixel when the L1 distance over RGB to the
+    /// reference is below `t` and alpha is unchanged.
+    pub fn rgba(cur: &mut [u8], prev: &[u8], t: u32) {
+        debug_assert_eq!(cur.len(), prev.len());
+        for (c, p) in cur
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(prev.as_chunks::<4>().0)
+        {
+            let d = c[0].abs_diff(p[0]) as u32
+                + c[1].abs_diff(p[1]) as u32
+                + c[2].abs_diff(p[2]) as u32;
+            if d < t && c[3] == p[3] {
+                *c = *p;
+            }
+        }
+    }
+
+    /// Planar (Y4M) frames: hold each sample independently when it moves
+    /// by less than `t`. Every plane is treated alike; a subsampled
+    /// chroma sample that holds or resets does so for the pixels it
+    /// covers, which is the right granularity for the noise it carries.
+    pub fn planes(cur: &mut [u8], prev: &[u8], t: u8) {
+        debug_assert_eq!(cur.len(), prev.len());
+        for (c, &p) in cur.iter_mut().zip(prev) {
+            if c.abs_diff(p) < t {
+                *c = p;
+            }
+        }
+    }
+
+    /// Per-sample threshold for planar input from the RGB L1 threshold:
+    /// a luma step of one moves every RGB channel by about one, so an
+    /// L1 budget of `t` over three channels is roughly `t / 3` per sample.
+    pub fn plane_threshold(t: u32) -> u8 {
+        t.div_ceil(3).min(255) as u8
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hold_rgba_keeps_small_moves_and_passes_large() {
+        let prev = [100u8, 100, 100, 255, 10, 10, 10, 255, 50, 50, 50, 255];
+        let mut cur = [103u8, 99, 101, 255, 40, 10, 10, 255, 52, 50, 50, 0];
+        hold::rgba(&mut cur, &prev, 8);
+        assert_eq!(&cur[0..4], &prev[0..4], "L1 5 < 8 holds");
+        assert_eq!(&cur[4..8], &[40, 10, 10, 255], "L1 30 passes through");
+        assert_eq!(&cur[8..12], &[52, 50, 50, 0], "alpha change never holds");
+    }
+
+    #[test]
+    fn hold_planes_and_threshold() {
+        let prev = [100u8, 100, 100];
+        let mut cur = [102u8, 97, 104];
+        hold::planes(&mut cur, &prev, 3);
+        assert_eq!(cur, [100, 97, 104]);
+        assert_eq!(hold::plane_threshold(8), 3);
+        assert_eq!(hold::plane_threshold(12), 4);
+        assert_eq!(hold::plane_threshold(0), 0);
+    }
 
     #[test]
     fn header_basic() {

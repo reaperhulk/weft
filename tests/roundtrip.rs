@@ -451,3 +451,36 @@ fn bayer_is_lossless_on_exact_palette() {
         assert_eq!(got, want, "frame {i} was dithered despite an exact palette");
     }
 }
+
+#[test]
+fn hold_folds_noisy_static_frames() {
+    // A static solid frame with +-1 per-channel noise re-rolled each
+    // frame, then a genuinely different frame. Without --hold the noise
+    // keeps every frame distinct; with it, the noisy frames hold at the
+    // first frame's values and fold into one delay.
+    let (w, h) = (32usize, 32usize);
+    let mut raw = Vec::new();
+    let mut seed = 0x9E37_79B9u32;
+    for f in 0..4 {
+        for _ in 0..w * h {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let n = |k: u32| ((seed >> k) % 3) as u8; // 0, 1, 2
+            raw.extend_from_slice(&[99 + n(3), 149 + n(11), 199 + n(19), 255]);
+            let _ = f;
+        }
+    }
+    raw.extend(std::iter::repeat_n([200u8, 10, 10, 255], w * h).flatten());
+    let plain = decode_gif(&run_weft(&["--size", "32x32", "--fps", "10"], &raw));
+    assert!(plain.frames.len() > 2, "noise should keep frames distinct");
+    let held = decode_gif(&run_weft(
+        &["--size", "32x32", "--fps", "10", "--hold", "8"],
+        &raw,
+    ));
+    assert_eq!(held.frames.len(), 2, "held frames fold into one");
+    assert_eq!(held.frames[0].1, 40, "4 x 10cs");
+    assert_eq!(
+        held.frames[1].0[..3],
+        [200, 10, 10],
+        "large change passes through"
+    );
+}

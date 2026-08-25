@@ -884,3 +884,122 @@ mod tests {
         }
     }
 }
+
+/// `--hold` for packed RGBA: hold a pixel at its `prev` value when the
+/// RGB L1 distance is below `t` and alpha is unchanged (see
+/// `input::hold`). Rewrites `cur` in place and mirrors the result into
+/// `prev` in the same pass, so the reference for the next frame costs one
+/// extra store stream instead of a separate full-frame copy. Runs on the
+/// serial reader thread, so it has to be cheap.
+pub fn hold_rgba(level: Level, cur: &mut [u8], prev: &mut [u8], t: u32) {
+    fearless_simd::dispatch!(level, simd => hold_rgba_impl(simd, cur, prev, t))
+}
+
+#[inline(always)]
+fn hold_rgba_impl<S: Simd>(simd: S, cur: &mut [u8], prev: &mut [u8], t: u32) {
+    debug_assert_eq!(cur.len(), prev.len());
+    let n = cur.len() / 4;
+    let tv = i32x16::splat(simd, t as i32);
+    let zero = i32x16::splat(simd, 0);
+    let mut i = 0usize;
+    while i + 16 <= n {
+        let a = px16(simd, &cur[i * 4..]);
+        let b = px16(simd, &prev[i * 4..]);
+        let close = sad3(simd, a, b).simd_lt(tv);
+        let alpha_same = ((a ^ b) >> 24u32).bitcast::<i32x16<S>>().simd_eq(zero);
+        let r = (close & alpha_same).select(b, a).bitcast::<u8x64<S>>();
+        r.store_slice(&mut cur[i * 4..i * 4 + 64]);
+        r.store_slice(&mut prev[i * 4..i * 4 + 64]);
+        i += 16;
+    }
+    let tail = i * 4;
+    crate::input::hold::rgba(&mut cur[tail..], &prev[tail..], t);
+    prev[tail..].copy_from_slice(&cur[tail..]);
+}
+
+/// `--hold` for planar (Y4M) samples: hold each byte at its `prev` value
+/// when |diff| < t; result stored to both `cur` and `prev`.
+pub fn hold_planes(level: Level, cur: &mut [u8], prev: &mut [u8], t: u8) {
+    fearless_simd::dispatch!(level, simd => hold_planes_impl(simd, cur, prev, t))
+}
+
+#[inline(always)]
+fn hold_planes_impl<S: Simd>(simd: S, cur: &mut [u8], prev: &mut [u8], t: u8) {
+    debug_assert_eq!(cur.len(), prev.len());
+    let n = cur.len();
+    let tv = u8x64::splat(simd, t);
+    let mut i = 0usize;
+    while i + 64 <= n {
+        let a = u8x64::from_slice(simd, &cur[i..i + 64]);
+        let b = u8x64::from_slice(simd, &prev[i..i + 64]);
+        let d = a.max(b) - a.min(b);
+        let r = d.simd_lt(tv).select(b, a);
+        r.store_slice(&mut cur[i..i + 64]);
+        r.store_slice(&mut prev[i..i + 64]);
+        i += 64;
+    }
+    crate::input::hold::planes(&mut cur[i..], &prev[i..], t);
+    prev[i..].copy_from_slice(&cur[i..]);
+}
+
+#[cfg(test)]
+mod hold_tests {
+    use super::*;
+
+    fn noise(n: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 24) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hold_rgba_matches_scalar() {
+        // 100 pixels: 6 full vectors + a 4-pixel tail; prev = cur + small
+        // noise on most pixels, big jumps and alpha flips sprinkled in
+        let n = 100;
+        let base = noise(n * 4, 1);
+        let jit = noise(n * 4, 2);
+        let mut cur = base.clone();
+        for (i, c) in cur.iter_mut().enumerate() {
+            let j = (jit[i] % 7) as i32 - 3;
+            *c = (*c as i32 + j).clamp(0, 255) as u8;
+            if i % 37 == 0 {
+                *c = c.wrapping_add(60);
+            }
+            if i % 4 == 3 {
+                *c = if i % 41 == 3 { 0 } else { base[i] };
+            }
+        }
+        let mut prev = base.clone();
+        let mut want = cur.clone();
+        crate::input::hold::rgba(&mut want, &base, 6);
+        let mut got = cur.clone();
+        hold_rgba(level(), &mut got, &mut prev, 6);
+        assert_eq!(got, want);
+        assert_eq!(prev, want, "reference must mirror the result");
+        assert_ne!(got, cur, "test input must actually hold something");
+    }
+
+    #[test]
+    fn hold_planes_matches_scalar() {
+        let n = 300; // 4 vectors + 44-byte tail
+        let base = noise(n, 3);
+        let jit = noise(n, 4);
+        let cur: Vec<u8> = base
+            .iter()
+            .zip(&jit)
+            .map(|(&b, &j)| (b as i32 + (j % 9) as i32 - 4).clamp(0, 255) as u8)
+            .collect();
+        let mut want = cur.clone();
+        crate::input::hold::planes(&mut want, &base, 3);
+        let mut got = cur.clone();
+        let mut prev = base.clone();
+        hold_planes(level(), &mut got, &mut prev, 3);
+        assert_eq!(got, want);
+        assert_eq!(prev, want);
+    }
+}

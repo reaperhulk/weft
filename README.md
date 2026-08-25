@@ -56,6 +56,10 @@ weft --colors 64 --dither none --no-loop < input.y4m > out.gif
 --lossy N          lossy LZW compression, 0-200 (default: 0 = lossless
                    encoding of the quantized frames; ~30 is subtle and
                    much smaller on dithered content)
+--hold N           temporal hold, 0-765 (default: 0 = off): a pixel that
+                   moves by less than N (|dR|+|dG|+|dB|) from the previous
+                   frame keeps its previous value; ~8-12 is invisible and
+                   much smaller on compressed-video input
 --no-loop          play once (no NETSCAPE extension)
 --threads N        worker threads             (default: all cores)
 --stats            print timing breakdown to stderr
