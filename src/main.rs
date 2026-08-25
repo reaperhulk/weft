@@ -57,11 +57,13 @@ options:
   --format F         auto | rgba | y4m          (default: auto)
   --colors N         max palette colors, 2-256  (default: 256; one slot is
                      reserved for transparency, so 256 means 255 colors)
-  --dither D         bluenoise | sierra2 | bayer | none
+  --dither D         bluenoise | auto | sierra2 | bayer | none
                      (default: bluenoise, which is fast, temporally
-                     stable, and compresses well; sierra2 error diffusion
-                     has slightly higher visual quality but is slower and
-                     shimmers frame-to-frame on animated content)
+                     stable, and compresses well; auto is bluenoise only
+                     in 32x32 tiles where the nearest-colour map shows
+                     banding contours, plain nearest colour elsewhere;
+                     sierra2 error diffusion has slightly higher visual
+                     quality but is slower and shimmers frame-to-frame)
   --dither-gate N    activity gate for bluenoise, 0-720 (default: 16;
                      0 = off). Smooth regions keep full dither; busier
                      regions get progressively less, reaching none at
@@ -148,6 +150,7 @@ fn parse_args() -> Result<Args, String> {
                     "bayer" => Dither::Bayer,
                     "bluenoise" | "bn" => Dither::BlueNoise,
                     "none" => Dither::None,
+                    "auto" => Dither::Auto,
                     d => return Err(format!("unknown dither {d}")),
                 }
             }
@@ -791,12 +794,14 @@ fn run(args: &Args) -> io::Result<()> {
     // as "unchanged" marker, so frames encode whole with
     // restore-to-background disposal (any_alpha comes from pass 1).
     let t3 = Instant::now();
+    let band = (args.dither == Dither::Auto).then(|| dither::BandGate::new(&nearest));
     let quant = Quantizer {
         nearest: &nearest,
         trans_idx,
         // median_cut returns the exact colors when they all fit
         exact_palette: n_entries < args.colors,
         gate: args.dither_gate,
+        band: band.as_ref(),
     };
     let delays = gif::frame_delays(nread, meta.fps_num, meta.fps_den);
     let disposal = if any_alpha {
@@ -939,6 +944,17 @@ fn run(args: &Args) -> io::Result<()> {
             t_smooth,
             t_hold, t_pal, t_qlzw, t_mux, t0.elapsed()
         );
+        if let Some(b) = &band {
+            let live = b.live_tiles.load(std::sync::atomic::Ordering::Relaxed);
+            let total = b
+                .total_tiles
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(1);
+            eprintln!(
+                "  dither auto: {live}/{total} tiles dithered ({:.1}%)",
+                live as f64 * 100.0 / total as f64
+            );
+        }
     }
     Ok(())
 }

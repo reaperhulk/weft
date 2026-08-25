@@ -1193,6 +1193,29 @@ impl NearestMap {
         packed
     }
 
+    /// Packed `rgb<<8 | idx` for a palette index (for callers that stored
+    /// only the index).
+    #[inline(always)]
+    pub fn packed(&self, idx: u8) -> PackedNearest {
+        (self.pal_rgb[idx as usize] << 8) | idx as u32
+    }
+
+    /// 256x256 table of index pairs whose OkLab distance lies in
+    /// [lo, hi): 1 where a boundary between the two colours would read as
+    /// a banding step (visible, but not an edge), else 0. Built once per
+    /// clip for the banding gate.
+    pub fn band_pair_table(&self, lo: f32, hi: f32) -> Vec<u8> {
+        let n = self.pal_lab.len();
+        let mut t = vec![0u8; 256 * 256];
+        for a in 0..n {
+            for b in 0..n {
+                let d = dist2(&self.pal_lab[a], &self.pal_lab[b]).sqrt();
+                t[a * 256 + b] = (d >= lo && d < hi) as u8;
+            }
+        }
+        t
+    }
+
     /// The multi-candidate path of `lookup_packed`: `off` is the direct[]
     /// entry's high 24 bits (the candidate list offset).
     #[inline]
