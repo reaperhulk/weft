@@ -1311,6 +1311,7 @@ pub const BAND_PAD: usize = 16;
 /// 1 = vertical (prev | x). Candidates are boundaries whose two endpoints
 /// both lie inside same-index runs of at least RUN pixels; the caller
 /// applies the colour-pair test to the (sparse) candidates.
+#[allow(clippy::too_many_arguments)]
 pub fn band_score_row(
     level: Level,
     idxp: &[u8],
@@ -1352,7 +1353,7 @@ fn band_score_row_impl<S: Simd>(
         let c = load64(simd, idxp, base, n);
         let mut m = c.simd_eq(load64(simd, idxp, base - 1, n));
         for k in 2..RUN {
-            m = m & c.simd_eq(load64(simd, idxp, base - k, n));
+            m &= c.simd_eq(load64(simd, idxp, base - k, n));
         }
         store64(m.select(one, zero), ltmp, base, n);
         x += 64;
@@ -1367,7 +1368,7 @@ fn band_score_row_impl<S: Simd>(
         let base = P + x;
         let mut f = load64(simd, ltmp, base, n);
         for s in 1..RUN {
-            f = f | load64(simd, ltmp, base + s, n);
+            f |= load64(simd, ltmp, base + s, n);
         }
         store64(f, flat_cur, base, n);
         x += 64;
@@ -1387,7 +1388,7 @@ fn band_score_row_impl<S: Simd>(
             let pv = load64(simd, prev, x, n);
             let fp = load64(simd, flat_prev, base, n).simd_eq(one);
             let v = f & fp & !c.simd_eq(pv);
-            out = out | v.select(u8x64::splat(simd, 2), zero);
+            out |= v.select(u8x64::splat(simd, 2), zero);
         }
         store64(out, cand, x, n);
         x += 64;
@@ -1460,7 +1461,7 @@ mod band_tests {
             s >> 24
         };
         // runs of random length 1..20 of random indices
-        let mut mk = |rnd: &mut dyn FnMut() -> u32| {
+        let mk = |rnd: &mut dyn FnMut() -> u32| {
             let mut v = Vec::new();
             while v.len() < w {
                 let len = (rnd() % 20 + 1) as usize;

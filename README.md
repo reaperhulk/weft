@@ -61,10 +61,11 @@ weft --colors 64 --dither none --no-loop < input.y4m > out.gif
                    stays within N (|dR|+|dG|+|dB|) of its running mean and
                    within 1.5N of its held value keeps that value; ~8-12
                    is invisible and much smaller on compressed-video input
---smooth N         spatial grain filter, 0-765 (default: 0 = off): each
-                   pixel becomes the mean of its 5x5 neighbours within N;
-                   edges are excluded so outlines stay crisp. ~24 removes
-                   film grain and codec noise (which also defeats --hold)
+--smooth N         spatial grain filter, 0-765 (default: 0 = off, or 16
+                   with --dither auto): each pixel becomes the mean of
+                   its 5x5 neighbours within N; edges are excluded so
+                   outlines stay crisp. ~16-24 removes film grain and
+                   codec noise (which also defeats --hold)
 --no-loop          play once (no NETSCAPE extension)
 --threads N        worker threads             (default: all cores)
 --stats            print timing breakdown to stderr
@@ -210,6 +211,17 @@ the far-candidate stages entirely, so `auto` costs about the same as
 `bluenoise` on gradient content and approaches `none` on flat content.
 Measured: cel animation dithers ~10% of tiles, live action 10-35%,
 synthetic gradients 100%; size and PSNR land between the two modes.
+
+The detector reads structure off the nearest-colour map, so it needs
+that map to reflect the picture rather than the noise: on raw grainy
+input a flat fill sitting between two palette entries quantizes into
+blobs of both, and blobs are wide enough with a small enough colour step
+to pass for banding — the gate then fires on nearly every tile and
+`auto` degrades to plain blue noise. `--dither auto` therefore implies
+`--smooth 16` (the live-action-safe strength) unless `--smooth` is
+given; `--smooth 0` opts out. `--stats` reports the dithered-tile
+fraction, and a reading near 100% on content that is not all gradient
+is the tell that the input needs more smoothing.
 
 ## Lossy compression
 
