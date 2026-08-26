@@ -942,32 +942,61 @@ fn mean_round64<S: Simd>(simd: S, lo: i16x32<S>, hi: i16x32<S>) -> u8x64<S> {
 
 /// `--hold` with a running mean, packed RGBA (see `input::hold::rgba_mean`).
 /// `mean` is one i16 per byte of `cur`. Result stored to `cur` and `prev`.
+/// Two more things ride along in the same pass so the hold thread makes
+/// one traversal per frame: the unmodified input is mirrored into
+/// `raw_prev` (the next frame's noise reference) after its previous
+/// contents have been compared against `cur` into `hist`, a histogram of
+/// per-pixel L1 change (every fourth vector of 16 pixels — a quarter of
+/// the frame is plenty for a quantile) that sizes the *next* frame's
+/// window. Reading raw_prev before overwriting it is what makes the
+/// fusion work: the reference is consumed and replaced in one step.
+#[allow(clippy::too_many_arguments)]
 pub fn hold_rgba_mean(
     level: Level,
     cur: &mut [u8],
     prev: &mut [u8],
     mean: &mut [i16],
+    raw_prev: &mut [u8],
+    hist: &mut [u32; 256],
     t: u32,
     tmax: u32,
 ) {
-    fearless_simd::dispatch!(level, simd => hold_rgba_mean_impl(simd, cur, prev, mean, t, tmax))
+    fearless_simd::dispatch!(level, simd => hold_rgba_mean_impl(simd, cur, prev, mean, raw_prev, hist, t, tmax))
 }
 
+/// Histogram sampling: one vector in this many.
+pub const HOLD_HIST_STRIDE: usize = 4;
+
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn hold_rgba_mean_impl<S: Simd>(
     simd: S,
     cur: &mut [u8],
     prev: &mut [u8],
     mean: &mut [i16],
+    raw_prev: &mut [u8],
+    hist: &mut [u32; 256],
     t: u32,
     tmax: u32,
 ) {
     let n = cur.len() / 4;
     let tv = i32x16::splat(simd, t as i32);
     let tmv = i32x16::splat(simd, tmax as i32);
+    let cap = i32x16::splat(simd, 255);
     let mut i = 0usize;
+    let mut v = 0usize;
     while i + 16 <= n {
         let a = px16(simd, &cur[i * 4..]);
+        if v.is_multiple_of(HOLD_HIST_STRIDE) {
+            let r = px16(simd, &raw_prev[i * 4..]);
+            let d = sad4(simd, a, r).min(cap);
+            let arr: [i32; 16] = d.into();
+            for x in arr {
+                hist[x as usize] += 1;
+            }
+        }
+        a.bitcast::<u8x64<S>>()
+            .store_slice(&mut raw_prev[i * 4..i * 4 + 64]);
         let b = px16(simd, &prev[i * 4..]);
         let m_lo = i16x32::from_slice(simd, &mean[i * 4..i * 4 + 32]);
         let m_hi = i16x32::from_slice(simd, &mean[i * 4 + 32..i * 4 + 64]);
@@ -985,59 +1014,22 @@ fn hold_rgba_mean_impl<S: Simd>(
         mean_step(c_lo, m_lo, k_lo).store_slice(&mut mean[i * 4..i * 4 + 32]);
         mean_step(c_hi, m_hi, k_hi).store_slice(&mut mean[i * 4 + 32..i * 4 + 64]);
         i += 16;
+        v += 1;
     }
     let tail = i * 4;
+    // tail pixels: sampled into the histogram only if the stride lands
+    // on them, mirrored into raw_prev before the hold rewrites cur
+    if v.is_multiple_of(HOLD_HIST_STRIDE) {
+        for p in i..n {
+            let d: u32 = (0..4)
+                .map(|k| cur[p * 4 + k].abs_diff(raw_prev[p * 4 + k]) as u32)
+                .sum();
+            hist[d.min(255) as usize] += 1;
+        }
+    }
+    raw_prev[tail..].copy_from_slice(&cur[tail..]);
     crate::input::hold::rgba_mean(&mut cur[tail..], &prev[tail..], &mut mean[tail..], t, tmax);
     prev[tail..].copy_from_slice(&cur[tail..]);
-}
-
-/// `--hold` with a running mean, planar samples.
-pub fn hold_planes_mean(
-    level: Level,
-    cur: &mut [u8],
-    prev: &mut [u8],
-    mean: &mut [i16],
-    t: u8,
-    tmax: u8,
-) {
-    fearless_simd::dispatch!(level, simd => hold_planes_mean_impl(simd, cur, prev, mean, t, tmax))
-}
-
-#[inline(always)]
-fn hold_planes_mean_impl<S: Simd>(
-    simd: S,
-    cur: &mut [u8],
-    prev: &mut [u8],
-    mean: &mut [i16],
-    t: u8,
-    tmax: u8,
-) {
-    let n = cur.len();
-    let tv = u8x64::splat(simd, t);
-    let tmv = u8x64::splat(simd, tmax);
-    let ff = u16x32::splat(simd, 0xFF);
-    let mut i = 0usize;
-    while i + 64 <= n {
-        let a = u8x64::from_slice(simd, &cur[i..i + 64]);
-        let b = u8x64::from_slice(simd, &prev[i..i + 64]);
-        let m_lo = i16x32::from_slice(simd, &mean[i..i + 32]);
-        let m_hi = i16x32::from_slice(simd, &mean[i + 32..i + 64]);
-        let m8 = mean_round64(simd, m_lo, m_hi);
-        let close = (a.max(m8) - a.min(m8)).simd_lt(tv);
-        let near = (a.max(b) - a.min(b)).simd_lt(tmv);
-        let keep = close & near;
-        let r = keep.select(b, a);
-        r.store_slice(&mut cur[i..i + 64]);
-        r.store_slice(&mut prev[i..i + 64]);
-        let (c_lo, c_hi) = a.widen();
-        let kb: u8x64<S> = keep.select(u8x64::splat(simd, 0xFF), u8x64::splat(simd, 0));
-        let (k_lo, k_hi): (u16x32<S>, u16x32<S>) = kb.widen();
-        mean_step(c_lo, m_lo, k_lo.simd_eq(ff)).store_slice(&mut mean[i..i + 32]);
-        mean_step(c_hi, m_hi, k_hi.simd_eq(ff)).store_slice(&mut mean[i + 32..i + 64]);
-        i += 64;
-    }
-    crate::input::hold::planes_mean(&mut cur[i..], &prev[i..], &mut mean[i..], t, tmax);
-    prev[i..].copy_from_slice(&cur[i..]);
 }
 
 /// Rounded division of 16 lanes of non-negative sums by counts in
@@ -1147,81 +1139,6 @@ fn tail_rgba(padded: &[u8], w: usize, y: usize, x0: usize, s: u32, out: &mut [u8
     }
 }
 
-/// One output row of the range-limited 5x5 box filter on a plane.
-pub fn smooth_plane_row(level: Level, padded: &[u8], w: usize, y: usize, t: u8, out: &mut [u8]) {
-    fearless_simd::dispatch!(level, simd => smooth_plane_row_impl(simd, padded, w, y, t, out))
-}
-
-#[inline(always)]
-fn smooth_plane_row_impl<S: Simd>(
-    simd: S,
-    padded: &[u8],
-    w: usize,
-    y: usize,
-    t: u8,
-    out: &mut [u8],
-) {
-    use crate::input::smooth::{PAD, WIN};
-    let pw = w + 2 * PAD;
-    let tv = u8x64::splat(simd, t);
-    let one8 = u8x64::splat(simd, 1);
-    let zero8 = u8x64::splat(simd, 0);
-    let zero16 = u16x32::splat(simd, 0);
-    let mut x = 0usize;
-    while x + 64 <= w {
-        let c = u8x64::from_slice(simd, &padded[(y + PAD) * pw + x + PAD..][..64]);
-        let mut acc_lo = zero16;
-        let mut acc_hi = zero16;
-        let mut cnt = zero8;
-        for dy in 0..WIN {
-            let base = (y + dy) * pw + x;
-            for dx in 0..WIN {
-                let nb = u8x64::from_slice(simd, &padded[base + dx..base + dx + 64]);
-                let ok = (nb.max(c) - nb.min(c)).simd_lt(tv);
-                let picked = ok.select(nb, zero8);
-                let (lo, hi) = picked.widen();
-                acc_lo += lo;
-                acc_hi += hi;
-                cnt += ok.select(one8, zero8);
-            }
-        }
-        // rounded division in four 16-lane chunks
-        let (cnt_lo, cnt_hi) = cnt.widen();
-        let mut res = [0u8; 64];
-        for (q, (acc, cn)) in [(acc_lo, cnt_lo), (acc_hi, cnt_hi)].into_iter().enumerate() {
-            let (a0, a1) = acc.widen();
-            let (n0, n1) = cn.widen();
-            for (k, (a, n)) in [(a0, n0), (a1, n1)].into_iter().enumerate() {
-                let n_i: i32x16<S> = n.bitcast();
-                let rcp = f32x16::splat(simd, 1.0) / f32x16::float_from(n_i);
-                let v = div_round16(simd, a.bitcast(), n_i, rcp);
-                let arr: [i32; 16] = v.into();
-                for (j, &val) in arr.iter().enumerate() {
-                    res[q * 32 + k * 16 + j] = val as u8;
-                }
-            }
-        }
-        out[x..x + 64].copy_from_slice(&res);
-        x += 64;
-    }
-    // scalar tail
-    for xx in x..w {
-        let c = padded[(y + PAD) * pw + xx + PAD];
-        let mut acc = 0u32;
-        let mut cnt = 0u32;
-        for dy in 0..WIN {
-            for dx in 0..WIN {
-                let n = padded[(y + dy) * pw + xx + dx];
-                if n.abs_diff(c) < t {
-                    acc += n as u32;
-                    cnt += 1;
-                }
-            }
-        }
-        out[xx] = ((acc + cnt / 2) / cnt) as u8;
-    }
-}
-
 #[cfg(test)]
 mod hold_mean_smooth_tests {
     use super::*;
@@ -1264,32 +1181,33 @@ mod hold_mean_smooth_tests {
         let (mut want, mut m_want) = (cur.clone(), mean_j.clone());
         hold::rgba_mean(&mut want, &base, &mut m_want, 8, 12);
         let (mut got, mut prev, mut m_got) = (cur.clone(), base.clone(), mean_j.clone());
-        hold_rgba_mean(level(), &mut got, &mut prev, &mut m_got, 8, 12);
+        let mut raw_prev = base.clone();
+        let mut hist = [0u32; 256];
+        hold_rgba_mean(
+            level(),
+            &mut got,
+            &mut prev,
+            &mut m_got,
+            &mut raw_prev,
+            &mut hist,
+            8,
+            12,
+        );
         assert_eq!(got, want);
         assert_eq!(prev, want);
         assert_eq!(m_got, m_want);
         assert_ne!(got, cur);
-    }
-
-    #[test]
-    fn hold_planes_mean_matches_scalar() {
-        let n = 300; // 4 vectors + tail
-        let base = noise(n, 3);
-        let cur = jitter(&base, 4, 4);
-        let mut mean_j: Vec<i16> = base
-            .iter()
-            .map(|&b| (b as i16) << hold::MEAN_SHIFT)
-            .collect();
-        for (k, m) in mean_j.iter_mut().enumerate() {
-            *m += ((k % 5) as i16 - 2) * 30;
+        assert_eq!(raw_prev, cur, "raw input mirrored for the next frame");
+        // histogram: sampled vectors of |cur - base| (vector 0 and 4 of 6,
+        // plus the 4-pixel tail at vector index 6)
+        let mut want_h = [0u32; 256];
+        for p in (0..n).filter(|&p| p / 16 % HOLD_HIST_STRIDE == 0) {
+            let d: u32 = (0..4)
+                .map(|k| cur[p * 4 + k].abs_diff(base[p * 4 + k]) as u32)
+                .sum();
+            want_h[d.min(255) as usize] += 1;
         }
-        let (mut want, mut m_want) = (cur.clone(), mean_j.clone());
-        hold::planes_mean(&mut want, &base, &mut m_want, 3, 5);
-        let (mut got, mut prev, mut m_got) = (cur.clone(), base.clone(), mean_j.clone());
-        hold_planes_mean(level(), &mut got, &mut prev, &mut m_got, 3, 5);
-        assert_eq!(got, want);
-        assert_eq!(prev, want);
-        assert_eq!(m_got, m_want);
+        assert_eq!(hist, want_h);
     }
 
     #[test]
@@ -1318,24 +1236,6 @@ mod hold_mean_smooth_tests {
             let mut got = vec![0u8; w * 4];
             smooth::rgba_row(&pad, w, y, 24, &mut want);
             smooth_rgba_row(level(), &pad, w, y, 24, &mut got);
-            assert_eq!(got, want, "row {y}");
-        }
-    }
-
-    #[test]
-    fn smooth_plane_row_matches_scalar() {
-        let (w, h) = (150usize, 7usize); // 2 vectors + 22 tail
-        let base: Vec<u8> = (0..w * h)
-            .map(|i| if i % w < 70 { 60 } else { 200 })
-            .collect();
-        let frame = jitter(&base, 6, 4);
-        let mut pad = Vec::new();
-        smooth::pad(&frame, w, h, 1, &mut pad);
-        for y in 0..h {
-            let mut want = vec![0u8; w];
-            let mut got = vec![0u8; w];
-            smooth::plane_row(&pad, w, y, 8, &mut want);
-            smooth_plane_row(level(), &pad, w, y, 8, &mut got);
             assert_eq!(got, want, "row {y}");
         }
     }
@@ -1368,29 +1268,6 @@ fn delta_hist_rgba_impl<S: Simd>(simd: S, cur: &[u8], prev: &[u8], hist: &mut [u
     }
 }
 
-/// Histogram of per-sample change for planar frames.
-pub fn delta_hist_planes(level: Level, cur: &[u8], prev: &[u8], hist: &mut [u32; 256]) {
-    fearless_simd::dispatch!(level, simd => delta_hist_planes_impl(simd, cur, prev, hist))
-}
-
-#[inline(always)]
-fn delta_hist_planes_impl<S: Simd>(simd: S, cur: &[u8], prev: &[u8], hist: &mut [u32; 256]) {
-    let n = cur.len();
-    let mut i = 0usize;
-    while i + 64 <= n {
-        let a = u8x64::from_slice(simd, &cur[i..i + 64]);
-        let b = u8x64::from_slice(simd, &prev[i..i + 64]);
-        let arr: [u8; 64] = (a.max(b) - a.min(b)).into();
-        for v in arr {
-            hist[v as usize] += 1;
-        }
-        i += 64;
-    }
-    for p in i..n {
-        hist[cur[p].abs_diff(prev[p]) as usize] += 1;
-    }
-}
-
 #[cfg(test)]
 mod delta_hist_tests {
     use super::*;
@@ -1415,12 +1292,5 @@ mod delta_hist_tests {
         let mut got = [0u32; 256];
         delta_hist_rgba(level(), &cur, &prev, &mut got);
         assert_eq!(got, want);
-        let mut want_p = [0u32; 256];
-        for p in 0..n * 4 {
-            want_p[cur[p].abs_diff(prev[p]) as usize] += 1;
-        }
-        let mut got_p = [0u32; 256];
-        delta_hist_planes(level(), &cur, &prev, &mut got_p);
-        assert_eq!(got_p, want_p);
     }
 }

@@ -409,6 +409,38 @@ fn y4m_smoke() {
     assert!(px.iter().all(|&c| (129..=131).contains(&c)), "{px:?}");
 }
 
+#[test]
+fn y4m_prefilters_convert_and_hold() {
+    // 4:2:0 y4m, 8x4, three frames: the first two differ by luma noise
+    // of 1, the third is a different shade. With --hold the pool converts
+    // to RGBA and holds, so the first two fold; the third stays distinct.
+    let mut input = Vec::new();
+    input.extend_from_slice(
+        b"YUV4MPEG2 W8 H4 F10:1 Ip A1:1 C420
+",
+    );
+    for (y, uv) in [(120u8, 128u8), (121, 128), (180, 128)] {
+        input.extend_from_slice(
+            b"FRAME
+",
+        );
+        input.extend_from_slice(&[y; 32]); // Y 8x4
+        input.extend_from_slice(&[uv; 8]); // U 4x2
+        input.extend_from_slice(&[uv; 8]); // V 4x2
+    }
+    let dec = decode_gif(&run_weft(&["--hold", "8", "--smooth", "16"], &input));
+    assert_eq!((dec.width, dec.height), (8, 4));
+    assert_eq!(
+        dec.frames.len(),
+        2,
+        "held frames fold, the shade change does not"
+    );
+    assert_eq!(dec.frames[0].1, 20, "2 frames at 10fps");
+    let a = dec.frames[0].0[0] as i32;
+    let b = dec.frames[1].0[0] as i32;
+    assert!(b - a > 40, "third frame is visibly brighter: {a} -> {b}");
+}
+
 /// A source whose colors all fit in the palette has no quantization error
 /// to hide, so every dither mode must reproduce it exactly — including
 /// `bayer`, whose threshold offset would otherwise push closely spaced

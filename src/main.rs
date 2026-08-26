@@ -379,16 +379,23 @@ fn run(args: &Args) -> io::Result<()> {
         // sequence order, reordering the pool's output as needed. Every
         // stage hands frames on through bounded channels; the main thread
         // sorts by index afterwards, so only the hold's order matters.
-        let geom = meta_ref.chroma.map(|c| input::planes(c, w, h));
+        let staged = smooth > 0 || hold > 0;
+        // The prefilters work on packed RGBA. Y4M frames are converted in
+        // the pool when a prefilter is on (the same SIMD conversion the
+        // passes would otherwise repeat per row), so there is one filter
+        // code path; per-plane thresholds were measured to form a box
+        // rather than an L1 ball and held 1.3 dB worse on live action.
+        // Converted frames that turn out opaque drop to packed RGB after
+        // pass 1 like any RGBA input.
+        let convert = staged && meta_ref.chroma.is_some();
         // pool size: the filter costs ~1.5 ms per 480x360 frame, about the
         // read itself; a quarter of the workers keeps it off the critical
         // path without starving the histogram (5 measured best on 40 vCPUs)
-        let smoothers = if smooth > 0 {
+        let smoothers = if smooth > 0 || convert {
             (nthreads / 4).clamp(1, 6)
         } else {
             0
         };
-        let staged = smooth > 0 || hold > 0;
         let stage_cap = 2 * smoothers.max(1);
         let (stx, srx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(stage_cap);
         let (htx, hrx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(stage_cap);
@@ -457,21 +464,28 @@ fn run(args: &Args) -> io::Result<()> {
         for _ in 0..smoothers {
             let srx = srx.clone();
             let htx = htx.clone();
-            let geom = geom.clone();
             let smooth_ns = smooth_ns.clone();
+            let chroma = meta_ref.chroma;
             scope.spawn(move || {
                 let mut scratch: Vec<u8> = Vec::new();
-                let t_plane = input::hold::plane_threshold(smooth);
                 loop {
                     let item = srx.lock().unwrap().recv();
                     let Ok((i, mut f)) = item else { break };
                     let t = Instant::now();
-                    let buf = match &mut f {
-                        Frame::Rgba(b) | Frame::Rgb(b) | Frame::Yuv(b) => b,
-                    };
-                    match &geom {
-                        Some(g) => input::smooth::planes(level, buf, g, t_plane, &mut scratch),
-                        None => input::smooth::rgba(level, buf, w, h, smooth, &mut scratch),
+                    if let Frame::Yuv(_) = &f {
+                        let mut rgba = vec![0u8; w * h * 4];
+                        let src = color::RowSource::new(&f, w, h, chroma);
+                        for (y, row) in rgba.chunks_mut(w * 4).enumerate() {
+                            src.fill_row(y, row);
+                        }
+                        f = Frame::Rgba(rgba);
+                    }
+                    if smooth > 0 {
+                        let buf = match &mut f {
+                            Frame::Rgba(b) | Frame::Rgb(b) => b,
+                            Frame::Yuv(_) => unreachable!("converted above"),
+                        };
+                        input::smooth::rgba(level, buf, w, h, smooth, &mut scratch);
                     }
                     smooth_ns.fetch_add(
                         t.elapsed().as_nanos() as u64,
@@ -488,14 +502,9 @@ fn run(args: &Args) -> io::Result<()> {
         let hold_handle = staged.then(|| {
             let tx = tx.clone();
             scope.spawn(move || -> (std::time::Duration, u64, usize) {
-                let is_yuv = geom.is_some();
-                // the caps from --hold N; the per-frame window adapts to the
-                // measured noise below them (see hold::adaptive_threshold)
-                let cap = if is_yuv {
-                    input::hold::plane_threshold(hold) as u32
-                } else {
-                    hold
-                };
+                // the cap from --hold N; the per-frame window adapts to the
+                // measured noise below it (see hold::adaptive_threshold)
+                let cap = hold;
                 let mut held_prev: Vec<u8> = Vec::new();
                 let mut held_mean: Vec<i16> = Vec::new();
                 // raw previous frame for the noise estimate (the held
@@ -513,7 +522,8 @@ fn run(args: &Args) -> io::Result<()> {
                         if hold > 0 {
                             let ts = Instant::now();
                             let buf = match &mut f {
-                                Frame::Rgba(b) | Frame::Rgb(b) | Frame::Yuv(b) => b,
+                                Frame::Rgba(b) | Frame::Rgb(b) => b,
+                                Frame::Yuv(_) => unreachable!("the pool converts Y4M frames"),
                             };
                             if next == 0 {
                                 held_prev = buf.clone();
@@ -522,38 +532,26 @@ fn run(args: &Args) -> io::Result<()> {
                                     .iter()
                                     .map(|&v| (v as i16) << input::hold::MEAN_SHIFT)
                                     .collect();
-                            } else if is_yuv {
-                                // noise from the luma plane's change
-                                hist.fill(0);
-                                let (_, yw, yh) = geom.as_ref().unwrap()[0];
-                                simdops::delta_hist_planes(
-                                    level,
-                                    &buf[..yw * yh],
-                                    &raw_prev[..yw * yh],
-                                    &mut hist,
-                                );
-                                let t = input::hold::adaptive_threshold(&hist, cap);
-                                t_sum += t as u64;
-                                raw_prev.copy_from_slice(buf);
-                                simdops::hold_planes_mean(
-                                    level,
-                                    buf,
-                                    &mut held_prev,
-                                    &mut held_mean,
-                                    t as u8,
-                                    input::hold::max_deviation(t) as u8,
-                                );
                             } else {
-                                hist.fill(0);
-                                simdops::delta_hist_rgba(level, buf, &raw_prev, &mut hist);
+                                // the window comes from the previous pair's
+                                // histogram (one frame of lag; the cap
+                                // bounds a cut); the first pair measures
+                                // itself. The kernel refills `hist` with
+                                // this pair and mirrors the raw input.
+                                if next == 1 {
+                                    hist.fill(0);
+                                    simdops::delta_hist_rgba(level, buf, &raw_prev, &mut hist);
+                                }
                                 let t = input::hold::adaptive_threshold(&hist, cap);
                                 t_sum += t as u64;
-                                raw_prev.copy_from_slice(buf);
+                                hist.fill(0);
                                 simdops::hold_rgba_mean(
                                     level,
                                     buf,
                                     &mut held_prev,
                                     &mut held_mean,
+                                    &mut raw_prev,
+                                    &mut hist,
                                     t,
                                     input::hold::max_deviation(t),
                                 );

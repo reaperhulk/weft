@@ -245,7 +245,11 @@ On a grainy 480x360 cartoon clip at `--lossy 30`: 9.10 MB baseline,
 PSNR against the source; on a corpus of random cartoon clips the pair is
 worth 8-18% with PSNR unchanged or up. Both are cheap: the hold runs on
 one thread, the filter on a small pool, and the encode is faster overall
-because the delta stage has less to do.
+because the delta stage has less to do. They work on packed RGBA: y4m
+input is converted once in the pool when either is on (frames that turn
+out opaque drop to packed RGB after the first pass, as RGBA input does),
+so a y4m clip with a prefilter holds about twice the resident set of one
+without.
 
 ## Design
 

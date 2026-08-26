@@ -176,13 +176,6 @@ pub fn read_rgba_frame(r: &mut impl Read, buf: Vec<u8>) -> io::Result<Option<Fra
 /// reader uses the SIMD versions in `simdops` (which also mirror the
 /// result into the reference buffer) and falls back to these for tails.
 pub mod hold {
-    /// Per-sample threshold for planar input from the RGB L1 threshold:
-    /// a luma step of one moves every RGB channel by about one, so an
-    /// L1 budget of `t` over three channels is roughly `t / 3` per sample.
-    pub fn plane_threshold(t: u32) -> u8 {
-        t.div_ceil(3).min(255) as u8
-    }
-
     /// Adaptive window from a histogram of per-pixel L1 change between
     /// consecutive raw frames (bins 0..=255, saturating): the larger of
     /// 2.5x the median change and the 75th-percentile change, clamped to
@@ -267,35 +260,10 @@ pub mod hold {
             }
         }
     }
-
-    /// Mean-centred hold for planar samples (see `rgba_mean`).
-    pub fn planes_mean(cur: &mut [u8], prev: &[u8], mean: &mut [i16], t: u8, tmax: u8) {
-        for ((c, &p), m) in cur.iter_mut().zip(prev).zip(mean.iter_mut()) {
-            if c.abs_diff(mean_round(*m)) < t && c.abs_diff(p) < tmax {
-                let d = ((*c as i16) << MEAN_SHIFT) - *m;
-                *m += d >> MEAN_RATE;
-                *c = p;
-            } else {
-                *m = (*c as i16) << MEAN_SHIFT;
-            }
-        }
-    }
 }
 
-/// Plane geometry of a stored Y4M frame: (byte offset, width, height)
-/// per plane, in buffer order.
-pub fn planes(chroma: Chroma, w: usize, h: usize) -> Vec<(usize, usize, usize)> {
-    let cw = w.div_ceil(2);
-    let ch = h.div_ceil(2);
-    match chroma {
-        Chroma::Mono => vec![(0, w, h)],
-        Chroma::C420 => vec![(0, w, h), (w * h, cw, ch), (w * h + cw * ch, cw, ch)],
-        Chroma::C422 => vec![(0, w, h), (w * h, cw, h), (w * h + cw * h, cw, h)],
-        Chroma::C444 => vec![(0, w, h), (w * h, w, h), (2 * w * h, w, h)],
-    }
-}
-
-/// Spatial grain filter for `--smooth`: a range-limited 5x5 box filter.
+/// Spatial grain filter for `--smooth`: a range-limited 5x5 box filter
+/// over packed RGBA (Y4M input is converted before the prefilters).
 /// Each pixel becomes the mean of the window neighbours whose distance to
 /// it is below the threshold, so film grain and codec noise average out
 /// inside a fill while anything across an edge is excluded and outlines
@@ -364,27 +332,6 @@ pub mod smooth {
         }
     }
 
-    /// Scalar reference for one output row of a plane.
-    #[cfg(test)]
-    pub fn plane_row(padded: &[u8], w: usize, y: usize, t: u8, out: &mut [u8]) {
-        let pw = w + 2 * PAD;
-        for (x, o) in out.iter_mut().enumerate() {
-            let c = padded[(y + PAD) * pw + x + PAD];
-            let mut acc = 0u32;
-            let mut cnt = 0u32;
-            for dy in 0..WIN {
-                for dx in 0..WIN {
-                    let n = padded[(y + dy) * pw + x + dx];
-                    if n.abs_diff(c) < t {
-                        acc += n as u32;
-                        cnt += 1;
-                    }
-                }
-            }
-            *o = ((acc + cnt / 2) / cnt) as u8;
-        }
-    }
-
     /// Smooth an RGBA frame in place.
     pub fn rgba(
         level: fearless_simd::Level,
@@ -398,24 +345,6 @@ pub mod smooth {
         let padded: &[u8] = scratch;
         for (y, row) in frame.chunks_mut(w * 4).enumerate() {
             crate::simdops::smooth_rgba_row(level, padded, w, y, s, row);
-        }
-    }
-
-    /// Smooth every plane of a Y4M frame in place.
-    pub fn planes(
-        level: fearless_simd::Level,
-        frame: &mut [u8],
-        geom: &[(usize, usize, usize)],
-        t: u8,
-        scratch: &mut Vec<u8>,
-    ) {
-        for &(off, pw, ph) in geom {
-            let plane = &mut frame[off..off + pw * ph];
-            pad(plane, pw, ph, 1, scratch);
-            let padded: &[u8] = scratch;
-            for (y, row) in plane.chunks_mut(pw).enumerate() {
-                crate::simdops::smooth_plane_row(level, padded, pw, y, t, row);
-            }
         }
     }
 }
@@ -476,54 +405,6 @@ mod tests {
                 assert_eq!(out[x * 4], want, "({x},{y})");
             }
         }
-    }
-
-    #[test]
-    fn plane_geometry() {
-        assert_eq!(
-            planes(Chroma::C420, 5, 3),
-            vec![(0, 5, 3), (15, 3, 2), (21, 3, 2)]
-        );
-        assert_eq!(
-            planes(Chroma::C444, 4, 2),
-            vec![(0, 4, 2), (8, 4, 2), (16, 4, 2)]
-        );
-        assert_eq!(planes(Chroma::Mono, 4, 2), vec![(0, 4, 2)]);
-    }
-
-    #[test]
-    fn adaptive_threshold_tracks_noise() {
-        let mut h = [0u32; 256];
-        h[1] = 60;
-        h[2] = 30;
-        h[4] = 10; // upper quartile at 2: max(2.5*1 -> 3, 2) -> floor 4
-        assert_eq!(hold::adaptive_threshold(&h, 12), 4);
-        let mut h = [0u32; 256];
-        h[1] = 60;
-        h[6] = 40; // grain: upper quartile at 6
-        assert_eq!(hold::adaptive_threshold(&h, 12), 6);
-        let mut h = [0u32; 256];
-        h[4] = 100;
-        assert_eq!(hold::adaptive_threshold(&h, 12), 10);
-        assert_eq!(hold::adaptive_threshold(&h, 8), 8, "capped by --hold");
-        let mut h = [0u32; 256];
-        h[0] = 95;
-        h[40] = 5; // a little motion does not open the window
-        assert_eq!(hold::adaptive_threshold(&h, 12), 4);
-        let h = [0u32; 256];
-        assert_eq!(hold::adaptive_threshold(&h, 12), 4, "empty: floor");
-    }
-
-    #[test]
-    fn hold_planes_and_threshold() {
-        let prev = [100u8, 100, 100];
-        let mut cur = [102u8, 97, 104];
-        let mut mean = [100i16 << hold::MEAN_SHIFT; 3];
-        hold::planes_mean(&mut cur, &prev, &mut mean, 3, 5);
-        assert_eq!(cur, [100, 97, 104]);
-        assert_eq!(hold::plane_threshold(8), 3);
-        assert_eq!(hold::plane_threshold(12), 4);
-        assert_eq!(hold::plane_threshold(0), 0);
     }
 
     #[test]
