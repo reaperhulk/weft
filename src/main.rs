@@ -268,11 +268,6 @@ fn run(args: &Args) -> io::Result<()> {
     // has none: its probe bytes are the first frame's own pixels.
     let mut hdr_consumed = 0u64;
 
-    enum Source {
-        Y4m(BufReader<io::Stdin>),
-        Rgba(io::Chain<io::Cursor<Vec<u8>>, BufReader<io::Stdin>>),
-    }
-
     let (meta, mut source) = if is_y4m {
         let mut line = String::new();
         io::BufRead::read_line(&mut reader, &mut line)?;
@@ -293,7 +288,7 @@ fn run(args: &Args) -> io::Result<()> {
             meta.fps_den = d;
         }
         hdr_consumed = header.len() as u64;
-        (meta, Source::Y4m(reader))
+        (meta, input::FrameSource::new(reader, Vec::new()))
     } else {
         let (w, h) = args.size.ok_or_else(|| {
             io::Error::new(
@@ -314,7 +309,7 @@ fn run(args: &Args) -> io::Result<()> {
         } else {
             Vec::new()
         };
-        (meta, Source::Rgba(io::Cursor::new(leftover).chain(reader)))
+        (meta, input::FrameSource::new(reader, leftover))
     };
     let (w, h) = (meta.width, meta.height);
     if w == 0 || h == 0 || w > 65535 || h > 65535 {
@@ -480,9 +475,10 @@ fn run(args: &Args) -> io::Result<()> {
         drop(stx);
         let reader_handle = scope.spawn(move || -> io::Result<usize> {
             let tx = reader_tx;
-            let fsize = match &source {
-                Source::Y4m(_) => meta_ref.chroma.unwrap().frame_bytes(w, h),
-                Source::Rgba(_) => w * h * 4,
+            let fsize = if is_y4m {
+                meta_ref.chroma.unwrap().frame_bytes(w, h)
+            } else {
+                w * h * 4
             };
             // Fast path: stdin is a plain file whose frames all sit at a
             // known offset, so several threads can pread disjoint frames
@@ -579,9 +575,10 @@ fn run(args: &Args) -> io::Result<()> {
             let res = (|| {
                 loop {
                     let buf = brx.recv().expect("prefault thread died");
-                    let frame = match &mut source {
-                        Source::Y4m(r) => input::read_y4m_frame(r, buf)?,
-                        Source::Rgba(r) => input::read_rgba_frame(r, buf)?,
+                    let frame = if is_y4m {
+                        input::read_y4m_frame(&mut source, buf)?
+                    } else {
+                        input::read_rgba_frame(&mut source, buf)?
                     };
                     match frame {
                         Some(f) => {
