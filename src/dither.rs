@@ -22,6 +22,25 @@ pub enum Dither {
     None,
 }
 
+/// Lossy cap fraction (0..=255) in perfectly smooth undithered regions.
+/// Zero: such regions encode losslessly. Any substitution there shows —
+/// the encoder's error feedback toggles between two indices to hold the
+/// average, which on a gradient reads as hatching and plateaus — and
+/// lossless runs are already cheap where nothing varies. Measured on a
+/// clean cartoon clip at --lossy 30 with --dither none: 1.22 MB / 38.4 dB
+/// with the full cap (visible hatching), 1.72 MB / 40.5 dB with this
+/// (clean; lossless is 1.83 MB), against 1.63 MB / 37.7 dB for the
+/// dithered default. Cel content with dither on costs 6-12% for it.
+const LOSSY_FLAT_FLOOR: u32 = 0;
+
+/// Lossy scale from the activity attenuation (`att` in 0..=256, 256 = the
+/// smoothest): ramps from the flat floor up to the full cap as activity
+/// rises, mirroring the dither gate's ramp.
+#[inline(always)]
+fn lossy_scale_from_att(att: u32) -> u8 {
+    (LOSSY_FLAT_FLOOR + (256 - att) * (255 - LOSSY_FLAT_FLOOR) / 256) as u8
+}
+
 /// Banding detector for `Dither::Auto`. A band contour is a boundary
 /// between two same-index runs of at least `RUN` pixels whose two palette
 /// colours differ by an OkLab distance that is visible but not an edge
@@ -144,6 +163,13 @@ impl<'a> Quantizer<'a> {
     /// Quantize a frame (accessed row-by-row via `src`, so YUV conversion
     /// stays fused and cache-resident) into palette indices. Returns true
     /// if any pixel was alpha-transparent.
+    ///
+    /// `scale`, if given, receives one byte per pixel for the lossy
+    /// encoder's per-pixel error cap (255 = full `--lossy` budget): full
+    /// where the pixel is dithered (dither texture absorbs substitutions)
+    /// or the source is busy, reduced toward `LOSSY_FLAT_FLOOR` in
+    /// smooth undithered regions, where substitutions read as plateaus
+    /// and hatching. Modes that dither everything leave it untouched.
     pub fn quantize(
         &self,
         src: &crate::color::RowSource,
@@ -152,16 +178,19 @@ impl<'a> Quantizer<'a> {
         mode: Dither,
         scratch: &mut QuantScratch,
         out: &mut [u8],
+        scale: Option<&mut [u8]>,
     ) -> bool {
         match mode {
-            Dither::None => self.quantize_plain(src, w, h, scratch, out),
+            Dither::None => self.quantize_plain_scaled(src, w, h, scratch, out, scale),
             Dither::Bayer => self.quantize_bayer(src, w, h, scratch, out),
             Dither::BlueNoise => self.quantize_bluenoise(src, w, h, scratch, out),
             // an exact palette has nothing to dither; without a detector
             // fall back to plain blue noise
-            Dither::Auto if self.exact_palette => self.quantize_plain(src, w, h, scratch, out),
+            Dither::Auto if self.exact_palette => {
+                self.quantize_plain_scaled(src, w, h, scratch, out, scale)
+            }
             Dither::Auto => match self.band {
-                Some(b) => self.quantize_bluenoise_auto(src, w, h, scratch, out, b),
+                Some(b) => self.quantize_bluenoise_auto(src, w, h, scratch, out, b, scale),
                 None => self.quantize_bluenoise(src, w, h, scratch, out),
             },
             Dither::Sierra2_4a => self.quantize_diffuse(src, w, h, scratch, out),
@@ -350,7 +379,7 @@ impl<'a> Quantizer<'a> {
     /// The c1 lookups are done once; pass B re-fills rows (a copy or
     /// expand for packed frames) and re-derives the packed colour from the
     /// stored index.
-    #[allow(clippy::needless_range_loop)]
+    #[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
     fn quantize_bluenoise_auto(
         &self,
         src: &crate::color::RowSource,
@@ -359,6 +388,7 @@ impl<'a> Quantizer<'a> {
         scratch: &mut QuantScratch,
         out: &mut [u8],
         band: &BandGate,
+        mut scale: Option<&mut [u8]>,
     ) -> bool {
         // 64-px stripes (mask-aligned): dead tiles then skip the probe and
         // threshold stages at tile granularity instead of per 256
@@ -500,6 +530,21 @@ impl<'a> Quantizer<'a> {
             };
             has_alpha |= has_alpha_row;
             let tlive = &scratch.tile_live[(y / T) * tx..(y / T + 1) * tx];
+            if let Some(scale) = scale.as_deref_mut() {
+                // lossy cap: full in dithered tiles, activity-scaled elsewhere
+                let srow = &mut scale[y * w..(y + 1) * w];
+                for (txx, &l) in tlive.iter().enumerate() {
+                    let x0 = txx * T;
+                    let x1 = (x0 + T).min(w);
+                    if l != 0 {
+                        srow[x0..x1].fill(255);
+                    } else {
+                        for (s, &a) in srow[x0..x1].iter_mut().zip(&scratch.att[x0..x1]) {
+                            *s = lossy_scale_from_att(a);
+                        }
+                    }
+                }
+            }
             for (txx, &l) in tlive.iter().enumerate() {
                 if l == 0 {
                     let x0 = txx * T;
@@ -637,6 +682,33 @@ impl<'a> Quantizer<'a> {
                 let den = dr * dr + dg * dg + db * db;
                 let m = mrow[x & 63] as i32;
                 *o = if m * den < num * 256 { idx2 } else { idx1 };
+            }
+        }
+        has_alpha
+    }
+
+    /// `quantize_plain`, also filling the lossy scale map from a source
+    /// activity pass (the dither gate's measure, knee at 16) when asked.
+    fn quantize_plain_scaled(
+        &self,
+        src: &crate::color::RowSource,
+        w: usize,
+        h: usize,
+        scratch: &mut QuantScratch,
+        out: &mut [u8],
+        scale: Option<&mut [u8]>,
+    ) -> bool {
+        let has_alpha = self.quantize_plain(src, w, h, scratch, out);
+        if let Some(scale) = scale {
+            let level = crate::simdops::level();
+            for y in 0..h {
+                src.fill_row(y, &mut scratch.row);
+                let prev: &[u8] = if y == 0 { &scratch.row } else { &scratch.row2 };
+                crate::simdops::bn_activity(level, &scratch.row, prev, 16, &mut scratch.att);
+                for (s, &a) in scale[y * w..(y + 1) * w].iter_mut().zip(&scratch.att) {
+                    *s = lossy_scale_from_att(a);
+                }
+                std::mem::swap(&mut scratch.row, &mut scratch.row2);
             }
         }
         has_alpha
@@ -863,7 +935,7 @@ mod tests {
         let src = crate::color::RowSource::new(&frame, 4, 1, None);
         let mut out = [9u8; 4];
         let mut scratch = QuantScratch::new(4);
-        let has_alpha = q.quantize(&src, 4, 1, Dither::None, &mut scratch, &mut out);
+        let has_alpha = q.quantize(&src, 4, 1, Dither::None, &mut scratch, &mut out, None);
         assert!(has_alpha);
         assert_eq!(out, [2, 0, 1, 3]);
     }
@@ -880,7 +952,7 @@ mod tests {
         let frame = crate::input::Frame::Rgba(rgba);
         let src = crate::color::RowSource::new(&frame, w, h, None);
         let mut scratch = QuantScratch::new(w);
-        q.quantize(&src, w, h, mode, &mut scratch, &mut out);
+        q.quantize(&src, w, h, mode, &mut scratch, &mut out, None);
         out
     }
 
@@ -1075,7 +1147,7 @@ mod tests {
         let frame = crate::input::Frame::Rgba(rgba);
         let src = crate::color::RowSource::new(&frame, 8, 8, None);
         let mut scratch = QuantScratch::new(8);
-        q.quantize(&src, 8, 8, Dither::Sierra2_4a, &mut scratch, &mut out);
+        q.quantize(&src, 8, 8, Dither::Sierra2_4a, &mut scratch, &mut out, None);
         for (i, &o) in out.iter().enumerate() {
             assert_eq!(o as usize, i % 2);
         }
