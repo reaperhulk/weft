@@ -982,9 +982,12 @@ pub fn refine_lloyd(colors: &mut [[u8; 3]], entries: &[(u32, u32)], iters: usize
         let soa = crate::simdops::PalSoa::new(&pal_lab);
         let padded = soa.l.len();
         // parallel assignment with per-chunk accumulators
+        // 4096-entry chunks left most of a 40-worker pool idle: a
+        // histogram of 54k unique colours is only thirteen of them.
+        const ASSIGN_CHUNK: usize = 1024;
         let parts: Vec<LloydPartial> = entries
-            .par_chunks(4096)
-            .zip(labs.par_chunks(4096))
+            .par_chunks(ASSIGN_CHUNK)
+            .zip(labs.par_chunks(ASSIGN_CHUNK))
             .map(|(chunk, lchunk)| {
                 let mut sum = vec![[0f64; 3]; n];
                 let mut cnt = vec![0u64; n];
@@ -1004,20 +1007,32 @@ pub fn refine_lloyd(colors: &mut [[u8; 3]], entries: &[(u32, u32)], iters: usize
                 (sum, cnt, dom)
             })
             .collect();
-        let mut sum = vec![[0f64; 3]; n];
-        let mut cnt = vec![0u64; n];
-        let mut dom = vec![(0u32, 0u32); n];
-        for (s, c, d) in parts {
-            for i in 0..n {
-                for ch in 0..3 {
-                    sum[i][ch] += s[i][ch];
+        // Merge per palette slot rather than per chunk: each slot still
+        // sums its chunks in chunk order, so the f64 association — and so
+        // the palette — is exactly what the serial merge produced, but the
+        // pass is parallel over slots instead of growing with the chunk
+        // count. That is what lets the chunks be small enough to balance.
+        let merged: Vec<([f64; 3], u64, (u32, u32))> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let mut sum = [0f64; 3];
+                let mut cnt = 0u64;
+                let mut dom = (0u32, 0u32);
+                for (s, c, d) in &parts {
+                    for ch in 0..3 {
+                        sum[ch] += s[i][ch];
+                    }
+                    cnt += c[i];
+                    if d[i].0 > dom.0 {
+                        dom = d[i];
+                    }
                 }
-                cnt[i] += c[i];
-                if d[i].0 > dom[i].0 {
-                    dom[i] = d[i];
-                }
-            }
-        }
+                (sum, cnt, dom)
+            })
+            .collect();
+        let sum: Vec<[f64; 3]> = merged.iter().map(|m| m.0).collect();
+        let cnt: Vec<u64> = merged.iter().map(|m| m.1).collect();
+        let dom: Vec<(u32, u32)> = merged.iter().map(|m| m.2).collect();
         for i in 0..n {
             if cnt[i] == 0 {
                 continue; // unused colour: leave it
