@@ -230,6 +230,18 @@ fn main() {
 
 fn run(args: &Args) -> io::Result<()> {
     let t0 = Instant::now();
+    // A duplicate of stdin, taken before anything has been read off it,
+    // together with the offset it started at. When stdin turns out to be
+    // a plain file this lets the frames be read in parallel by offset
+    // (see `input::FramePlan`); on a pipe the dup is simply unused.
+    #[cfg(unix)]
+    let stdin_dup: Option<(std::fs::File, u64)> = (|| {
+        use std::io::Seek;
+        use std::os::fd::AsFd;
+        let f = std::fs::File::from(io::stdin().as_fd().try_clone_to_owned().ok()?);
+        let pos = (&mut &f).stream_position().ok()?;
+        Some((f, pos))
+    })();
     // Stdin (not StdinLock): the reader moves to a worker thread, and
     // StdinLock is not Send. Refills lock per read; at 1 MB granularity the
     // lock cost vanishes.
@@ -252,6 +264,9 @@ fn run(args: &Args) -> io::Result<()> {
         }
     };
     let probe_consumed = args.format == Format::Auto;
+    // Container bytes taken off stdin ahead of the first frame. Raw RGBA
+    // has none: its probe bytes are the first frame's own pixels.
+    let mut hdr_consumed = 0u64;
 
     enum Source {
         Y4m(BufReader<io::Stdin>),
@@ -277,6 +292,7 @@ fn run(args: &Args) -> io::Result<()> {
             meta.fps_num = n;
             meta.fps_den = d;
         }
+        hdr_consumed = header.len() as u64;
         (meta, Source::Y4m(reader))
     } else {
         let (w, h) = args.size.ok_or_else(|| {
@@ -331,8 +347,31 @@ fn run(args: &Args) -> io::Result<()> {
     // finishes — small on a slow source (maximum overlap with input), the
     // cap on a fast one. The cap bounds the routed runs, which can reach 4
     // bytes per pixel on noisy content, to a modest transient.
-    let batch_cap = 2 * nthreads;
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(batch_cap);
+    // Two frames per worker is not enough to balance phase A — a batch
+    // ends when its slowest frame does — and it also throttles the reader,
+    // which cannot run more than a batch ahead. Both caps are budgeted
+    // instead of counted.
+    //
+    // `batch_cap` bounds the routed runs, which are the one genuinely
+    // transient allocation here (up to 4 bytes per pixel per frame on
+    // noisy content), so it gets a byte budget with the old two-per-worker
+    // as its floor. Sixteen per worker is where the corpus stops
+    // improving.
+    let frame_bytes = match meta.chroma {
+        Some(c) => c.frame_bytes(w, h),
+        None => w * h * 4,
+    };
+    const RUN_BUDGET: usize = 192 << 20;
+    let batch_cap = (RUN_BUDGET / (w * h * 4)).clamp(2 * nthreads, 8 * nthreads);
+    // The channel is a different question: every frame it holds is a frame
+    // the clip keeps anyway, so queueing them early costs nothing but the
+    // few that would have been narrowed from RGBA to RGB sooner. Let the
+    // reader run far enough ahead that the histogram never waits on it —
+    // measured worth another 15 % of the phase at 40 threads, on top of
+    // the batch change.
+    const QUEUE_BUDGET: usize = 256 << 20;
+    let chan_cap = (QUEUE_BUDGET / frame_bytes).max(batch_cap);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(chan_cap);
     const BUCKETS: usize = 256;
     // Bucket state: one exact table per red-byte bucket, until the tables
     // together exceed GRID_SIZE distinct colors. Past that the palette
@@ -374,6 +413,19 @@ fn run(args: &Args) -> io::Result<()> {
     // allocation per frame (an mmap plus a page fault per 4 KiB) costs
     // more than the hashing itself at low thread counts.
     let run_pool: Mutex<Vec<Vec<palette::PackedRun>>> = Mutex::new(Vec::new());
+    // If stdin is a plain file of fixed-stride frames the reader can be
+    // replaced by several threads preading disjoint frames; anything else
+    // (a pipe, an odd length, y4m with varying FRAME markers) returns None
+    // and keeps the sequential reader.
+    #[cfg(unix)]
+    let plan = stdin_dup.and_then(|(f, base)| {
+        let fsize = if is_y4m {
+            meta.chroma.unwrap().frame_bytes(w, h)
+        } else {
+            w * h * 4
+        };
+        input::FramePlan::probe(f, base, hdr_consumed, is_y4m, fsize)
+    });
     let (read_res, mut indexed_frames, any_alpha) = std::thread::scope(|scope| {
         let meta_ref = &meta;
         let hold = args.hold;
@@ -426,15 +478,67 @@ fn run(args: &Args) -> io::Result<()> {
         drop(stx);
         let reader_handle = scope.spawn(move || -> io::Result<usize> {
             let tx = reader_tx;
+            let fsize = match &source {
+                Source::Y4m(_) => meta_ref.chroma.unwrap().frame_bytes(w, h),
+                Source::Rgba(_) => w * h * 4,
+            };
+            // Fast path: stdin is a plain file whose frames all sit at a
+            // known offset, so several threads can pread disjoint frames
+            // at once. One sequential reader tops out around 2.3 GB/s
+            // copying into fresh pages, and that — not the histogram — is
+            // what paces this phase on a fast source.
+            #[cfg(unix)]
+            if let Some(plan) = plan {
+                let loaders = nthreads.clamp(1, 6);
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let (next, plan) = (&next, &plan);
+                let what = if is_y4m { "y4m" } else { "raw rgba" };
+                let res = std::thread::scope(|s| {
+                    let handles: Vec<_> = (0..loaders)
+                        .map(|_| {
+                            let tx = tx.clone();
+                            s.spawn(move || -> io::Result<()> {
+                                loop {
+                                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if i >= plan.frames {
+                                        return Ok(());
+                                    }
+                                    // Same first-touch as the sequential
+                                    // path's prefault helpers, except each
+                                    // loader does its own, so the faulting
+                                    // scales with the reading.
+                                    #[allow(clippy::slow_vector_initialization)]
+                                    let buf: Vec<u8> = {
+                                        let mut v = Vec::with_capacity(fsize);
+                                        v.resize(fsize, 0);
+                                        v
+                                    };
+                                    let buf = plan.read_frame(i, buf, what)?;
+                                    let f = if is_y4m {
+                                        Frame::Yuv(buf)
+                                    } else {
+                                        Frame::Rgba(buf)
+                                    };
+                                    if tx.send((i, f)).is_err() {
+                                        return Ok(()); // consumer died
+                                    }
+                                }
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("loader thread panicked"))
+                        .find(|r| r.is_err())
+                        .unwrap_or(Ok(()))
+                });
+                return res.map(|()| plan.frames);
+            }
             // On a fast source (tmpfs, a pipe from a decoder already
             // ahead of us) most of the reader's time is page-faulting the
             // fresh buffer for each frame, not copying into it. A helper
             // thread allocates and first-touches the buffers a few frames
             // ahead so the reader only does the read.
-            let fsize = match &source {
-                Source::Y4m(_) => meta_ref.chroma.unwrap().frame_bytes(w, h),
-                Source::Rgba(_) => w * h * 4,
-            };
             // Every frame of the clip stays resident, so each one needs its
             // own fresh pages, and faulting a frame in costs more than
             // reading one: with a single helper the reader spends about as
@@ -732,15 +836,47 @@ fn run(args: &Args) -> io::Result<()> {
                 bins = fold_slabs(&hists);
                 hists = Vec::new();
             }
+            // Hand the heaviest bucket out first. Red bytes are far from
+            // uniform — a few dominate a cartoon frame — so in bucket
+            // order the batch ends with one worker still grinding through
+            // the biggest table while the rest idle (measured parallel
+            // efficiency 0.18). Longest-processing-time-first packs them
+            // instead; the buckets are independent and each still sees the
+            // batch's frames in the same order, so the tables come out
+            // identical.
             if coarse {
-                bins.par_iter_mut().enumerate().for_each(|(g, slab)| {
+                let mut tasks: Vec<(u64, usize, &mut Vec<[u64; 4]>)> = bins
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(g, slab)| {
+                        let w: u64 = routed
+                            .iter()
+                            .map(|r| (r.offs[4 * g + 4] - r.offs[4 * g]) as u64)
+                            .sum();
+                        (w, g, slab)
+                    })
+                    .collect();
+                tasks.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                tasks.into_par_iter().for_each(|(_, g, slab)| {
                     for r in &routed {
                         let s = &r.runs[r.offs[4 * g] as usize..r.offs[4 * g + 4] as usize];
                         palette::accumulate_runs_coarse(slab, s);
                     }
                 });
             } else {
-                hists.par_iter_mut().enumerate().for_each(|(b, hist)| {
+                let mut tasks: Vec<(u64, usize, &mut palette::ColorHist)> = hists
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(b, hist)| {
+                        let w: u64 = routed
+                            .iter()
+                            .map(|r| (r.offs[b + 1] - r.offs[b]) as u64)
+                            .sum();
+                        (w, b, hist)
+                    })
+                    .collect();
+                tasks.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                tasks.into_par_iter().for_each(|(_, b, hist)| {
                     for r in &routed {
                         let s = &r.runs[r.offs[b] as usize..r.offs[b + 1] as usize];
                         palette::accumulate_runs(hist, s);

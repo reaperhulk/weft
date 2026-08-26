@@ -175,6 +175,102 @@ pub fn read_rgba_frame(r: &mut impl Read, buf: Vec<u8>) -> io::Result<Option<Fra
 /// the deviation bound. These are the scalar reference kernels; the
 /// reader uses the SIMD versions in `simdops` (which also mirror the
 /// result into the reference buffer) and falls back to these for tails.
+/// A seekable stdin laid out as fixed-stride frames, so the frames can be
+/// read in parallel with `pread` instead of one after another. The single
+/// reader thread copies about 2.3 GB/s into fresh pages, which is what
+/// paces the whole read+histogram phase on a fast source; several threads
+/// preading disjoint offsets are not serialized by the file position and
+/// scale with the memory system instead.
+///
+/// Only built when every frame is provably where the stride says it is,
+/// so nothing here can mis-slice an unusual stream: a pipe, a y4m whose
+/// FRAME markers are not all identical, or a length that is not a whole
+/// number of frames all fall back to the sequential reader.
+#[cfg(unix)]
+pub struct FramePlan {
+    pub file: std::fs::File,
+    /// Byte offset of the first frame's pixel payload.
+    pub payload: u64,
+    /// Payload-to-payload distance (frame bytes plus any FRAME marker).
+    pub stride: u64,
+    pub frames: usize,
+}
+
+#[cfg(unix)]
+impl FramePlan {
+    /// `base` is stdin's file offset before anything was read, `consumed`
+    /// the bytes of container header taken off it since (0 for raw RGBA,
+    /// whose probe bytes belong to the first frame). Returns None for
+    /// anything that is not a plain seekable file of whole frames.
+    pub fn probe(
+        file: std::fs::File,
+        base: u64,
+        consumed: u64,
+        is_y4m: bool,
+        fsize: usize,
+    ) -> Option<FramePlan> {
+        use std::os::unix::fs::FileExt;
+        let md = file.metadata().ok()?;
+        if !md.is_file() || fsize == 0 {
+            return None;
+        }
+        let start = base.checked_add(consumed)?;
+        let avail = md.len().checked_sub(start)?;
+        if !is_y4m {
+            if avail % fsize as u64 != 0 {
+                return None;
+            }
+            let frames = (avail / fsize as u64) as usize;
+            return Some(FramePlan {
+                file,
+                payload: start,
+                stride: fsize as u64,
+                frames,
+            });
+        }
+        // y4m: every frame carries a FRAME marker. Take the first one's
+        // length as the stride, then confirm byte for byte that the same
+        // marker sits at every other frame's offset; a stream that varies
+        // its markers falls back rather than being mis-sliced.
+        let mut hdr = [0u8; 64];
+        let n = file.read_at(&mut hdr, start).ok()?;
+        let nl = hdr[..n].iter().position(|&b| b == b'\n')?;
+        if !hdr.starts_with(b"FRAME") {
+            return None;
+        }
+        let marker = &hdr[..nl + 1];
+        let stride = marker.len() as u64 + fsize as u64;
+        if avail % stride != 0 {
+            return None;
+        }
+        let frames = (avail / stride) as usize;
+        let ok = (0..frames).all(|i| {
+            let mut got = [0u8; 64];
+            let at = start + i as u64 * stride;
+            matches!(file.read_at(&mut got[..marker.len()], at), Ok(k) if k == marker.len())
+                && &got[..marker.len()] == marker
+        });
+        if !ok {
+            return None;
+        }
+        Some(FramePlan {
+            file,
+            payload: start + marker.len() as u64,
+            stride,
+            frames,
+        })
+    }
+
+    /// Read frame `i`'s payload into `buf` (exactly one frame's bytes).
+    pub fn read_frame(&self, i: usize, mut buf: Vec<u8>, what: &str) -> io::Result<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+        self.file
+            .read_exact_at(&mut buf, self.payload + i as u64 * self.stride)
+            .map_err(|e| io::Error::new(e.kind(), format!("{what}: frame {i}: {e}")))?;
+        Ok(buf)
+    }
+}
+
 pub mod hold {
     /// Adaptive window from a histogram of per-pixel L1 change between
     /// consecutive raw frames (bins 0..=255, saturating): the larger of
