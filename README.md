@@ -242,6 +242,15 @@ dramatically better. Measured at `--lossy 30` (same clips as above):
 
 ¹ gifsicle 1.94 `-O3 --lossy=30` applied to weft's lossless output.
 
+With `--dither none` or `auto`, the error cap is scaled per pixel: full
+where a pixel is dithered (`auto`'s live tiles) or the source is busy,
+falling to zero in perfectly smooth undithered regions. Lossy substitution
+there is what produces the plateaus and hatching that make undithered
+gradients look posterized — the encoder's error feedback toggles between
+two indices to hold the average, and with no dither texture to hide in
+the toggling shows — and lossless runs are already cheap where nothing
+varies. `bluenoise` keeps the flat cap (dither absorbs the substitutions).
+
 Two structural pieces land alongside it (and improve lossless output too):
 each delta frame is encoded both transparency-punched and plain-opaque and
 the smaller wins — sparse changes favor punching, while smooth animated

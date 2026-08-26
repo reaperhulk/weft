@@ -834,6 +834,11 @@ fn run(args: &Args) -> io::Result<()> {
     // faults each buffer's pages once instead of allocating, zeroing, and
     // freeing ~w*h bytes per frame.
     let mut idx_block: Vec<Vec<u8>> = Vec::new();
+    // Per-pixel lossy scale maps (see `LzwEncoder::encode`): only the
+    // modes that leave regions undithered produce them; the others keep
+    // the flat cap and skip the buffers.
+    let scaled_lossy = args.lossy > 0 && matches!(args.dither, Dither::None | Dither::Auto);
+    let mut scale_block: Vec<Vec<u8>> = Vec::new();
     // `for_each_init`/`map_init` state lives for only one parallel
     // operation. Since the block loop launches two new operations per
     // block, using them here would repeatedly allocate and zero the 1 MiB
@@ -871,19 +876,42 @@ fn run(args: &Args) -> io::Result<()> {
                 .collect();
             idx_block.extend(extra);
         }
-        chunk
-            .into_par_iter()
-            .zip(idx_block[..cn].par_iter_mut())
-            .for_each(|(f, idx)| {
-                let wi = rayon::current_thread_index().unwrap_or(nthreads);
-                let mut scratch = worker_ctx[wi]
-                    .quant
-                    .get_or_init(|| Mutex::new(dither::QuantScratch::new(w)))
-                    .lock()
-                    .unwrap();
-                let src = color::RowSource::new(&f, w, h, meta.chroma);
-                quant.quantize(&src, w, h, args.dither, &mut scratch, idx);
-            });
+        if scaled_lossy && scale_block.len() < cn {
+            let extra: Vec<Vec<u8>> = (scale_block.len()..cn)
+                .into_par_iter()
+                .map(|_| vec![255u8; w * h])
+                .collect();
+            scale_block.extend(extra);
+        }
+        {
+            let scale_slots: Vec<Option<&mut Vec<u8>>> = if scaled_lossy {
+                scale_block[..cn].iter_mut().map(Some).collect()
+            } else {
+                (0..cn).map(|_| None).collect()
+            };
+            chunk
+                .into_par_iter()
+                .zip(idx_block[..cn].par_iter_mut())
+                .zip(scale_slots.into_par_iter())
+                .for_each(|((f, idx), scale)| {
+                    let wi = rayon::current_thread_index().unwrap_or(nthreads);
+                    let mut scratch = worker_ctx[wi]
+                        .quant
+                        .get_or_init(|| Mutex::new(dither::QuantScratch::new(w)))
+                        .lock()
+                        .unwrap();
+                    let src = color::RowSource::new(&f, w, h, meta.chroma);
+                    quant.quantize(
+                        &src,
+                        w,
+                        h,
+                        args.dither,
+                        &mut scratch,
+                        idx,
+                        scale.map(|v| v.as_mut_slice()),
+                    );
+                });
+        }
         encoded.par_extend((0..cn).into_par_iter().map(|j| {
             let wi = rayon::current_thread_index().unwrap_or(nthreads);
             let mut encode = worker_ctx[wi]
@@ -909,6 +937,11 @@ fn run(args: &Args) -> io::Result<()> {
                 delays[i],
                 disposal,
                 lossy_map.as_ref(),
+                if scaled_lossy {
+                    Some(scale_block[j].as_slice())
+                } else {
+                    None
+                },
                 &mut encode,
             )
         }));
