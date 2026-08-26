@@ -99,35 +99,94 @@ pub fn parse_y4m_header(line: &str) -> io::Result<VideoIn> {
     })
 }
 
-/// Fill the caller's frame buffer (`buf.len()` bytes, already faulted in
-/// — see the reader's prefault thread in main.rs) from the stream.
-/// Returns None on immediate clean EOF; errors on a short read.
-fn read_frame_into(r: &mut impl Read, mut buf: Vec<u8>, what: &str) -> io::Result<Option<Vec<u8>>> {
-    let n = buf.len();
-    let mut got = 0usize;
-    while got < n {
-        match r.read(&mut buf[got..]) {
-            Ok(0) => break,
-            Ok(k) => got += k,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
+/// stdin, wrapped so a frame's payload lands in the caller's buffer with
+/// one copy instead of two.
+///
+/// A `BufReader` refill copies the stream into its own buffer and `read`
+/// copies it out again. That second copy is invisible when the frame is
+/// small or the destination write dominates, but on packed RGBA — four
+/// bytes a pixel, arriving down a pipe — it is a second pass over every
+/// byte of the input on the one thread that paces the whole read and
+/// histogram phase. Here whatever is already buffered ahead of the
+/// payload (the format probe in `pending`, plus the tail of the last
+/// refill) is copied out first, and the rest is read straight into the
+/// destination.
+pub struct FrameSource {
+    inner: io::BufReader<io::Stdin>,
+    /// Bytes taken off the stream before the `BufReader` existed (the raw
+    /// RGBA format probe), consumed ahead of its buffer.
+    pending: Vec<u8>,
+    pending_pos: usize,
+}
+
+impl FrameSource {
+    pub fn new(inner: io::BufReader<io::Stdin>, pending: Vec<u8>) -> Self {
+        FrameSource {
+            inner,
+            pending,
+            pending_pos: 0,
         }
     }
-    if got == 0 {
-        return Ok(None);
+
+    /// Copy out of `pending` and then the `BufReader`'s buffer, without
+    /// triggering a refill. Returns how much of `dst` was filled.
+    fn drain_buffered(&mut self, dst: &mut [u8]) -> usize {
+        let mut n = 0;
+        let left = &self.pending[self.pending_pos..];
+        if !left.is_empty() {
+            n = left.len().min(dst.len());
+            dst[..n].copy_from_slice(&left[..n]);
+            self.pending_pos += n;
+        }
+        let buffered = self.inner.buffer();
+        if n < dst.len() && !buffered.is_empty() {
+            let k = buffered.len().min(dst.len() - n);
+            dst[n..n + k].copy_from_slice(&buffered[..k]);
+            self.inner.consume(k);
+            n += k;
+        }
+        n
     }
-    if got < n {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            format!("{what}: truncated frame ({got} of {n} bytes)"),
-        ));
+
+    /// Fill the caller's frame buffer (`buf.len()` bytes, already faulted
+    /// in — see the reader's prefault thread in main.rs) from the stream.
+    /// Returns None on immediate clean EOF; errors on a short read.
+    fn read_frame_into(&mut self, mut buf: Vec<u8>, what: &str) -> io::Result<Option<Vec<u8>>> {
+        let n = buf.len();
+        let mut got = self.drain_buffered(&mut buf);
+        while got < n {
+            // Past the buffered bytes: read into the frame buffer itself.
+            match self.inner.get_mut().read(&mut buf[got..]) {
+                Ok(0) => break,
+                Ok(k) => got += k,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        if got == 0 {
+            return Ok(None);
+        }
+        if got < n {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("{what}: truncated frame ({got} of {n} bytes)"),
+            ));
+        }
+        Ok(Some(buf))
     }
-    Ok(Some(buf))
+
+    /// The next line, for the Y4M FRAME marker. `pending` is empty on the
+    /// Y4M path (its probe bytes are part of the header line, read off the
+    /// `BufReader` before this wrapper is built).
+    fn read_line(&mut self, out: &mut String) -> io::Result<usize> {
+        debug_assert_eq!(self.pending_pos, self.pending.len());
+        self.inner.read_line(out)
+    }
 }
 
 /// Read the next Y4M frame (FRAME marker + planes) into `buf`, which must
 /// hold exactly one frame (`Chroma::frame_bytes`), or None at EOF.
-pub fn read_y4m_frame(r: &mut impl BufRead, buf: Vec<u8>) -> io::Result<Option<Frame>> {
+pub fn read_y4m_frame(r: &mut FrameSource, buf: Vec<u8>) -> io::Result<Option<Frame>> {
     let mut line = String::new();
     if r.read_line(&mut line)? == 0 {
         return Ok(None); // clean EOF
@@ -138,7 +197,7 @@ pub fn read_y4m_frame(r: &mut impl BufRead, buf: Vec<u8>) -> io::Result<Option<F
             "y4m: expected FRAME marker",
         ));
     }
-    match read_frame_into(r, buf, "y4m")? {
+    match r.read_frame_into(buf, "y4m")? {
         Some(buf) => Ok(Some(Frame::Yuv(buf))),
         None => Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -149,8 +208,8 @@ pub fn read_y4m_frame(r: &mut impl BufRead, buf: Vec<u8>) -> io::Result<Option<F
 
 /// Read the next raw RGBA frame into `buf` (exactly w*h*4 bytes), or None
 /// at EOF.
-pub fn read_rgba_frame(r: &mut impl Read, buf: Vec<u8>) -> io::Result<Option<Frame>> {
-    Ok(read_frame_into(r, buf, "raw rgba")?.map(Frame::Rgba))
+pub fn read_rgba_frame(r: &mut FrameSource, buf: Vec<u8>) -> io::Result<Option<Frame>> {
+    Ok(r.read_frame_into(buf, "raw rgba")?.map(Frame::Rgba))
 }
 
 /// Temporal hold: the per-pixel "keep the previous value" prefilter for
