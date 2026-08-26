@@ -877,7 +877,22 @@ fn run(args: &Args) -> io::Result<()> {
     // Enough frames per block that both halves keep every worker busy;
     // small enough that the block's index buffers stay a modest, clip-
     // length-independent working set.
-    let block = 4 * nthreads;
+    //
+    // Four frames per worker is not enough to balance: a block ends when
+    // its slowest frame does, and frame costs vary several-fold with how
+    // much of the frame the auto dither gate lights up. At 40 threads and
+    // 480p, going from 4 frames per worker to 16 lifts the measured
+    // parallel efficiency from 0.79 to 0.85 quantizing and from 0.68 to
+    // 0.81 encoding, and cuts quantize+lzw by 15 %. Sixteen is where the
+    // corpus stops improving (most clips are then a single block).
+    //
+    // The index buffers are a byte per pixel per frame, so on large
+    // frames that many would be gigabytes: cap the block by a memory
+    // budget, and keep the old four-per-worker as the floor so nothing
+    // regresses on 4K, where a frame is 48x the work of a 480p one
+    // anyway.
+    const IDX_BUDGET: usize = 128 << 20;
+    let block = (IDX_BUDGET / (w * h)).clamp(4 * nthreads, 16 * nthreads);
     let mut encoded: Vec<gif::EncodedFrame> = Vec::with_capacity(nread);
     let mut prev_last: Option<Vec<u8>> = None;
     let mut frames_it = frames.into_iter();
