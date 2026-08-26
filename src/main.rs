@@ -435,22 +435,40 @@ fn run(args: &Args) -> io::Result<()> {
                 Source::Y4m(_) => meta_ref.chroma.unwrap().frame_bytes(w, h),
                 Source::Rgba(_) => w * h * 4,
             };
-            let (btx, brx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
-            let prefault = std::thread::spawn(move || loop {
-                // Deliberately not `vec![0; fsize]`: that is calloc, whose
-                // pages stay unmapped until first written, i.e. the fault
-                // would land on the reader after all. resize() stores the
-                // zeros itself, which is the first touch we want here.
-                #[allow(clippy::slow_vector_initialization)]
-                let v: Vec<u8> = {
-                    let mut v = Vec::with_capacity(fsize);
-                    v.resize(fsize, 0);
-                    v
-                };
-                if btx.send(v).is_err() {
-                    break;
-                }
-            });
+            // Every frame of the clip stays resident, so each one needs its
+            // own fresh pages, and faulting a frame in costs more than
+            // reading one: with a single helper the reader spends about as
+            // long waiting for a buffer as it does reading (measured 48 ms
+            // of wait against 50 ms of read on a 20 s 480p clip at 40
+            // threads). Spreading the prefaulting over three helpers drops
+            // that wait to ~3 ms and the whole read+histogram phase by 22 %;
+            // a fourth is already past the point where the reader is the one
+            // waiting, and more only add page-zeroing contention with the
+            // histogram workers.
+            let helpers = nthreads.clamp(1, 3);
+            let (btx, brx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2 * helpers);
+            let prefault: Vec<_> = (0..helpers)
+                .map(|_| {
+                    let btx = btx.clone();
+                    std::thread::spawn(move || loop {
+                        // Deliberately not `vec![0; fsize]`: that is calloc,
+                        // whose pages stay unmapped until first written,
+                        // i.e. the fault would land on the reader after all.
+                        // resize() stores the zeros itself, which is the
+                        // first touch we want here.
+                        #[allow(clippy::slow_vector_initialization)]
+                        let v: Vec<u8> = {
+                            let mut v = Vec::with_capacity(fsize);
+                            v.resize(fsize, 0);
+                            v
+                        };
+                        if btx.send(v).is_err() {
+                            break;
+                        }
+                    })
+                })
+                .collect();
+            drop(btx);
             let mut n = 0usize;
             let res = (|| {
                 loop {
@@ -471,8 +489,10 @@ fn run(args: &Args) -> io::Result<()> {
                 }
                 Ok(n)
             })();
-            drop(brx); // unblocks the helper's pending send
-            prefault.join().expect("prefault thread panicked");
+            drop(brx); // unblocks the helpers' pending sends
+            for h in prefault {
+                h.join().expect("prefault thread panicked");
+            }
             res
         });
         for _ in 0..smoothers {
