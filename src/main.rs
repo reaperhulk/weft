@@ -32,7 +32,7 @@ struct Args {
     loop_count: Option<u16>,
     lossy: u32,
     hold: u32,
-    /// None = not given: `--dither auto` then defaults it to 16
+    /// None = not given (0)
     smooth: Option<u32>,
     threads: Option<usize>,
     stats: bool,
@@ -58,14 +58,16 @@ options:
   --format F         auto | rgba | y4m          (default: auto)
   --colors N         max palette colors, 2-256  (default: 256; one slot is
                      reserved for transparency, so 256 means 255 colors)
-  --dither D         bluenoise | auto | sierra2 | bayer | none
-                     (default: bluenoise, which is fast, temporally
-                     stable, and compresses well; auto is bluenoise only
-                     in 32x32 tiles where the nearest-colour map shows
-                     banding contours, plain nearest colour elsewhere,
-                     and implies --smooth 16 unless --smooth is given;
-                     sierra2 error diffusion has slightly higher visual
-                     quality but is slower and shimmers frame-to-frame)
+  --dither D         auto | bluenoise | sierra2 | bayer | none
+                     (default: auto — blue noise only in 32x32 tiles
+                     where the nearest-colour map shows banding
+                     contours, plain nearest colour elsewhere; smaller
+                     and higher-fidelity than either extreme; on noisy
+                     scans pair it with --smooth, or its gate sees grain.
+                     bluenoise dithers everywhere: fast, temporally
+                     stable; sierra2 error diffusion has slightly higher
+                     visual quality but is slower and shimmers
+                     frame-to-frame)
   --dither-gate N    activity gate for bluenoise, 0-720 (default: 16;
                      0 = off). Smooth regions keep full dither; busier
                      regions get progressively less, reaching none at
@@ -84,12 +86,13 @@ options:
                      noise (2.5x its median change, at least 4) and N
                      caps it; ~12 is a safe cap: grainy scans use most
                      of it, clean sources settle at 4-5 on their own
-  --smooth N         spatial grain filter, 0-765 (default: 0 = off, or
-                     16 with --dither auto): each pixel becomes the mean
-                     of its 5x5 neighbours within N (|dR|+|dG|+|dB|);
-                     edges are excluded so outlines stay crisp. ~16-24
-                     removes film grain and codec noise, which otherwise
-                     defeats --hold and misleads the auto dither gate
+  --smooth N         spatial grain filter, 0-765 (default: 0 = off): each
+                     pixel becomes the mean of its 5x5 neighbours within
+                     N (|dR|+|dG|+|dB|); edges are excluded so outlines
+                     stay crisp. ~16-24 removes film grain and codec
+                     noise, which otherwise defeats --hold and misleads
+                     the auto dither gate. Not for clean or few-colour
+                     sources: it invents colours
   --no-loop          play once (no NETSCAPE extension)
   --threads N        worker threads             (default: all cores)
   --stats            print timing breakdown to stderr
@@ -101,7 +104,7 @@ fn parse_args() -> Result<Args, String> {
         fps: None,
         format: Format::Auto,
         colors: 256,
-        dither: Dither::BlueNoise,
+        dither: Dither::Auto,
         dither_gate: 16,
         loop_count: Some(0),
         lossy: 0,
@@ -374,14 +377,11 @@ fn run(args: &Args) -> io::Result<()> {
     let (read_res, mut indexed_frames, any_alpha) = std::thread::scope(|scope| {
         let meta_ref = &meta;
         let hold = args.hold;
-        // --dither auto reads structure off the nearest-colour map, and on
-        // grainy input that structure is grain: fills split into blobs
-        // that pass for banding contours and the gate fires everywhere.
-        // Smoothing first is what makes the map meaningful, so auto
-        // defaults it on (16: safe on live action) unless given explicitly.
-        let smooth = args
-            .smooth
-            .unwrap_or(if args.dither == Dither::Auto { 16 } else { 0 });
+        // The prefilters are opt-in. (--dither auto once implied --smooth 16
+        // so its gate saw a denoised map; that inflated exact-palette
+        // sources — smoothing invents colours — by 60% and doubled the
+        // resident set on y4m input, which converts to RGBA to be filtered.)
+        let smooth = args.smooth.unwrap_or(0);
         let level = simdops::level();
         // ---- prefilter pipeline ------------------------------------------
         // --smooth and --hold run as pipeline stages between the reader and

@@ -22,16 +22,18 @@ pub enum Dither {
     None,
 }
 
-/// Lossy cap fraction (0..=255) in perfectly smooth undithered regions.
-/// Zero: such regions encode losslessly. Any substitution there shows —
-/// the encoder's error feedback toggles between two indices to hold the
-/// average, which on a gradient reads as hatching and plateaus — and
-/// lossless runs are already cheap where nothing varies. Measured on a
-/// clean cartoon clip at --lossy 30 with --dither none: 1.22 MB / 38.4 dB
-/// with the full cap (visible hatching), 1.72 MB / 40.5 dB with this
-/// (clean; lossless is 1.83 MB), against 1.63 MB / 37.7 dB for the
-/// dithered default. Cel content with dither on costs 6-12% for it.
-const LOSSY_FLAT_FLOOR: u32 = 0;
+/// Lossy cap fraction (0..=255) in perfectly smooth undithered regions:
+/// 8/255, about 3% of the --lossy budget. Substitutions there show — the
+/// encoder's error feedback toggles between two indices to hold the
+/// average, which on a gradient reads as hatching and plateaus — but
+/// forbidding them outright (floor 0) also forbids the invisible swaps
+/// between adjacent entries of a smooth ramp, and on an all-gradient clip
+/// that left --lossy 30 a no-op (2290 KB, versus 1594 for gifsicle at
+/// 61.6 dB). Measured on a clean cartoon clip at --lossy 30, --dither
+/// none: floor 0 1.72 MB / 40.47 dB, floor 8 1.67 MB / 40.37 dB with the
+/// crop indistinguishable, floor 16 faint hatching, 32+ visible; on the
+/// gradient clip floor 8 gives 1222 KB at 48.8 dB (lossless 49.2).
+const LOSSY_FLAT_FLOOR: u32 = 8;
 
 /// Lossy scale from the activity attenuation (`att` in 0..=256, 256 = the
 /// smoothest): ramps from the flat floor up to the full cap as activity

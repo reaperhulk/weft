@@ -48,9 +48,10 @@ weft --colors 64 --dither none --no-loop < input.y4m > out.gif
 --format F         auto | rgba | y4m          (default: auto)
 --colors N         max palette colors, 2-256  (default: 256; one slot is
                    reserved for transparency, so 256 means 255 colors)
---dither D         bluenoise | auto | sierra2 | bayer | none
-                   (default: bluenoise; auto dithers only 32x32 tiles
-                   whose nearest-colour map shows banding contours)
+--dither D         auto | bluenoise | sierra2 | bayer | none
+                   (default: auto — blue noise only in 32x32 tiles whose
+                   nearest-colour map shows banding contours, plain
+                   nearest colour elsewhere)
 --dither-gate N    activity gate for bluenoise, 0-720 (default: 16;
                    0 = off): busy regions get progressively less dither
 --loop N           loop count, 0 = forever    (default: 0)
@@ -61,8 +62,8 @@ weft --colors 64 --dither none --no-loop < input.y4m > out.gif
                    stays within N (|dR|+|dG|+|dB|) of its running mean and
                    within 1.5N of its held value keeps that value; ~8-12
                    is invisible and much smaller on compressed-video input
---smooth N         spatial grain filter, 0-765 (default: 0 = off, or 16
-                   with --dither auto): each pixel becomes the mean of
+--smooth N         spatial grain filter, 0-765 (default: 0 = off): each
+                   pixel becomes the mean of
                    its 5x5 neighbours within N; edges are excluded so
                    outlines stay crisp. ~16-24 removes film grain and
                    codec noise (which also defeats --hold)
@@ -83,40 +84,37 @@ so a clip that mixes them pays only for the frames that need it.
 ## Benchmarks
 
 640×360 @30fps, 150 frames (5 s) except `big` (1280×720, 300 frames);
-4 cores; ffmpeg 6.1.1 running its single-command in-memory two-pass
-`split[a][b];[a]palettegen[p];[b][p]paletteuse`. Best of 2 runs. PSNR/SSIM
-measured on the decoded GIF against the decoded source at the source frame
-rate.
+40-vCPU Xeon 6248 (KVM guest); ffmpeg 8.0.1 running its single-command
+in-memory two-pass `split[a][b];[a]palettegen[p];[b][p]paletteuse`. Best
+of 2 runs. PSNR/SSIM measured on the decoded GIF against the decoded
+source at the source frame rate.
 
 | clip      | encoder | time (s) | peak RSS (MB) | size (KB) | PSNR (dB) | SSIM  |
 |-----------|---------|---------:|--------------:|----------:|----------:|------:|
-| rgba¹     | ffmpeg  | 2.25     | 201           | 2296      | 40.07     | 0.9847|
-| rgba¹     | weft    | **0.34** | 118           | **2160**  | **40.51** | **0.9855**|
-| testsrc   | ffmpeg  | 2.06     | 199           | 2296      | 40.07     | 0.985 |
-| testsrc   | weft    | **0.31** | 63            | **2170**  | 40.07²    | 0.900²|
-| big (720p)| ffmpeg  | 18.23    | 1150          | 13751     | 42.16     | 0.993 |
-| big (720p)| weft    | **2.28** | 417           | **13117** | 41.77²    | 0.900²|
-| mandel    | ffmpeg  | 9.51     | 264           | 16762     | 31.40     | 0.886 |
-| mandel    | weft    | **0.68** | 93            | **16130** | **32.20** | 0.873 |
-| gradients | ffmpeg  | 1.76     | 189           | 5378      | inf³      | 1.000 |
-| gradients | weft    | **0.35** | 78            | **4906**  | 46.7²³    | 0.9993|
-| life      | ffmpeg  | 1.62     | 189           | 3511      | 74.59     | 0.9997|
-| life      | weft    | **0.21** | 63            | **3389**  | 53.4²     | 0.993 |
-| static    | ffmpeg  | 1.28     | 189           | 15        | inf³      | 1.000 |
-| static    | weft    | **0.17** | 63            | **11**    | 49.7²³    | 0.976 |
+| rgba¹     | ffmpeg  | 1.62     | 216           | 2296      | 40.07     | 0.9847|
+| rgba¹     | weft    | **0.13** | 189           | **2002**  | **40.89** | **0.9865**|
+| testsrc   | ffmpeg  | 1.54     | 208           | 2296      | 40.07     | 0.985 |
+| testsrc   | weft    | **0.11** | 119           | **2015**  | **40.41**²| 0.900²|
+| big (720p)| ffmpeg  | 9.93     | 1165          | 13751     | 42.16     | 0.993 |
+| big (720p)| weft    | **0.53** | 535           | **12341** | 42.10²    | 0.901²|
+| mandel    | ffmpeg  | 6.46     | 273           | 16762     | 31.40     | 0.886 |
+| mandel    | weft    | **0.20** | 173           | **16130** | **32.20** | 0.873 |
+| gradients | ffmpeg  | 1.15     | 198           | 2340      | 67.1³     | 0.9998|
+| gradients | weft    | **0.11** | 125           | **2290**  | 49.2²³    | 0.9993|
+| life      | ffmpeg  | 1.11     | 198           | 2947      | 75.4³     | 0.9997|
+| life      | weft    | **0.09** | 106           | **2844**  | 54.2²³    | 0.993 |
+| static    | ffmpeg  | 1.15     | 198           | 15        | inf³      | 1.000 |
+| static    | weft    | **0.08** | 106           | **11**    | 49.7²³    | 0.976 |
 
-**5–14× faster, smaller output on every clip, 2–3× less memory.**
+**10–32× faster, smaller output on every clip, 1.1–2.2× less memory.**
 
 Each encoder runs its default dither: sierra2 error diffusion for
-ffmpeg's paletteuse, blue-noise for weft (temporally stable and smaller;
-see below).
+ffmpeg's paletteuse, `auto` for weft (blue noise where the picture bands,
+plain nearest colour elsewhere; see below).
 
 ¹ `rgba` is the apples-to-apples row: identical input bytes for both
-encoders, no YUV→RGB conversion anywhere. With the activity-gated
-blue-noise default, weft measures *higher* PSNR and SSIM than ffmpeg on
-identical input, with a 6% smaller file; with `--dither sierra2` — the
-same algorithm ffmpeg uses — weft measures 40.08 dB / 0.9846:
-statistically identical.
+encoders, no YUV→RGB conversion anywhere. weft measures *higher* PSNR
+and SSIM than ffmpeg on identical input, with a 13% smaller file.
 
 ² The y4m rows undercount weft's quality: the PSNR/SSIM reference is
 decoded with swscale, which *truncates* in YUV→RGB where weft rounds to
@@ -124,33 +122,32 @@ nearest (e.g. Y=180 → 1.164×164 = 190.96: correctly 191, swscale says
 190). weft's output therefore shows a constant ±1–2 offset against that
 reference in flat regions — despite being the *closer* conversion — which
 caps measurable PSNR around 44–55 dB and dents SSIM in zero-variance
-areas. With `--dither sierra2` (ffmpeg's algorithm), measured dither
-speckle (high-pass error RMS) is identical to ffmpeg's: 2.69/1.52/1.69
-vs 2.65/1.52/1.86 per RGB channel on `testsrc`.
+areas.
 
 ³ Sources with ≤255 distinct colors get a bit-exact (lossless) palette
-from both encoders.
+from both encoders; on the y4m rows only the conversion offset of ²
+separates them.
 
 ### Lossy mode
 
 `weft --lossy 30` against the standard two-tool pipeline — the ffmpeg
-encode above piped through `gifsicle -O3 --lossy=30` (gifsicle 1.94),
+encode above piped through `gifsicle -O3 --lossy=30` (gifsicle 1.96),
 timed as the sum of both stages:
 
 | clip      | pipeline          | time (s) | size (KB) | PSNR (dB) | SSIM  |
 |-----------|-------------------|---------:|----------:|----------:|------:|
-| testsrc   | ffmpeg + gifsicle | 12.9     | 1975      | 39.17     | 0.940 |
-| testsrc   | weft --lossy 30   | **0.49** | 1992      | 39.36²    | 0.875²|
-| big (720p)| ffmpeg + gifsicle | 114.4    | 11854     | 41.02     | 0.974 |
-| big (720p)| weft --lossy 30   | **3.67** | **11602** | 41.13²    | 0.891²|
-| mandel    | ffmpeg + gifsicle | 39.5     | 11734     | 30.91     | 0.854 |
-| mandel    | weft --lossy 30   | **1.24** | 12710     | 31.33     | 0.821 |
-| gradients | ffmpeg + gifsicle | 10.3     | 1334      | 48.74     | 0.989 |
-| gradients | weft --lossy 30   | **1.16** | **1287**  | 44.87²    | 0.990 |
+| testsrc   | ffmpeg + gifsicle | 7.68     | 2188      | 39.75     | 0.965 |
+| testsrc   | weft --lossy 30   | **0.13** | **1924**  | **40.16**²| 0.893²|
+| big (720p)| ffmpeg + gifsicle | 61.1     | 13493     | 42.16     | 0.992 |
+| big (720p)| weft --lossy 30   | **0.73** | **11334** | 41.74²    | 0.899²|
+| mandel    | ffmpeg + gifsicle | 31.5     | 16341     | 31.39     | 0.886 |
+| mandel    | weft --lossy 30   | **0.28** | **12714** | 31.34     | 0.821 |
+| gradients | ffmpeg + gifsicle | 3.89     | 1594      | 61.6³     | 0.9994|
+| gradients | weft --lossy 30   | **0.15** | **1222**  | 48.8²³    | 0.9983|
 
-**9–32× faster than the two-tool pipeline**, at sizes between 4% smaller
-and 8% larger, and quality within the dither-default and
-reference-decoder gaps above (the weft rows inherit footnote ²).
+**26–113× faster than the two-tool pipeline, 12–23% smaller on every
+clip**, and quality within the reference-decoder gap above (the weft
+rows inherit footnote ²).
 
 Reproduce with:
 
@@ -161,7 +158,8 @@ bench/run.sh          # full comparison table
 
 ## Dithering modes
 
-`bluenoise` (default) is a two-candidate ordered dither against a 64×64
+`auto` (default) is `bluenoise` gated per tile by a banding detector —
+see below. `bluenoise` is a two-candidate ordered dither against a 64×64
 void-and-cluster blue-noise mask: for each pixel it finds the nearest
 palette color, and only when quantization error exists, lets the
 threshold pick between the two palette colors spanning that error — so
@@ -197,7 +195,7 @@ encodes losslessly whatever the dither setting. The mask is generated by
 `bench/gen_bluenoise.py` (Ulichney void-and-cluster) and checked in as
 `src/bluenoise.rs`.
 
-`auto` addresses the case where neither extreme is right: on flat content
+`auto`, the default, addresses the case where neither extreme is right: on flat content
 (cel animation, UI, text) dither only renders invisible quantization error
 as visible speckle and `none` looks better and compresses smaller, while
 on gradients (skies, dark scenes, skin) `none` posterizes. `auto` runs the
@@ -215,13 +213,15 @@ synthetic gradients 100%; size and PSNR land between the two modes.
 The detector reads structure off the nearest-colour map, so it needs
 that map to reflect the picture rather than the noise: on raw grainy
 input a flat fill sitting between two palette entries quantizes into
-blobs of both, and blobs are wide enough with a small enough colour step
-to pass for banding — the gate then fires on nearly every tile and
-`auto` degrades to plain blue noise. `--dither auto` therefore implies
-`--smooth 16` (the live-action-safe strength) unless `--smooth` is
-given; `--smooth 0` opts out. `--stats` reports the dithered-tile
-fraction, and a reading near 100% on content that is not all gradient
-is the tell that the input needs more smoothing.
+blobs of both, wide enough with a small enough colour step to pass for
+banding — the gate then fires on nearly every tile and `auto` degrades
+to plain blue noise (today's behaviour, not worse). On such sources pair
+it with `--smooth` (16 is safe on live action, 24 on cel animation);
+`--stats` reports the dithered-tile fraction, and a reading near 100% on
+content that is not all gradient is the tell. `--smooth` is not implied
+by default because it invents colours: a source with fewer colours than
+the palette is encoded exactly without it and grows (measured +60% on a
+two-colour automaton) with it.
 
 ## Lossy compression
 
@@ -244,12 +244,13 @@ dramatically better. Measured at `--lossy 30` (same clips as above):
 
 With `--dither none` or `auto`, the error cap is scaled per pixel: full
 where a pixel is dithered (`auto`'s live tiles) or the source is busy,
-falling to zero in perfectly smooth undithered regions. Lossy substitution
-there is what produces the plateaus and hatching that make undithered
-gradients look posterized — the encoder's error feedback toggles between
-two indices to hold the average, and with no dither texture to hide in
-the toggling shows — and lossless runs are already cheap where nothing
-varies. `bluenoise` keeps the flat cap (dither absorbs the substitutions).
+falling to ~3% of it in perfectly smooth undithered regions. Lossy
+substitution there is what produces the plateaus and hatching that make
+undithered gradients look posterized — the encoder's error feedback
+toggles between two indices to hold the average, and with no dither
+texture to hide in the toggling shows — while the small residual budget
+still allows the invisible swaps between adjacent entries of a smooth
+ramp. `bluenoise` keeps the flat cap (dither absorbs the substitutions).
 
 Two structural pieces land alongside it (and improve lossless output too):
 each delta frame is encoded both transparency-punched and plain-opaque and
