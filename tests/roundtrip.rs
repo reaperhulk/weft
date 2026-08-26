@@ -454,17 +454,18 @@ fn bayer_is_lossless_on_exact_palette() {
 
 #[test]
 fn hold_folds_noisy_static_frames() {
-    // A static solid frame with +-1 per-channel noise re-rolled each
+    // A static solid frame with 0/1 per-channel noise re-rolled each
     // frame, then a genuinely different frame. Without --hold the noise
-    // keeps every frame distinct; with it, the noisy frames hold at the
-    // first frame's values and fold into one delay.
+    // keeps every frame distinct; with it, the adaptive window (sized
+    // from the noise itself) holds the noisy frames at the first frame's
+    // values and they fold into one delay.
     let (w, h) = (32usize, 32usize);
     let mut raw = Vec::new();
     let mut seed = 0x9E37_79B9u32;
     for f in 0..4 {
         for _ in 0..w * h {
             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            let n = |k: u32| ((seed >> k) % 3) as u8; // 0, 1, 2
+            let n = |k: u32| ((seed >> k) % 2) as u8; // 0, 1
             raw.extend_from_slice(&[99 + n(3), 149 + n(11), 199 + n(19), 255]);
             let _ = f;
         }
