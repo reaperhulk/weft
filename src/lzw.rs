@@ -251,17 +251,22 @@ impl LzwEncoder {
     /// (min-code-size byte + length-prefixed sub-blocks + terminator) to `out`.
     /// With `lossy`, dictionary matches may continue through near-color
     /// substitutions within the map's error budget.
+    /// `scale`, when given with `lossy`, is one byte per pixel of `data`
+    /// (0..=255) scaling that pixel's error cap: the quantizer sets it
+    /// below 255 in smooth undithered regions, where a substitution shows
+    /// as a plateau or hatch rather than vanishing into dither.
     pub fn encode(
         &mut self,
         min_code_size: u8,
         data: &[u8],
         lossy: Option<&LossyMap>,
+        scale: Option<&[u8]>,
         out: &mut Vec<u8>,
     ) {
         out.push(min_code_size);
         self.scratch.clear();
         let mut scratch = std::mem::take(&mut self.scratch);
-        self.encode_raw(min_code_size, data, lossy, &mut scratch);
+        self.encode_raw(min_code_size, data, lossy, scale, &mut scratch);
 
         // Chunk into 255-byte sub-blocks.
         out.reserve(scratch.len() + scratch.len() / 255 + 2);
@@ -278,10 +283,11 @@ impl LzwEncoder {
         min_code_size: u8,
         data: &[u8],
         lossy: Option<&LossyMap>,
+        scale: Option<&[u8]>,
         out: &mut Vec<u8>,
     ) {
         if let Some(map) = lossy {
-            return self.encode_raw_lossy(min_code_size, data, map, out);
+            return self.encode_raw_lossy(min_code_size, data, map, scale, out);
         }
         let clear = 1u32 << min_code_size;
         let eoi = clear + 1;
@@ -358,8 +364,10 @@ impl LzwEncoder {
         min_code_size: u8,
         data: &[u8],
         map: &LossyMap,
+        scale: Option<&[u8]>,
         out: &mut Vec<u8>,
     ) {
+        debug_assert!(scale.is_none_or(|s| s.len() == data.len()));
         self.ensure_lossy_scratch();
         let clear = 1u32 << min_code_size;
         let eoi = clear + 1;
@@ -404,6 +412,7 @@ impl LzwEncoder {
                 &mut visits,
                 &mut best,
                 map,
+                scale,
             );
             bw.put(best.code, width);
             update_run_ewma(&mut run_ewma, (best.end - pos) as u32);
@@ -464,6 +473,7 @@ impl LzwEncoder {
         visits: &mut u32,
         best: &mut LossyBest,
         map: &LossyMap,
+        scale: Option<&[u8]>,
     ) -> bool {
         // Longest match wins; equal length prefers lower total error.
         if pos > best.end || (pos == best.end && accum < best.diff) {
@@ -493,18 +503,34 @@ impl LzwEncoder {
         if cb[(b >> 6) as usize] & (1u64 << (b & 63)) != 0 {
             if let Ok(code) = self.probe((node_code << 8) | b as u32) {
                 let nd = map.next_dither(b, b, &dither);
-                if self.lossy_dfs(gen, data, pos + 1, code, nd, accum, visits, best, map) {
+                if self.lossy_dfs(
+                    gen,
+                    data,
+                    pos + 1,
+                    code,
+                    nd,
+                    accum,
+                    visits,
+                    best,
+                    map,
+                    scale,
+                ) {
                     return true;
                 }
             }
         }
         if b != map.trans_idx {
+            // per-pixel cap: the frame's loss scale, if any, applies here
+            let cap = match scale {
+                Some(s) => (map.max_diff * s[pos] as u32) >> 8,
+                None => map.max_diff,
+            };
             for &b2 in map.candidates(b) {
                 if cb[(b2 >> 6) as usize] & (1u64 << (b2 & 63)) == 0 {
                     continue;
                 }
                 let d = map.diff(b, b2, &dither);
-                if d > map.max_diff {
+                if d > cap {
                     continue;
                 }
                 if let Ok(code) = self.probe((node_code << 8) | b2 as u32) {
@@ -519,6 +545,7 @@ impl LzwEncoder {
                         visits,
                         best,
                         map,
+                        scale,
                     ) {
                         return true;
                     }
@@ -601,7 +628,7 @@ pub mod tests {
     fn roundtrip_at(min_code_size: u8, data: &[u8]) {
         let mut enc = LzwEncoder::default();
         let mut raw = Vec::new();
-        enc.encode_raw(min_code_size, data, None, &mut raw);
+        enc.encode_raw(min_code_size, data, None, None, &mut raw);
         let dec = lzw_decode(min_code_size, &raw, data.len());
         assert_eq!(dec, data, "roundtrip failed for len {}", data.len());
     }
@@ -635,7 +662,7 @@ pub mod tests {
             let data = vec![0u8; len];
             let mut enc = LzwEncoder::default();
             let mut raw = Vec::new();
-            enc.encode_raw(2, &data, Some(&map), &mut raw);
+            enc.encode_raw(2, &data, Some(&map), None, &mut raw);
             assert_eq!(lzw_decode(2, &raw, len), data, "lossy roundtrip len {len}");
         }
     }
@@ -683,7 +710,7 @@ pub mod tests {
                 .map(|i| ((i as u32 * (round + 3)) % 251) as u8)
                 .collect();
             let mut raw = Vec::new();
-            enc.encode_raw(8, &data, None, &mut raw);
+            enc.encode_raw(8, &data, None, None, &mut raw);
             assert_eq!(lzw_decode(8, &raw, data.len()), data);
         }
     }
@@ -710,9 +737,9 @@ pub mod tests {
             .collect();
         let mut enc = LzwEncoder::default();
         let mut exact = Vec::new();
-        enc.encode_raw(8, &data, None, &mut exact);
+        enc.encode_raw(8, &data, None, None, &mut exact);
         let mut lossy = Vec::new();
-        enc.encode_raw(8, &data, Some(&map), &mut lossy);
+        enc.encode_raw(8, &data, Some(&map), None, &mut lossy);
         assert!(
             lossy.len() < exact.len() * 9 / 10,
             "lossy ({}) should be >10% smaller than exact ({})",
@@ -750,7 +777,7 @@ pub mod tests {
         }
         let mut enc = LzwEncoder::default();
         let mut out = Vec::new();
-        enc.encode_raw(8, &data, Some(&map), &mut out);
+        enc.encode_raw(8, &data, Some(&map), None, &mut out);
         let dec = lzw_decode(8, &out, data.len());
         for (i, (&got, &want)) in dec.iter().zip(&data).enumerate() {
             if want == trans || got == trans {
@@ -764,7 +791,7 @@ pub mod tests {
         let mut enc = LzwEncoder::default();
         let data = vec![7u8; 10_000];
         let mut out = Vec::new();
-        enc.encode(8, &data, None, &mut out);
+        enc.encode(8, &data, None, None, &mut out);
         assert_eq!(out[0], 8);
         // walk sub-blocks and collect payload
         let mut i = 1;

@@ -14,7 +14,68 @@ pub enum Dither {
     /// serial error-diffusion chain, temporally stable, far less visible
     /// structure than Bayer.
     BlueNoise,
+    /// Blue noise gated per 32x32 tile by a banding detector: tiles whose
+    /// nearest-colour map shows contours between long runs of visibly
+    /// different colours (the signature of posterization) are dithered,
+    /// everything else takes plain nearest colour. See `BandGate`.
+    Auto,
     None,
+}
+
+/// Lossy cap fraction (0..=255) in perfectly smooth undithered regions:
+/// 8/255, about 3% of the --lossy budget. Substitutions there show — the
+/// encoder's error feedback toggles between two indices to hold the
+/// average, which on a gradient reads as hatching and plateaus — but
+/// forbidding them outright (floor 0) also forbids the invisible swaps
+/// between adjacent entries of a smooth ramp, and on an all-gradient clip
+/// that left --lossy 30 a no-op (2290 KB, versus 1594 for gifsicle at
+/// 61.6 dB). Measured on a clean cartoon clip at --lossy 30, --dither
+/// none: floor 0 1.72 MB / 40.47 dB, floor 8 1.67 MB / 40.37 dB with the
+/// crop indistinguishable, floor 16 faint hatching, 32+ visible; on the
+/// gradient clip floor 8 gives 1222 KB at 48.8 dB (lossless 49.2).
+const LOSSY_FLAT_FLOOR: u32 = 8;
+
+/// Lossy scale from the activity attenuation (`att` in 0..=256, 256 = the
+/// smoothest): ramps from the flat floor up to the full cap as activity
+/// rises, mirroring the dither gate's ramp.
+#[inline(always)]
+fn lossy_scale_from_att(att: u32) -> u8 {
+    (LOSSY_FLAT_FLOOR + (256 - att) * (255 - LOSSY_FLAT_FLOOR) / 256) as u8
+}
+
+/// Banding detector for `Dither::Auto`. A band contour is a boundary
+/// between two same-index runs of at least `RUN` pixels whose two palette
+/// colours differ by an OkLab distance that is visible but not an edge
+/// (`pairs`, built by `NearestMap::band_pair_table`). Grain blobs fail the
+/// run test, outlines fail the distance test, gradients pass both. A tile
+/// is dithered when more than 1/`DENSITY` of its pixels sit on such a
+/// contour. Measured on a 32x32 grid: mandelbrot gradients 31% of tiles,
+/// dark live-action panelling (visibly posterized undithered) 19%, flat
+/// cel animation 4%.
+pub struct BandGate {
+    pub pairs: Vec<u8>,
+    /// live / total tile counts across the run, for --stats
+    pub live_tiles: std::sync::atomic::AtomicU64,
+    pub total_tiles: std::sync::atomic::AtomicU64,
+}
+
+impl BandGate {
+    pub const RUN: usize = 8;
+    pub const TILE: usize = 32;
+    pub const DENSITY: u32 = 50; // 2%
+    pub const DE_LO: f32 = 0.012;
+    pub const DE_HI: f32 = 0.05;
+    /// Live-tile fraction above which the whole frame is dithered: 1/4.
+    pub const FULL_NUM: u64 = 1;
+    pub const FULL_DENOM: u64 = 4;
+
+    pub fn new(nearest: &crate::palette::NearestMap) -> Self {
+        BandGate {
+            pairs: nearest.band_pair_table(Self::DE_LO, Self::DE_HI),
+            live_tiles: std::sync::atomic::AtomicU64::new(0),
+            total_tiles: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
 }
 
 const BAYER8: [[u8; 8]; 8] = [
@@ -43,6 +104,8 @@ pub struct Quantizer<'a> {
     /// noise — degrade to plain nearest-color, which also compresses far
     /// better. 0 disables the gate (dither everywhere error is nonzero).
     pub gate: u32,
+    /// Banding detector for `Dither::Auto` (None: mode unavailable).
+    pub band: Option<&'a BandGate>,
 }
 
 /// Per-thread quantization scratch: RGBA row buffers, memo cache, and the
@@ -58,6 +121,17 @@ pub struct QuantScratch {
     ors: Vec<u32>,
     c2c: Vec<u32>,
     att: Vec<u32>,
+    // Dither::Auto: whole-frame nearest indices, the previous row's
+    // long-run flags, and per-tile contour counts / live flags
+    idx_frame: Vec<u8>,
+    // padded rows for the SIMD scorer (BAND_PAD each side)
+    idxp: Vec<u8>,
+    flat_prev: Vec<u8>,
+    flat_cur: Vec<u8>,
+    ltmp: Vec<u8>,
+    cand: Vec<u8>,
+    tile_counts: Vec<u32>,
+    tile_live: Vec<u8>,
 }
 
 impl QuantScratch {
@@ -75,14 +149,30 @@ impl QuantScratch {
             // 256 = no attenuation: with the gate off this is never
             // rewritten and the threshold pick reduces to the ungated one
             att: vec![256; w],
+            idx_frame: Vec::new(),
+            idxp: vec![0xFF; w + 2 * crate::simdops::BAND_PAD],
+            flat_prev: vec![0; w + 2 * crate::simdops::BAND_PAD],
+            flat_cur: vec![0; w + 2 * crate::simdops::BAND_PAD],
+            ltmp: vec![0; w + 2 * crate::simdops::BAND_PAD],
+            cand: vec![0; w],
+            tile_counts: Vec::new(),
+            tile_live: Vec::new(),
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 impl<'a> Quantizer<'a> {
     /// Quantize a frame (accessed row-by-row via `src`, so YUV conversion
     /// stays fused and cache-resident) into palette indices. Returns true
     /// if any pixel was alpha-transparent.
+    ///
+    /// `scale`, if given, receives one byte per pixel for the lossy
+    /// encoder's per-pixel error cap (255 = full `--lossy` budget): full
+    /// where the pixel is dithered (dither texture absorbs substitutions)
+    /// or the source is busy, reduced toward `LOSSY_FLAT_FLOOR` in
+    /// smooth undithered regions, where substitutions read as plateaus
+    /// and hatching. Modes that dither everything leave it untouched.
     pub fn quantize(
         &self,
         src: &crate::color::RowSource,
@@ -91,11 +181,21 @@ impl<'a> Quantizer<'a> {
         mode: Dither,
         scratch: &mut QuantScratch,
         out: &mut [u8],
+        scale: Option<&mut [u8]>,
     ) -> bool {
         match mode {
-            Dither::None => self.quantize_plain(src, w, h, scratch, out),
+            Dither::None => self.quantize_plain_scaled(src, w, h, scratch, out, scale),
             Dither::Bayer => self.quantize_bayer(src, w, h, scratch, out),
             Dither::BlueNoise => self.quantize_bluenoise(src, w, h, scratch, out),
+            // an exact palette has nothing to dither; without a detector
+            // fall back to plain blue noise
+            Dither::Auto if self.exact_palette => {
+                self.quantize_plain_scaled(src, w, h, scratch, out, scale)
+            }
+            Dither::Auto => match self.band {
+                Some(b) => self.quantize_bluenoise_auto(src, w, h, scratch, out, b, scale),
+                None => self.quantize_bluenoise(src, w, h, scratch, out),
+            },
             Dither::Sierra2_4a => self.quantize_diffuse(src, w, h, scratch, out),
         }
     }
@@ -273,6 +373,262 @@ impl<'a> Quantizer<'a> {
         has_alpha
     }
 
+    /// `Dither::Auto`: the staged blue-noise pipeline with a per-tile
+    /// banding gate (see `BandGate`). Pass A looks up c1 for the whole
+    /// frame, storing one index byte per pixel, and scores each tile from
+    /// the run structure of the index map; pass B is the ungated pipeline
+    /// with the attenuation forced to zero in tiles that do not band, so
+    /// their far-candidate lookups are skipped and they emit c1 directly.
+    /// The c1 lookups are done once; pass B re-fills rows (a copy or
+    /// expand for packed frames) and re-derives the packed colour from the
+    /// stored index.
+    #[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+    fn quantize_bluenoise_auto(
+        &self,
+        src: &crate::color::RowSource,
+        w: usize,
+        h: usize,
+        scratch: &mut QuantScratch,
+        out: &mut [u8],
+        band: &BandGate,
+        mut scale: Option<&mut [u8]>,
+    ) -> bool {
+        // 64-px stripes (mask-aligned): dead tiles then skip the probe and
+        // threshold stages at tile granularity instead of per 256
+        const TILE: usize = 64;
+        const T: usize = BandGate::TILE;
+        let mask32 = &crate::bluenoise::BLUE_NOISE_64_U32;
+        let level = crate::simdops::level();
+        let gate_on = self.gate > 0;
+        let tx = w.div_ceil(T);
+        let ty = h.div_ceil(T);
+        if scratch.idx_frame.len() < w * h {
+            scratch.idx_frame.resize(w * h, 0);
+        }
+        scratch.tile_counts.clear();
+        scratch.tile_counts.resize(tx * ty, 0);
+        scratch.tile_live.clear();
+        scratch.tile_live.resize(tx * ty, 0);
+
+        // ---- pass A: c1 per pixel, tile contour counts ----------------
+        for y in 0..h {
+            let keys_ready = src.fill_row_with_grid_keys(y, &mut scratch.row, &mut scratch.keys);
+            if !keys_ready {
+                crate::simdops::bn_keys(level, &scratch.row, &mut scratch.keys);
+            }
+            let cache = &mut scratch.cache;
+            let row = &scratch.row[..];
+            let (before, rest) = scratch.idx_frame.split_at_mut(y * w);
+            let irow = &mut rest[..w];
+            for i in 0..w {
+                if let Some(p) = row.get((i + 8) * 4..(i + 8) * 4 + 4) {
+                    self.nearest.prefetch_cache_slot(cache, p[0], p[1], p[2]);
+                }
+                let p = &row[i * 4..i * 4 + 4];
+                irow[i] = self
+                    .nearest
+                    .lookup_cache_first(cache, scratch.keys[i], p[0], p[1], p[2])
+                    as u8;
+            }
+            // score: run flags + contour candidates (SIMD), then the sparse
+            // colour-pair test on candidates, counted per tile
+            const P: usize = crate::simdops::BAND_PAD;
+            scratch.idxp[P..P + w].copy_from_slice(irow);
+            let prev_row: Option<&[u8]> = if y > 0 {
+                Some(&before[(y - 1) * w..])
+            } else {
+                None
+            };
+            crate::simdops::band_score_row(
+                level,
+                &scratch.idxp,
+                prev_row,
+                &scratch.flat_prev,
+                &mut scratch.flat_cur,
+                &mut scratch.ltmp,
+                &mut scratch.cand,
+                w,
+            );
+            let counts = &mut scratch.tile_counts;
+            let trow = (y / T) * tx;
+            let pairs = &band.pairs;
+            let cand = &scratch.cand;
+            // candidates are sparse: skip 8 pixels at a time when none
+            let mut i = 0usize;
+            while i < w {
+                if i + 8 <= w && u64::from_ne_bytes(cand[i..i + 8].try_into().unwrap()) == 0 {
+                    i += 8;
+                    continue;
+                }
+                let c = cand[i];
+                if c != 0 {
+                    let b = irow[i];
+                    if c & 1 != 0 && pairs[irow[i - 1] as usize * 256 + b as usize] != 0 {
+                        counts[trow + i / T] += 1;
+                    }
+                    if c & 2 != 0 && pairs[prev_row.unwrap()[i] as usize * 256 + b as usize] != 0 {
+                        counts[trow + i / T] += 1;
+                    }
+                }
+                i += 1;
+            }
+            std::mem::swap(&mut scratch.flat_prev, &mut scratch.flat_cur);
+        }
+        // tile decision
+        let mut live = 0u64;
+        for tyy in 0..ty {
+            let th = T.min(h - tyy * T);
+            for txx in 0..tx {
+                let tw = T.min(w - txx * T);
+                let area = (tw * th) as u32;
+                let l = scratch.tile_counts[tyy * tx + txx] * BandGate::DENSITY > area;
+                scratch.tile_live[tyy * tx + txx] = l as u8;
+                live += l as u64;
+            }
+        }
+        // a frame that bands almost everywhere is gradient content: dither
+        // it whole. Mixed tiles on such frames measured worse than either
+        // extreme (LZW loses the pattern's regularity, and seams show).
+        if live * BandGate::FULL_DENOM > (tx * ty) as u64 * BandGate::FULL_NUM {
+            scratch.tile_live.fill(1);
+            live = (tx * ty) as u64;
+        }
+        band.live_tiles
+            .fetch_add(live, std::sync::atomic::Ordering::Relaxed);
+        band.total_tiles
+            .fetch_add((tx * ty) as u64, std::sync::atomic::Ordering::Relaxed);
+
+        // ---- pass B: staged pipeline, attenuation masked per tile --------
+        let mut has_alpha = false;
+        for y in 0..h {
+            // keys are not needed in pass B (c1 is stored); frames whose
+            // rows carry keys for free skip that work
+            let keys_ready = src.has_direct_rgb_keys();
+            if keys_ready {
+                src.fill_row(y, &mut scratch.row);
+            } else {
+                src.fill_row_with_grid_keys(y, &mut scratch.row, &mut scratch.keys);
+            }
+            let has_alpha_row = if gate_on && keys_ready {
+                let prev: &[u8] = if y == 0 { &scratch.row } else { &scratch.row2 };
+                crate::simdops::bn_activity(level, &scratch.row, prev, self.gate, &mut scratch.att);
+                false
+            } else if gate_on {
+                let prev: &[u8] = if y == 0 { &scratch.row } else { &scratch.row2 };
+                crate::simdops::bn_keys_att(
+                    level,
+                    &scratch.row,
+                    prev,
+                    self.gate,
+                    &mut scratch.keys,
+                    &mut scratch.att,
+                )
+            } else {
+                scratch.att.fill(256);
+                if !keys_ready {
+                    crate::simdops::bn_keys(level, &scratch.row, &mut scratch.keys)
+                } else {
+                    false
+                }
+            };
+            has_alpha |= has_alpha_row;
+            let tlive = &scratch.tile_live[(y / T) * tx..(y / T + 1) * tx];
+            if let Some(scale) = scale.as_deref_mut() {
+                // lossy cap: full in dithered tiles, activity-scaled elsewhere
+                let srow = &mut scale[y * w..(y + 1) * w];
+                for (txx, &l) in tlive.iter().enumerate() {
+                    let x0 = txx * T;
+                    let x1 = (x0 + T).min(w);
+                    if l != 0 {
+                        srow[x0..x1].fill(255);
+                    } else {
+                        for (s, &a) in srow[x0..x1].iter_mut().zip(&scratch.att[x0..x1]) {
+                            *s = lossy_scale_from_att(a);
+                        }
+                    }
+                }
+            }
+            for (txx, &l) in tlive.iter().enumerate() {
+                if l == 0 {
+                    let x0 = txx * T;
+                    scratch.att[x0..(x0 + T).min(w)].fill(0);
+                }
+            }
+            let mrow: &[u32; 64] = mask32[(y & 63) << 6..((y & 63) << 6) + 64]
+                .try_into()
+                .unwrap();
+            let irow = &scratch.idx_frame[y * w..(y + 1) * w];
+            let mut x0 = 0usize;
+            while x0 < w {
+                let tw = TILE.min(w - x0);
+                let row = &scratch.row[x0 * 4..(x0 + tw) * 4];
+                let orow = &mut out[y * w + x0..y * w + x0 + tw];
+                let att = &scratch.att[x0..x0 + tw];
+                let cache = &mut scratch.cache;
+                let tile_live = att.iter().any(|&a| a != 0);
+                if tile_live {
+                    for i in 0..tw {
+                        scratch.pk1[i] = self.nearest.packed(irow[x0 + i]);
+                    }
+                }
+                let tile_live = tile_live
+                    && crate::simdops::bn_probe(
+                        level,
+                        row,
+                        &scratch.pk1[..tw],
+                        &mut scratch.ors[..tw],
+                        &mut scratch.c2c[..tw],
+                        &mut scratch.keys2[..tw],
+                    );
+                if tile_live {
+                    for i in 0..tw {
+                        if let Some(&c) = scratch.c2c.get(i + 8) {
+                            self.nearest.prefetch_cache_slot(
+                                cache,
+                                (c >> 16) as u8,
+                                (c >> 8) as u8,
+                                c as u8,
+                            );
+                        }
+                        if (scratch.ors[i] != 0) & (att[i] != 0) {
+                            let c = scratch.c2c[i];
+                            scratch.pk2[i] = self.nearest.lookup_cache_first(
+                                cache,
+                                scratch.keys2[i],
+                                (c >> 16) as u8,
+                                (c >> 8) as u8,
+                                c as u8,
+                            );
+                        }
+                    }
+                    crate::simdops::bn_threshold(
+                        level,
+                        row,
+                        &scratch.pk1[..tw],
+                        &scratch.pk2[..tw],
+                        mrow,
+                        att,
+                        orow,
+                    );
+                } else {
+                    orow.copy_from_slice(&irow[x0..x0 + tw]);
+                }
+                if has_alpha_row {
+                    for (o, px) in orow.iter_mut().zip(row.as_chunks::<4>().0) {
+                        if px[3] < 128 {
+                            *o = self.trans_idx;
+                        }
+                    }
+                }
+                x0 += tw;
+            }
+            if gate_on {
+                std::mem::swap(&mut scratch.row, &mut scratch.row2);
+            }
+        }
+        has_alpha
+    }
+
     fn quantize_bluenoise_scalar(
         &self,
         src: &crate::color::RowSource,
@@ -329,6 +685,33 @@ impl<'a> Quantizer<'a> {
                 let den = dr * dr + dg * dg + db * db;
                 let m = mrow[x & 63] as i32;
                 *o = if m * den < num * 256 { idx2 } else { idx1 };
+            }
+        }
+        has_alpha
+    }
+
+    /// `quantize_plain`, also filling the lossy scale map from a source
+    /// activity pass (the dither gate's measure, knee at 16) when asked.
+    fn quantize_plain_scaled(
+        &self,
+        src: &crate::color::RowSource,
+        w: usize,
+        h: usize,
+        scratch: &mut QuantScratch,
+        out: &mut [u8],
+        scale: Option<&mut [u8]>,
+    ) -> bool {
+        let has_alpha = self.quantize_plain(src, w, h, scratch, out);
+        if let Some(scale) = scale {
+            let level = crate::simdops::level();
+            for y in 0..h {
+                src.fill_row(y, &mut scratch.row);
+                let prev: &[u8] = if y == 0 { &scratch.row } else { &scratch.row2 };
+                crate::simdops::bn_activity(level, &scratch.row, prev, 16, &mut scratch.att);
+                for (s, &a) in scale[y * w..(y + 1) * w].iter_mut().zip(&scratch.att) {
+                    *s = lossy_scale_from_att(a);
+                }
+                std::mem::swap(&mut scratch.row, &mut scratch.row2);
             }
         }
         has_alpha
@@ -546,6 +929,7 @@ mod tests {
             trans_idx: 3,
             exact_palette: false,
             gate: 0,
+            band: None,
         };
         let rgba = vec![
             255u8, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 0,
@@ -554,7 +938,7 @@ mod tests {
         let src = crate::color::RowSource::new(&frame, 4, 1, None);
         let mut out = [9u8; 4];
         let mut scratch = QuantScratch::new(4);
-        let has_alpha = q.quantize(&src, 4, 1, Dither::None, &mut scratch, &mut out);
+        let has_alpha = q.quantize(&src, 4, 1, Dither::None, &mut scratch, &mut out, None);
         assert!(has_alpha);
         assert_eq!(out, [2, 0, 1, 3]);
     }
@@ -571,7 +955,7 @@ mod tests {
         let frame = crate::input::Frame::Rgba(rgba);
         let src = crate::color::RowSource::new(&frame, w, h, None);
         let mut scratch = QuantScratch::new(w);
-        q.quantize(&src, w, h, mode, &mut scratch, &mut out);
+        q.quantize(&src, w, h, mode, &mut scratch, &mut out, None);
         out
     }
 
@@ -594,6 +978,7 @@ mod tests {
             trans_idx: 3,
             exact_palette: false,
             gate,
+            band: None,
         };
         let ungated = quantize_rgba(&mk(0), rgba.clone(), w, h, Dither::BlueNoise);
         let gated = quantize_rgba(&mk(16), rgba.clone(), w, h, Dither::BlueNoise);
@@ -630,6 +1015,7 @@ mod tests {
             trans_idx: 2,
             exact_palette: false,
             gate,
+            band: None,
         };
         let plain = quantize_rgba(&mk(0), rgba.clone(), w, h, Dither::None);
         let gated = quantize_rgba(&mk(16), rgba.clone(), w, h, Dither::BlueNoise);
@@ -697,6 +1083,7 @@ mod tests {
             trans_idx,
             exact_palette: false,
             gate,
+            band: None,
         };
         let got = quantize_rgba(&q, rgba.clone(), w, h, Dither::BlueNoise);
 
@@ -751,6 +1138,7 @@ mod tests {
             trans_idx: 2,
             exact_palette: false,
             gate: 0,
+            band: None,
         };
         let mut rgba = Vec::new();
         for i in 0..64 {
@@ -762,7 +1150,7 @@ mod tests {
         let frame = crate::input::Frame::Rgba(rgba);
         let src = crate::color::RowSource::new(&frame, 8, 8, None);
         let mut scratch = QuantScratch::new(8);
-        q.quantize(&src, 8, 8, Dither::Sierra2_4a, &mut scratch, &mut out);
+        q.quantize(&src, 8, 8, Dither::Sierra2_4a, &mut scratch, &mut out, None);
         for (i, &o) in out.iter().enumerate() {
             assert_eq!(o as usize, i % 2);
         }
@@ -797,6 +1185,7 @@ mod tests {
             trans_idx: 8,
             exact_palette: false,
             gate: 0,
+            band: None,
         };
         let out = quantize_rgba(&q, rgba.clone(), w, h, Dither::Bayer);
         for y in 0..h {
@@ -847,6 +1236,7 @@ mod tests {
             trans_idx: 64,
             exact_palette: true,
             gate: 0,
+            band: None,
         };
         let out = quantize_rgba(&q, rgba.clone(), w, h, Dither::Bayer);
         let plain = quantize_rgba(&q, rgba, w, h, Dither::None);

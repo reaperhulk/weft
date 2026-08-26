@@ -1294,3 +1294,231 @@ mod delta_hist_tests {
         assert_eq!(got, want);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Dither::Auto banding score (see dither::BandGate)
+
+/// Padding on each side of the padded index/flag rows used by
+/// `band_score_row`: at least RUN, rounded to a vector-friendly 16.
+pub const BAND_PAD: usize = 16;
+
+/// Score one row of the nearest-index map. `idxp` is the row padded by
+/// BAND_PAD bytes of 0xFF (never a palette index) on each side; `prev`
+/// the previous row (unpadded) or None; `flat_prev` the previous row's
+/// long-run flags (padded like `idxp`, zeros in the pads). Writes this
+/// row's flags into `flat_cur` (same layout) and one candidate byte per
+/// pixel into `cand`: bit 0 = horizontal contour candidate (x-1 | x), bit
+/// 1 = vertical (prev | x). Candidates are boundaries whose two endpoints
+/// both lie inside same-index runs of at least RUN pixels; the caller
+/// applies the colour-pair test to the (sparse) candidates.
+#[allow(clippy::too_many_arguments)]
+pub fn band_score_row(
+    level: Level,
+    idxp: &[u8],
+    prev: Option<&[u8]>,
+    flat_prev: &[u8],
+    flat_cur: &mut [u8],
+    ltmp: &mut [u8],
+    cand: &mut [u8],
+    w: usize,
+) {
+    fearless_simd::dispatch!(level, simd => band_score_row_impl(simd, idxp, prev, flat_prev, flat_cur, ltmp, cand, w))
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn band_score_row_impl<S: Simd>(
+    simd: S,
+    idxp: &[u8],
+    prev: Option<&[u8]>,
+    flat_prev: &[u8],
+    flat_cur: &mut [u8],
+    ltmp: &mut [u8],
+    cand: &mut [u8],
+    w: usize,
+) {
+    use crate::dither::BandGate;
+    const P: usize = BAND_PAD;
+    const RUN: usize = BandGate::RUN;
+    let one = u8x64::splat(simd, 1);
+    let zero = u8x64::splat(simd, 0);
+    // L[x] = the RUN pixels ending at x are all equal (ltmp, padded layout,
+    // zero beyond the row so the OR below reads nothing past the end)
+    ltmp[..P].fill(0);
+    ltmp[P + w..].fill(0);
+    let mut x = 0usize;
+    while x < w {
+        let n = 64.min(w - x);
+        let base = P + x;
+        let c = load64(simd, idxp, base, n);
+        let mut m = c.simd_eq(load64(simd, idxp, base - 1, n));
+        for k in 2..RUN {
+            m &= c.simd_eq(load64(simd, idxp, base - k, n));
+        }
+        store64(m.select(one, zero), ltmp, base, n);
+        x += 64;
+    }
+    // flat[x] = OR of L[x + s] for s in 0..RUN: x lies inside some run of
+    // RUN equal pixels
+    flat_cur[..P].fill(0);
+    flat_cur[P + w..].fill(0);
+    x = 0;
+    while x < w {
+        let n = 64.min(w - x);
+        let base = P + x;
+        let mut f = load64(simd, ltmp, base, n);
+        for s in 1..RUN {
+            f |= load64(simd, ltmp, base + s, n);
+        }
+        store64(f, flat_cur, base, n);
+        x += 64;
+    }
+    // candidates
+    x = 0;
+    while x < w {
+        let n = 64.min(w - x);
+        let base = P + x;
+        let c = load64(simd, idxp, base, n);
+        let f = load64(simd, flat_cur, base, n).simd_eq(one);
+        let left = load64(simd, idxp, base - 1, n);
+        let fl = load64(simd, flat_cur, base - 1, n).simd_eq(one);
+        let h = f & fl & !c.simd_eq(left);
+        let mut out = h.select(one, zero);
+        if let Some(prev) = prev {
+            let pv = load64(simd, prev, x, n);
+            let fp = load64(simd, flat_prev, base, n).simd_eq(one);
+            let v = f & fp & !c.simd_eq(pv);
+            out |= v.select(u8x64::splat(simd, 2), zero);
+        }
+        store64(out, cand, x, n);
+        x += 64;
+    }
+}
+
+/// 64 bytes from `buf[at..]`, zero-filled past `n` valid bytes (rows are
+/// padded, so the load itself never runs past the buffer).
+#[inline(always)]
+fn load64<S: Simd>(simd: S, buf: &[u8], at: usize, n: usize) -> u8x64<S> {
+    if n == 64 {
+        u8x64::from_slice(simd, &buf[at..at + 64])
+    } else {
+        let mut tmp = [0u8; 64];
+        let avail = (buf.len() - at).min(64);
+        tmp[..avail].copy_from_slice(&buf[at..at + avail]);
+        u8x64::from_slice(simd, &tmp)
+    }
+}
+
+#[inline(always)]
+fn store64<S: Simd>(v: u8x64<S>, buf: &mut [u8], at: usize, n: usize) {
+    if n == 64 {
+        v.store_slice(&mut buf[at..at + 64]);
+    } else {
+        let arr: [u8; 64] = v.into();
+        buf[at..at + n].copy_from_slice(&arr[..n]);
+    }
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::*;
+    use crate::dither::BandGate;
+
+    /// Scalar reference: flags and candidates as defined in the docs.
+    fn reference(idx: &[u8], prev: Option<&[u8]>, flat_prev: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let w = idx.len();
+        // flat[i] = the run containing i has length >= RUN
+        let mut flat = vec![0u8; w];
+        let mut start = 0;
+        for i in 1..=w {
+            if i == w || idx[i] != idx[start] {
+                if i - start >= BandGate::RUN {
+                    flat[start..i].fill(1);
+                }
+                start = i;
+            }
+        }
+        let mut cand = vec![0u8; w];
+        for i in 0..w {
+            if i > 0 && idx[i] != idx[i - 1] && flat[i] == 1 && flat[i - 1] == 1 {
+                cand[i] |= 1;
+            }
+            if let Some(p) = prev {
+                if idx[i] != p[i] && flat[i] == 1 && flat_prev[i] == 1 {
+                    cand[i] |= 2;
+                }
+            }
+        }
+        (flat, cand)
+    }
+
+    #[test]
+    fn band_score_row_matches_reference() {
+        let w = 203; // three full vectors + tail
+        let mut s = 7u32;
+        let mut rnd = || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            s >> 24
+        };
+        // runs of random length 1..20 of random indices
+        let mk = |rnd: &mut dyn FnMut() -> u32| {
+            let mut v = Vec::new();
+            while v.len() < w {
+                let len = (rnd() % 20 + 1) as usize;
+                let c = (rnd() % 5) as u8;
+                v.extend(std::iter::repeat_n(c, len));
+            }
+            v.truncate(w);
+            v
+        };
+        let prev = mk(&mut rnd);
+        let idx = mk(&mut rnd);
+        let (flat_prev_ref, _) = reference(&prev, None, &[]);
+        let (want_flat, want_cand) = reference(&idx, Some(&prev), &flat_prev_ref);
+        const P: usize = BAND_PAD;
+        let mut idxp = vec![0xFFu8; w + 2 * P];
+        idxp[P..P + w].copy_from_slice(&idx);
+        let mut flat_prev = vec![0u8; w + 2 * P];
+        flat_prev[P..P + w].copy_from_slice(&flat_prev_ref);
+        let mut flat_cur = vec![0u8; w + 2 * P];
+        let mut ltmp = vec![0u8; w + 2 * P];
+        let mut cand = vec![0u8; w];
+        band_score_row(
+            level(),
+            &idxp,
+            Some(&prev),
+            &flat_prev,
+            &mut flat_cur,
+            &mut ltmp,
+            &mut cand,
+            w,
+        );
+        if flat_cur[P..P + w] != want_flat[..] {
+            let i = (0..w).find(|&i| flat_cur[P + i] != want_flat[i]).unwrap();
+            panic!(
+                "flat mismatch at {i}: idx[{}..{}]={:?} got {:?} want {:?}",
+                i.saturating_sub(9),
+                (i + 9).min(w),
+                &idx[i.saturating_sub(9)..(i + 9).min(w)],
+                &flat_cur[P + i.saturating_sub(9)..P + (i + 9).min(w)],
+                &want_flat[i.saturating_sub(9)..(i + 9).min(w)]
+            );
+        }
+        if cand != want_cand {
+            let i = (0..w).find(|&i| cand[i] != want_cand[i]).unwrap();
+            panic!(
+                "cand mismatch at {i}: got {} want {} idx {:?} prev {:?} flat {:?} flatp {:?}",
+                cand[i],
+                want_cand[i],
+                &idx[i.saturating_sub(2)..(i + 2).min(w)],
+                &prev[i.saturating_sub(2)..(i + 2).min(w)],
+                &flat_cur[P + i.saturating_sub(2)..P + (i + 2).min(w)],
+                &flat_prev[P + i.saturating_sub(2)..P + (i + 2).min(w)]
+            );
+        }
+        assert!(
+            want_cand.iter().any(|&c| c != 0),
+            "test input must produce candidates"
+        );
+    }
+}

@@ -32,7 +32,8 @@ struct Args {
     loop_count: Option<u16>,
     lossy: u32,
     hold: u32,
-    smooth: u32,
+    /// None = not given (0)
+    smooth: Option<u32>,
     threads: Option<usize>,
     stats: bool,
 }
@@ -57,11 +58,16 @@ options:
   --format F         auto | rgba | y4m          (default: auto)
   --colors N         max palette colors, 2-256  (default: 256; one slot is
                      reserved for transparency, so 256 means 255 colors)
-  --dither D         bluenoise | sierra2 | bayer | none
-                     (default: bluenoise, which is fast, temporally
-                     stable, and compresses well; sierra2 error diffusion
-                     has slightly higher visual quality but is slower and
-                     shimmers frame-to-frame on animated content)
+  --dither D         auto | bluenoise | sierra2 | bayer | none
+                     (default: auto — blue noise only in 32x32 tiles
+                     where the nearest-colour map shows banding
+                     contours, plain nearest colour elsewhere; smaller
+                     and higher-fidelity than either extreme; on noisy
+                     scans pair it with --smooth, or its gate sees grain.
+                     bluenoise dithers everywhere: fast, temporally
+                     stable; sierra2 error diffusion has slightly higher
+                     visual quality but is slower and shimmers
+                     frame-to-frame)
   --dither-gate N    activity gate for bluenoise, 0-720 (default: 16;
                      0 = off). Smooth regions keep full dither; busier
                      regions get progressively less, reaching none at
@@ -83,8 +89,10 @@ options:
   --smooth N         spatial grain filter, 0-765 (default: 0 = off): each
                      pixel becomes the mean of its 5x5 neighbours within
                      N (|dR|+|dG|+|dB|); edges are excluded so outlines
-                     stay crisp. ~24 removes film grain and codec noise,
-                     which then also stops defeating --hold
+                     stay crisp. ~16-24 removes film grain and codec
+                     noise, which otherwise defeats --hold and misleads
+                     the auto dither gate. Not for clean or few-colour
+                     sources: it invents colours
   --no-loop          play once (no NETSCAPE extension)
   --threads N        worker threads             (default: all cores)
   --stats            print timing breakdown to stderr
@@ -96,12 +104,12 @@ fn parse_args() -> Result<Args, String> {
         fps: None,
         format: Format::Auto,
         colors: 256,
-        dither: Dither::BlueNoise,
+        dither: Dither::Auto,
         dither_gate: 16,
         loop_count: Some(0),
         lossy: 0,
         hold: 0,
-        smooth: 0,
+        smooth: None,
         threads: None,
         stats: false,
     };
@@ -151,6 +159,7 @@ fn parse_args() -> Result<Args, String> {
                     "bayer" => Dither::Bayer,
                     "bluenoise" | "bn" => Dither::BlueNoise,
                     "none" => Dither::None,
+                    "auto" => Dither::Auto,
                     d => return Err(format!("unknown dither {d}")),
                 }
             }
@@ -178,10 +187,11 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--smooth" => {
-                a.smooth = val("--smooth")?.parse().map_err(|_| "bad --smooth")?;
-                if a.smooth > 765 {
+                let v: u32 = val("--smooth")?.parse().map_err(|_| "bad --smooth")?;
+                if v > 765 {
                     return Err("--smooth must be 0-765".into());
                 }
+                a.smooth = Some(v);
             }
             "--no-loop" => a.loop_count = None,
             "--threads" => {
@@ -367,7 +377,11 @@ fn run(args: &Args) -> io::Result<()> {
     let (read_res, mut indexed_frames, any_alpha) = std::thread::scope(|scope| {
         let meta_ref = &meta;
         let hold = args.hold;
-        let smooth = args.smooth;
+        // The prefilters are opt-in. (--dither auto once implied --smooth 16
+        // so its gate saw a denoised map; that inflated exact-palette
+        // sources — smoothing invents colours — by 60% and doubled the
+        // resident set on y4m input, which converts to RGBA to be filtered.)
+        let smooth = args.smooth.unwrap_or(0);
         let level = simdops::level();
         // ---- prefilter pipeline ------------------------------------------
         // --smooth and --hold run as pipeline stages between the reader and
@@ -824,12 +838,14 @@ fn run(args: &Args) -> io::Result<()> {
     // as "unchanged" marker, so frames encode whole with
     // restore-to-background disposal (any_alpha comes from pass 1).
     let t3 = Instant::now();
+    let band = (args.dither == Dither::Auto).then(|| dither::BandGate::new(&nearest));
     let quant = Quantizer {
         nearest: &nearest,
         trans_idx,
         // median_cut returns the exact colors when they all fit
         exact_palette: n_entries < args.colors,
         gate: args.dither_gate,
+        band: band.as_ref(),
     };
     let delays = gif::frame_delays(nread, meta.fps_num, meta.fps_den);
     let disposal = if any_alpha {
@@ -851,6 +867,11 @@ fn run(args: &Args) -> io::Result<()> {
     // faults each buffer's pages once instead of allocating, zeroing, and
     // freeing ~w*h bytes per frame.
     let mut idx_block: Vec<Vec<u8>> = Vec::new();
+    // Per-pixel lossy scale maps (see `LzwEncoder::encode`): only the
+    // modes that leave regions undithered produce them; the others keep
+    // the flat cap and skip the buffers.
+    let scaled_lossy = args.lossy > 0 && matches!(args.dither, Dither::None | Dither::Auto);
+    let mut scale_block: Vec<Vec<u8>> = Vec::new();
     // `for_each_init`/`map_init` state lives for only one parallel
     // operation. Since the block loop launches two new operations per
     // block, using them here would repeatedly allocate and zero the 1 MiB
@@ -888,19 +909,42 @@ fn run(args: &Args) -> io::Result<()> {
                 .collect();
             idx_block.extend(extra);
         }
-        chunk
-            .into_par_iter()
-            .zip(idx_block[..cn].par_iter_mut())
-            .for_each(|(f, idx)| {
-                let wi = rayon::current_thread_index().unwrap_or(nthreads);
-                let mut scratch = worker_ctx[wi]
-                    .quant
-                    .get_or_init(|| Mutex::new(dither::QuantScratch::new(w)))
-                    .lock()
-                    .unwrap();
-                let src = color::RowSource::new(&f, w, h, meta.chroma);
-                quant.quantize(&src, w, h, args.dither, &mut scratch, idx);
-            });
+        if scaled_lossy && scale_block.len() < cn {
+            let extra: Vec<Vec<u8>> = (scale_block.len()..cn)
+                .into_par_iter()
+                .map(|_| vec![255u8; w * h])
+                .collect();
+            scale_block.extend(extra);
+        }
+        {
+            let scale_slots: Vec<Option<&mut Vec<u8>>> = if scaled_lossy {
+                scale_block[..cn].iter_mut().map(Some).collect()
+            } else {
+                (0..cn).map(|_| None).collect()
+            };
+            chunk
+                .into_par_iter()
+                .zip(idx_block[..cn].par_iter_mut())
+                .zip(scale_slots.into_par_iter())
+                .for_each(|((f, idx), scale)| {
+                    let wi = rayon::current_thread_index().unwrap_or(nthreads);
+                    let mut scratch = worker_ctx[wi]
+                        .quant
+                        .get_or_init(|| Mutex::new(dither::QuantScratch::new(w)))
+                        .lock()
+                        .unwrap();
+                    let src = color::RowSource::new(&f, w, h, meta.chroma);
+                    quant.quantize(
+                        &src,
+                        w,
+                        h,
+                        args.dither,
+                        &mut scratch,
+                        idx,
+                        scale.map(|v| v.as_mut_slice()),
+                    );
+                });
+        }
         encoded.par_extend((0..cn).into_par_iter().map(|j| {
             let wi = rayon::current_thread_index().unwrap_or(nthreads);
             let mut encode = worker_ctx[wi]
@@ -926,6 +970,11 @@ fn run(args: &Args) -> io::Result<()> {
                 delays[i],
                 disposal,
                 lossy_map.as_ref(),
+                if scaled_lossy {
+                    Some(scale_block[j].as_slice())
+                } else {
+                    None
+                },
                 &mut encode,
             )
         }));
@@ -977,6 +1026,17 @@ fn run(args: &Args) -> io::Result<()> {
             t_mux,
             t0.elapsed()
         );
+        if let Some(b) = &band {
+            let live = b.live_tiles.load(std::sync::atomic::Ordering::Relaxed);
+            let total = b
+                .total_tiles
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(1);
+            eprintln!(
+                "  dither auto: {live}/{total} tiles dithered ({:.1}%)",
+                live as f64 * 100.0 / total as f64
+            );
+        }
     }
     Ok(())
 }

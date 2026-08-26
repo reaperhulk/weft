@@ -24,6 +24,7 @@ pub struct EncodeCtx {
     pub enc: LzwEncoder,
     punched: Vec<u8>,
     plain: Vec<u8>,
+    scale_rect: Vec<u8>,
 }
 
 /// Encode one indexed frame relative to the previous full indexed frame.
@@ -43,6 +44,7 @@ pub fn encode_frame(
     delay_cs: u32,
     disposal: u8,
     lossy: Option<&LossyMap>,
+    scale: Option<&[u8]>,
     ctx: &mut EncodeCtx,
 ) -> EncodedFrame {
     let enc = &mut ctx.enc;
@@ -116,12 +118,18 @@ pub fn encode_frame(
             plain.clear();
             plain.reserve(sw * sh);
             let mut trans_count = 0usize;
+            let scale_rect = &mut ctx.scale_rect;
+            scale_rect.clear();
             for (orow, y) in punched.chunks_exact_mut(sw).zip(y0..=y1) {
                 let a = &idx[y * w + x0..y * w + x1 + 1];
                 let b = &prev[y * w + x0..y * w + x1 + 1];
                 trans_count += crate::simdops::punch_row(level, a, b, trans_idx, orow);
                 plain.extend_from_slice(a);
+                if let Some(s) = scale {
+                    scale_rect.extend_from_slice(&s[y * w + x0..y * w + x1 + 1]);
+                }
             }
+            let scale = scale.map(|_| &scale_rect[..]);
             let descriptor_len = body.len();
             if trans_count * 5 >= punched.len() * 3 {
                 // Mostly transparent: punching wins, skip the opaque
@@ -130,18 +138,18 @@ pub fn encode_frame(
                 // ~45% transparent; 60% leaves margin while skipping the
                 // double encode on the sparse-change frames that dominate
                 // typical animations.
-                enc.encode(min_code_size, punched, lossy, &mut body);
+                enc.encode(min_code_size, punched, lossy, scale, &mut body);
             } else if trans_count * 20 <= punched.len() {
                 // Almost everything changed: punching would only shatter
                 // smooth runs with scattered transparent pixels, so skip
                 // it — on dense-motion content this halves the LZW work.
-                enc.encode(min_code_size, plain, lossy, &mut body);
+                enc.encode(min_code_size, plain, lossy, scale, &mut body);
             } else {
                 // In between, encode both and keep the smaller (gifsicle
                 // -O2/-O3 behavior).
-                enc.encode(min_code_size, punched, lossy, &mut body);
+                enc.encode(min_code_size, punched, lossy, scale, &mut body);
                 let mut alt = Vec::new();
-                enc.encode(min_code_size, plain, lossy, &mut alt);
+                enc.encode(min_code_size, plain, lossy, scale, &mut alt);
                 if alt.len() < body.len() - descriptor_len {
                     // the opaque encoding won: swap it in after the descriptor
                     body.truncate(descriptor_len);
@@ -149,7 +157,7 @@ pub fn encode_frame(
                 }
             }
         }
-        None => enc.encode(min_code_size, idx, lossy, &mut body),
+        None => enc.encode(min_code_size, idx, lossy, scale, &mut body),
     }
 
     EncodedFrame {
@@ -261,7 +269,19 @@ mod tests {
     fn identical_frame_returns_empty_body() {
         let a = vec![5u8; 16];
         let mut ctx = EncodeCtx::default();
-        let f = encode_frame(&a, Some(&a), 4, 4, 255, 8, 3, DISPOSAL_NONE, None, &mut ctx);
+        let f = encode_frame(
+            &a,
+            Some(&a),
+            4,
+            4,
+            255,
+            8,
+            3,
+            DISPOSAL_NONE,
+            None,
+            None,
+            &mut ctx,
+        );
         assert!(f.body.is_empty());
         assert_eq!(f.delay_cs, 3);
     }
@@ -283,6 +303,7 @@ mod tests {
             8,
             3,
             DISPOSAL_NONE,
+            None,
             None,
             &mut ctx,
         );
