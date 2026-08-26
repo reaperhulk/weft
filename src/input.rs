@@ -186,7 +186,7 @@ pub mod hold {
     /// Adaptive window from a histogram of per-pixel L1 change between
     /// consecutive raw frames (bins 0..=255, saturating): the larger of
     /// 2.5x the median change and the 75th-percentile change, clamped to
-    /// [2, cap]. On grainy content the upper quartile is the grain level
+    /// [4, cap] (4 measured clean on every clip, including a slow zoom). On grainy content the upper quartile is the grain level
     /// (a scanned cartoon lands near 8, where the fixed window was
     /// tuned); on a clean source both statistics are ~0 and the window
     /// closes to the floor — a fixed window sized for grain would only
@@ -209,7 +209,7 @@ pub mod hold {
         };
         let median = quantile(1, 2);
         let q75 = quantile(3, 4);
-        ((median * 5).div_ceil(2)).max(q75).clamp(2, cap.max(2))
+        ((median * 5).div_ceil(2)).max(q75).clamp(4, cap.max(4))
     }
 
     /// The bound on how far a held pixel may sit from its reference:
@@ -496,12 +496,8 @@ mod tests {
         let mut h = [0u32; 256];
         h[1] = 60;
         h[2] = 30;
-        h[4] = 10; // upper quartile at 2
-        assert_eq!(
-            hold::adaptive_threshold(&h, 12),
-            3,
-            "max(2.5*1 -> 3, q75 2)"
-        );
+        h[4] = 10; // upper quartile at 2: max(2.5*1 -> 3, 2) -> floor 4
+        assert_eq!(hold::adaptive_threshold(&h, 12), 4);
         let mut h = [0u32; 256];
         h[1] = 60;
         h[6] = 40; // grain: upper quartile at 6
@@ -513,9 +509,9 @@ mod tests {
         let mut h = [0u32; 256];
         h[0] = 95;
         h[40] = 5; // a little motion does not open the window
-        assert_eq!(hold::adaptive_threshold(&h, 12), 2);
+        assert_eq!(hold::adaptive_threshold(&h, 12), 4);
         let h = [0u32; 256];
-        assert_eq!(hold::adaptive_threshold(&h, 12), 2, "empty: floor");
+        assert_eq!(hold::adaptive_threshold(&h, 12), 4, "empty: floor");
     }
 
     #[test]

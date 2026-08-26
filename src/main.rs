@@ -81,9 +81,9 @@ options:
                      value, so source noise on static regions stops
                      re-rolling the palette pick every frame. The window
                      adapts per frame to the measured frame-to-frame
-                     noise (2.5x its median change) and N caps it; ~12
-                     is a safe cap: grainy scans use most of it, clean
-                     sources settle near 3-4 on their own
+                     noise (2.5x its median change, at least 4) and N
+                     caps it; ~12 is a safe cap: grainy scans use most
+                     of it, clean sources settle at 4-5 on their own
   --smooth N         spatial grain filter, 0-765 (default: 0 = off, or
                      16 with --dither auto): each pixel becomes the mean
                      of its 5x5 neighbours within N (|dR|+|dG|+|dB|);
