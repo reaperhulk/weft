@@ -32,6 +32,7 @@ struct Args {
     loop_count: Option<u16>,
     lossy: u32,
     hold: u32,
+    smooth: u32,
     threads: Option<usize>,
     stats: bool,
 }
@@ -71,11 +72,19 @@ options:
                      encoding of the quantized frames; ~30 is subtle and
                      much smaller on dithered content)
   --hold N           temporal hold, 0-765 (default: 0 = off): a pixel
-                     that moves by less than N (|dR|+|dG|+|dB|) from its
-                     value in the previous frame keeps that value, so
-                     source noise on static regions stops re-rolling the
-                     palette pick every frame. ~8-12 is invisible and
-                     much smaller on compressed-video input
+                     that stays within the hold window of its running
+                     mean (and 1.5x it of its held value) keeps that
+                     value, so source noise on static regions stops
+                     re-rolling the palette pick every frame. The window
+                     adapts per frame to the measured frame-to-frame
+                     noise (2.5x its median change, at least 4) and N
+                     caps it; ~12 is a safe cap: grainy scans use most
+                     of it, clean sources settle at 4-5 on their own
+  --smooth N         spatial grain filter, 0-765 (default: 0 = off): each
+                     pixel becomes the mean of its 5x5 neighbours within
+                     N (|dR|+|dG|+|dB|); edges are excluded so outlines
+                     stay crisp. ~24 removes film grain and codec noise,
+                     which then also stops defeating --hold
   --no-loop          play once (no NETSCAPE extension)
   --threads N        worker threads             (default: all cores)
   --stats            print timing breakdown to stderr
@@ -92,6 +101,7 @@ fn parse_args() -> Result<Args, String> {
         loop_count: Some(0),
         lossy: 0,
         hold: 0,
+        smooth: 0,
         threads: None,
         stats: false,
     };
@@ -165,6 +175,12 @@ fn parse_args() -> Result<Args, String> {
                 a.hold = val("--hold")?.parse().map_err(|_| "bad --hold")?;
                 if a.hold > 765 {
                     return Err("--hold must be 0-765".into());
+                }
+            }
+            "--smooth" => {
+                a.smooth = val("--smooth")?.parse().map_err(|_| "bad --smooth")?;
+                if a.smooth > 765 {
+                    return Err("--smooth must be 0-765".into());
                 }
             }
             "--no-loop" => a.loop_count = None,
@@ -351,8 +367,51 @@ fn run(args: &Args) -> io::Result<()> {
     let (read_res, mut indexed_frames, any_alpha) = std::thread::scope(|scope| {
         let meta_ref = &meta;
         let hold = args.hold;
+        let smooth = args.smooth;
         let level = simdops::level();
+        // ---- prefilter pipeline ------------------------------------------
+        // --smooth and --hold run as pipeline stages between the reader and
+        // the histogram pass, so nothing but the read() itself sits on the
+        // reader thread. Smoothing is frame-independent and runs on a small
+        // pool (whole frames per task: the per-row rayon form measured 5x
+        // slower under contention with the histogram workers); the hold
+        // carries state from frame to frame, so one thread applies it in
+        // sequence order, reordering the pool's output as needed. Every
+        // stage hands frames on through bounded channels; the main thread
+        // sorts by index afterwards, so only the hold's order matters.
+        let staged = smooth > 0 || hold > 0;
+        // The prefilters work on packed RGBA. Y4M frames are converted in
+        // the pool when a prefilter is on (the same SIMD conversion the
+        // passes would otherwise repeat per row), so there is one filter
+        // code path; per-plane thresholds were measured to form a box
+        // rather than an L1 ball and held 1.3 dB worse on live action.
+        // Converted frames that turn out opaque drop to packed RGB after
+        // pass 1 like any RGBA input.
+        let convert = staged && meta_ref.chroma.is_some();
+        // pool size: the filter costs ~1.5 ms per 480x360 frame, about the
+        // read itself; a quarter of the workers keeps it off the critical
+        // path without starving the histogram (5 measured best on 40 vCPUs)
+        let smoothers = if smooth > 0 || convert {
+            (nthreads / 4).clamp(1, 6)
+        } else {
+            0
+        };
+        let stage_cap = 2 * smoothers.max(1);
+        let (stx, srx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(stage_cap);
+        let (htx, hrx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(stage_cap);
+        let srx = std::sync::Arc::new(Mutex::new(srx));
+        let smooth_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // the reader feeds the first live stage
+        let reader_tx = if smoothers > 0 {
+            stx.clone()
+        } else if staged {
+            htx.clone()
+        } else {
+            tx.clone()
+        };
+        drop(stx);
         let reader_handle = scope.spawn(move || -> io::Result<usize> {
+            let tx = reader_tx;
             // On a fast source (tmpfs, a pipe from a decoder already
             // ahead of us) most of the reader's time is page-faulting the
             // fresh buffer for each frame, not copying into it. A helper
@@ -379,10 +438,6 @@ fn run(args: &Args) -> io::Result<()> {
                 }
             });
             let mut n = 0usize;
-            // --hold reference: the previous frame after holding. One
-            // frame of extra residency; the compare-and-copy runs on the
-            // reader thread, overlapped with the histogram pass.
-            let mut held_prev: Vec<u8> = Vec::new();
             let res = (|| {
                 loop {
                     let buf = brx.recv().expect("prefault thread died");
@@ -391,27 +446,7 @@ fn run(args: &Args) -> io::Result<()> {
                         Source::Rgba(r) => input::read_rgba_frame(r, buf)?,
                     };
                     match frame {
-                        Some(mut f) => {
-                            if hold > 0 {
-                                let is_yuv = matches!(f, Frame::Yuv(_));
-                                let buf = match &mut f {
-                                    Frame::Rgba(b) | Frame::Rgb(b) | Frame::Yuv(b) => b,
-                                };
-                                if n > 0 {
-                                    if is_yuv {
-                                        simdops::hold_planes(
-                                            level,
-                                            buf,
-                                            &mut held_prev,
-                                            input::hold::plane_threshold(hold),
-                                        );
-                                    } else {
-                                        simdops::hold_rgba(level, buf, &mut held_prev, hold);
-                                    }
-                                } else {
-                                    held_prev = buf.clone();
-                                }
-                            }
+                        Some(f) => {
                             if tx.send((n, f)).is_err() {
                                 break; // consumer died; its error surfaces below
                             }
@@ -426,6 +461,113 @@ fn run(args: &Args) -> io::Result<()> {
             prefault.join().expect("prefault thread panicked");
             res
         });
+        for _ in 0..smoothers {
+            let srx = srx.clone();
+            let htx = htx.clone();
+            let smooth_ns = smooth_ns.clone();
+            let chroma = meta_ref.chroma;
+            scope.spawn(move || {
+                let mut scratch: Vec<u8> = Vec::new();
+                loop {
+                    let item = srx.lock().unwrap().recv();
+                    let Ok((i, mut f)) = item else { break };
+                    let t = Instant::now();
+                    if let Frame::Yuv(_) = &f {
+                        let mut rgba = vec![0u8; w * h * 4];
+                        let src = color::RowSource::new(&f, w, h, chroma);
+                        for (y, row) in rgba.chunks_mut(w * 4).enumerate() {
+                            src.fill_row(y, row);
+                        }
+                        f = Frame::Rgba(rgba);
+                    }
+                    if smooth > 0 {
+                        let buf = match &mut f {
+                            Frame::Rgba(b) | Frame::Rgb(b) => b,
+                            Frame::Yuv(_) => unreachable!("converted above"),
+                        };
+                        input::smooth::rgba(level, buf, w, h, smooth, &mut scratch);
+                    }
+                    smooth_ns.fetch_add(
+                        t.elapsed().as_nanos() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    if htx.send((i, f)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(htx);
+        drop(srx);
+        let hold_handle = staged.then(|| {
+            let tx = tx.clone();
+            scope.spawn(move || -> (std::time::Duration, u64, usize) {
+                // the cap from --hold N; the per-frame window adapts to the
+                // measured noise below it (see hold::adaptive_threshold)
+                let cap = hold;
+                let mut held_prev: Vec<u8> = Vec::new();
+                let mut held_mean: Vec<i16> = Vec::new();
+                // raw previous frame for the noise estimate (the held
+                // reference is not it: held pixels are older)
+                let mut raw_prev: Vec<u8> = Vec::new();
+                let mut hist = [0u32; 256];
+                let mut t_sum = 0u64;
+                let mut pending: std::collections::BTreeMap<usize, Frame> =
+                    std::collections::BTreeMap::new();
+                let mut next = 0usize;
+                let mut t_hold = std::time::Duration::ZERO;
+                while let Ok((i, f)) = hrx.recv() {
+                    pending.insert(i, f);
+                    while let Some(mut f) = pending.remove(&next) {
+                        if hold > 0 {
+                            let ts = Instant::now();
+                            let buf = match &mut f {
+                                Frame::Rgba(b) | Frame::Rgb(b) => b,
+                                Frame::Yuv(_) => unreachable!("the pool converts Y4M frames"),
+                            };
+                            if next == 0 {
+                                held_prev = buf.clone();
+                                raw_prev = buf.clone();
+                                held_mean = buf
+                                    .iter()
+                                    .map(|&v| (v as i16) << input::hold::MEAN_SHIFT)
+                                    .collect();
+                            } else {
+                                // the window comes from the previous pair's
+                                // histogram (one frame of lag; the cap
+                                // bounds a cut); the first pair measures
+                                // itself. The kernel refills `hist` with
+                                // this pair and mirrors the raw input.
+                                if next == 1 {
+                                    hist.fill(0);
+                                    simdops::delta_hist_rgba(level, buf, &raw_prev, &mut hist);
+                                }
+                                let t = input::hold::adaptive_threshold(&hist, cap);
+                                t_sum += t as u64;
+                                hist.fill(0);
+                                simdops::hold_rgba_mean(
+                                    level,
+                                    buf,
+                                    &mut held_prev,
+                                    &mut held_mean,
+                                    &mut raw_prev,
+                                    &mut hist,
+                                    t,
+                                    input::hold::max_deviation(t),
+                                );
+                            }
+                            t_hold += ts.elapsed();
+                        }
+                        if tx.send((next, f)).is_err() {
+                            return (t_hold, t_sum, next);
+                        }
+                        next += 1;
+                    }
+                }
+                (t_hold, t_sum, next)
+            })
+        });
+        drop(tx);
         let mut frames: Vec<(usize, Frame)> = Vec::new();
         let mut any_alpha = false;
         let (mut row1, mut keys1) = (vec![0u8; w * 4], vec![0u32; w]);
@@ -580,13 +722,24 @@ fn run(args: &Args) -> io::Result<()> {
                 pool.push(r.runs);
             }
         }
+        let read_res = reader_handle.join().expect("reader thread panicked");
+        let (t_hold, hold_t_sum, hold_frames) = hold_handle
+            .map(|h| h.join().expect("hold thread panicked"))
+            .unwrap_or_default();
+        let hold_mean_t = if hold > 0 && hold_frames > 1 {
+            hold_t_sum as f64 / (hold_frames - 1) as f64
+        } else {
+            0.0
+        };
+        let t_smooth =
+            std::time::Duration::from_nanos(smooth_ns.load(std::sync::atomic::Ordering::Relaxed));
         (
-            reader_handle.join().expect("reader thread panicked"),
+            read_res.map(|n| (n, t_smooth, t_hold, hold_mean_t)),
             frames,
             any_alpha,
         )
     });
-    let nread = read_res?;
+    let (nread, t_smooth, t_hold, hold_mean_t) = read_res?;
     if indexed_frames.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -814,8 +967,15 @@ fn run(args: &Args) -> io::Result<()> {
             stdout.written
         );
         eprintln!(
-            "  read+hist {:?} (hist span {:?})  palette+lut {:?}  quantize+lzw {:?}  mux+write {:?}  total {:?}",
-            t_read, t_hist, t_pal, t_qlzw, t_mux, t0.elapsed()
+            "  read+hist {:?} (hist span {:?}; prefilter cpu: smooth {:?} hold {:?}, mean hold window {:.1})  palette+lut {:?}  quantize+lzw {:?}  mux+write {:?}  total {:?}",
+            t_read, t_hist,
+            t_smooth,
+            t_hold,
+            hold_mean_t,
+            t_pal,
+            t_qlzw,
+            t_mux,
+            t0.elapsed()
         );
     }
     Ok(())

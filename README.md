@@ -57,9 +57,13 @@ weft --colors 64 --dither none --no-loop < input.y4m > out.gif
                    encoding of the quantized frames; ~30 is subtle and
                    much smaller on dithered content)
 --hold N           temporal hold, 0-765 (default: 0 = off): a pixel that
-                   moves by less than N (|dR|+|dG|+|dB|) from the previous
-                   frame keeps its previous value; ~8-12 is invisible and
-                   much smaller on compressed-video input
+                   stays within N (|dR|+|dG|+|dB|) of its running mean and
+                   within 1.5N of its held value keeps that value; ~8-12
+                   is invisible and much smaller on compressed-video input
+--smooth N         spatial grain filter, 0-765 (default: 0 = off): each
+                   pixel becomes the mean of its 5x5 neighbours within N;
+                   edges are excluded so outlines stay crisp. ~24 removes
+                   film grain and codec noise (which also defeats --hold)
 --no-loop          play once (no NETSCAPE extension)
 --threads N        worker threads             (default: all cores)
 --stats            print timing breakdown to stderr
@@ -230,6 +234,35 @@ that, and on the measured clips are worth +0.4-0.8 dB mean PSNR (up to
 gradients, which median cut alone under-serves. Clusters dominated by a
 single colour snap to it exactly, so flat fills and sources with few
 colours stay lossless.
+
+## Prefilters: `--hold` and `--smooth`
+
+Compressed-video input carries a few LSB of noise on every pixel of every
+frame, and on flat content that noise — not the picture — decides which
+of two neighbouring palette entries a pixel lands on. Re-rolled each frame
+it turns static fills into per-frame index churn that defeats the delta
+encoder. Two optional prefilters, both running as pipeline stages between
+the reader and the histogram pass, address this at the source:
+
+- `--hold N` keeps a pixel at its held value while the input stays within
+  N of a per-pixel running mean (and within 1.5N of the held value, which
+  bounds the lag on slow drifts). Static regions become byte-identical
+  across frames and drop out of the delta entirely.
+- `--smooth N` replaces each pixel with the mean of the 5x5 neighbours
+  within N of it, so grain averages out inside fills while nothing across
+  an edge is touched. With the grain gone, far fewer pixels escape the
+  hold window, and the palette sees clean fills.
+
+On a grainy 480x360 cartoon clip at `--lossy 30`: 9.10 MB baseline,
+6.40 MB with `--hold 8`, 5.59 MB with `--smooth 24 --hold 8`, at equal
+PSNR against the source; on a corpus of random cartoon clips the pair is
+worth 8-18% with PSNR unchanged or up. Both are cheap: the hold runs on
+one thread, the filter on a small pool, and the encode is faster overall
+because the delta stage has less to do. They work on packed RGBA: y4m
+input is converted once in the pool when either is on (frames that turn
+out opaque drop to packed RGB after the first pass, as RGBA input does),
+so a y4m clip with a prefilter holds about twice the resident set of one
+without.
 
 ## Design
 

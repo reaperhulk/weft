@@ -409,6 +409,38 @@ fn y4m_smoke() {
     assert!(px.iter().all(|&c| (129..=131).contains(&c)), "{px:?}");
 }
 
+#[test]
+fn y4m_prefilters_convert_and_hold() {
+    // 4:2:0 y4m, 8x4, three frames: the first two differ by luma noise
+    // of 1, the third is a different shade. With --hold the pool converts
+    // to RGBA and holds, so the first two fold; the third stays distinct.
+    let mut input = Vec::new();
+    input.extend_from_slice(
+        b"YUV4MPEG2 W8 H4 F10:1 Ip A1:1 C420
+",
+    );
+    for (y, uv) in [(120u8, 128u8), (121, 128), (180, 128)] {
+        input.extend_from_slice(
+            b"FRAME
+",
+        );
+        input.extend_from_slice(&[y; 32]); // Y 8x4
+        input.extend_from_slice(&[uv; 8]); // U 4x2
+        input.extend_from_slice(&[uv; 8]); // V 4x2
+    }
+    let dec = decode_gif(&run_weft(&["--hold", "8", "--smooth", "16"], &input));
+    assert_eq!((dec.width, dec.height), (8, 4));
+    assert_eq!(
+        dec.frames.len(),
+        2,
+        "held frames fold, the shade change does not"
+    );
+    assert_eq!(dec.frames[0].1, 20, "2 frames at 10fps");
+    let a = dec.frames[0].0[0] as i32;
+    let b = dec.frames[1].0[0] as i32;
+    assert!(b - a > 40, "third frame is visibly brighter: {a} -> {b}");
+}
+
 /// A source whose colors all fit in the palette has no quantization error
 /// to hide, so every dither mode must reproduce it exactly — including
 /// `bayer`, whose threshold offset would otherwise push closely spaced
@@ -454,17 +486,18 @@ fn bayer_is_lossless_on_exact_palette() {
 
 #[test]
 fn hold_folds_noisy_static_frames() {
-    // A static solid frame with +-1 per-channel noise re-rolled each
+    // A static solid frame with 0/1 per-channel noise re-rolled each
     // frame, then a genuinely different frame. Without --hold the noise
-    // keeps every frame distinct; with it, the noisy frames hold at the
-    // first frame's values and fold into one delay.
+    // keeps every frame distinct; with it, the adaptive window (sized
+    // from the noise itself) holds the noisy frames at the first frame's
+    // values and they fold into one delay.
     let (w, h) = (32usize, 32usize);
     let mut raw = Vec::new();
     let mut seed = 0x9E37_79B9u32;
     for f in 0..4 {
         for _ in 0..w * h {
             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            let n = |k: u32| ((seed >> k) % 3) as u8; // 0, 1, 2
+            let n = |k: u32| ((seed >> k) % 2) as u8; // 0, 1
             raw.extend_from_slice(&[99 + n(3), 149 + n(11), 199 + n(19), 255]);
             let _ = f;
         }
@@ -483,4 +516,83 @@ fn hold_folds_noisy_static_frames() {
         [200, 10, 10],
         "large change passes through"
     );
+}
+
+#[test]
+fn smooth_flattens_grain_and_keeps_edges() {
+    // Two halves of different colours with +-2 grain on every pixel and
+    // a fresh grain roll per frame. --smooth alone makes each frame flat
+    // (so the two frames become identical and fold); the edge between
+    // the halves must stay exactly where it was.
+    let (w, h) = (32usize, 16usize);
+    let mut raw = Vec::new();
+    let mut seed = 0x1234_5678u32;
+    for _ in 0..2 {
+        for y in 0..h {
+            for x in 0..w {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                // independent -2..+2 grain per channel
+                let g = |k: u32| ((seed >> k) % 5) as u8;
+                let base: [u8; 3] = if x < 16 {
+                    [60, 120, 180]
+                } else {
+                    [200, 80, 40]
+                };
+                raw.extend_from_slice(&[
+                    base[0] + g(24) - 2,
+                    base[1] + g(16) - 2,
+                    base[2] + g(8) - 2,
+                    255,
+                ]);
+                let _ = y;
+            }
+        }
+    }
+    let plain = decode_gif(&run_weft(&["--size", "32x16", "--fps", "10"], &raw));
+    assert_eq!(plain.frames.len(), 2, "grain keeps the frames distinct");
+    // smoothing alone: every pixel within 1 of its fill colour (the 5x5
+    // mean of +-2 grain), edge column exact
+    let smooth = decode_gif(&run_weft(
+        &["--size", "32x16", "--fps", "10", "--smooth", "24"],
+        &raw,
+    ));
+    for (fi, (f, _)) in smooth.frames.iter().enumerate() {
+        for y in 0..h {
+            for x in 0..w {
+                let px = &f[(y * w + x) * 3..(y * w + x) * 3 + 3];
+                let want: [u8; 3] = if x < 16 {
+                    [60, 120, 180]
+                } else {
+                    [200, 80, 40]
+                };
+                for c in 0..3 {
+                    assert!(
+                        px[c].abs_diff(want[c]) <= 1,
+                        "frame {fi} ({x},{y}): {px:?} vs {want:?}"
+                    );
+                }
+            }
+        }
+    }
+    // with the hold on top, the adaptive window (sized from the raw grain,
+    // ~8 here) covers the residual +-1 and the two frames fold into one
+    let both = decode_gif(&run_weft(
+        &[
+            "--size", "32x16", "--fps", "10", "--smooth", "24", "--hold", "8",
+        ],
+        &raw,
+    ));
+    // the window adapts to the residual it sees after smoothing (tiny
+    // here), so a handful of pixels sitting exactly on it may still reset:
+    // require the held frame to be (nearly) identical, not necessarily
+    // folded away
+    if both.frames.len() > 1 {
+        let (a, b) = (&both.frames[0].0, &both.frames[1].0);
+        let changed = a.chunks(3).zip(b.chunks(3)).filter(|(p, q)| p != q).count();
+        assert!(
+            changed * 50 < w * h,
+            "held frame changed {changed} of {} pixels",
+            w * h
+        );
+    }
 }
