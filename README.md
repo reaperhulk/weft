@@ -222,6 +222,19 @@ from 2555 KB to 2136 KB lossless) — and the encoder defers LZW dictionary
 clears, keeping a full dictionary alive while its average match length
 holds up (gifsicle's EWMA heuristic) instead of resetting at 4096 codes.
 
+## Palette
+
+The global palette is a variance median cut in OkLab over the clip's
+exact colour histogram, followed by three Lloyd (k-means) passes: each
+colour moves to the count-weighted mean of the colours that actually map
+to it. Median cut places colours at box means, but once the neighbouring
+boxes exist a colour's nearest set is not its box; the passes correct
+that, and on the measured clips are worth +0.4-0.8 dB mean PSNR (up to
++1.2 dB on the worst frame) at unchanged file size — most visibly in dark
+gradients, which median cut alone under-serves. Clusters dominated by a
+single colour snap to it exactly, so flat fills and sources with few
+colours stay lossless.
+
 ## Prefilters: `--hold` and `--smooth`
 
 Compressed-video input carries a few LSB of noise on every pixel of every
