@@ -1568,3 +1568,87 @@ mod band_tests {
         );
     }
 }
+
+/// Histogram of per-pixel L1 change (over all four bytes, saturating at
+/// 255) between two packed-RGBA frames, for the adaptive hold window.
+pub fn delta_hist_rgba(level: Level, cur: &[u8], prev: &[u8], hist: &mut [u32; 256]) {
+    fearless_simd::dispatch!(level, simd => delta_hist_rgba_impl(simd, cur, prev, hist))
+}
+
+#[inline(always)]
+fn delta_hist_rgba_impl<S: Simd>(simd: S, cur: &[u8], prev: &[u8], hist: &mut [u32; 256]) {
+    let n = cur.len() / 4;
+    let cap = i32x16::splat(simd, 255);
+    let mut i = 0usize;
+    while i + 16 <= n {
+        let d = sad4(simd, px16(simd, &cur[i * 4..]), px16(simd, &prev[i * 4..])).min(cap);
+        let arr: [i32; 16] = d.into();
+        for v in arr {
+            hist[v as usize] += 1;
+        }
+        i += 16;
+    }
+    for p in i..n {
+        let d: u32 = (0..4)
+            .map(|k| cur[p * 4 + k].abs_diff(prev[p * 4 + k]) as u32)
+            .sum();
+        hist[d.min(255) as usize] += 1;
+    }
+}
+
+/// Histogram of per-sample change for planar frames.
+pub fn delta_hist_planes(level: Level, cur: &[u8], prev: &[u8], hist: &mut [u32; 256]) {
+    fearless_simd::dispatch!(level, simd => delta_hist_planes_impl(simd, cur, prev, hist))
+}
+
+#[inline(always)]
+fn delta_hist_planes_impl<S: Simd>(simd: S, cur: &[u8], prev: &[u8], hist: &mut [u32; 256]) {
+    let n = cur.len();
+    let mut i = 0usize;
+    while i + 64 <= n {
+        let a = u8x64::from_slice(simd, &cur[i..i + 64]);
+        let b = u8x64::from_slice(simd, &prev[i..i + 64]);
+        let arr: [u8; 64] = (a.max(b) - a.min(b)).into();
+        for v in arr {
+            hist[v as usize] += 1;
+        }
+        i += 64;
+    }
+    for p in i..n {
+        hist[cur[p].abs_diff(prev[p]) as usize] += 1;
+    }
+}
+
+#[cfg(test)]
+mod delta_hist_tests {
+    use super::*;
+
+    #[test]
+    fn delta_hist_matches_scalar() {
+        let n = 101;
+        let mut s = 5u32;
+        let mut rnd = || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (s >> 24) as u8
+        };
+        let cur: Vec<u8> = (0..n * 4).map(|_| rnd()).collect();
+        let prev: Vec<u8> = (0..n * 4).map(|_| rnd()).collect();
+        let mut want = [0u32; 256];
+        for p in 0..n {
+            let d: u32 = (0..4)
+                .map(|k| cur[p * 4 + k].abs_diff(prev[p * 4 + k]) as u32)
+                .sum();
+            want[d.min(255) as usize] += 1;
+        }
+        let mut got = [0u32; 256];
+        delta_hist_rgba(level(), &cur, &prev, &mut got);
+        assert_eq!(got, want);
+        let mut want_p = [0u32; 256];
+        for p in 0..n * 4 {
+            want_p[cur[p].abs_diff(prev[p]) as usize] += 1;
+        }
+        let mut got_p = [0u32; 256];
+        delta_hist_planes(level(), &cur, &prev, &mut got_p);
+        assert_eq!(got_p, want_p);
+    }
+}

@@ -76,11 +76,14 @@ options:
                      encoding of the quantized frames; ~30 is subtle and
                      much smaller on dithered content)
   --hold N           temporal hold, 0-765 (default: 0 = off): a pixel
-                     that stays within N (|dR|+|dG|+|dB|) of its running
-                     mean, and within 1.5N of its held value, keeps that
+                     that stays within the hold window of its running
+                     mean (and 1.5x it of its held value) keeps that
                      value, so source noise on static regions stops
-                     re-rolling the palette pick every frame. ~8-12 is
-                     invisible and much smaller on compressed-video input
+                     re-rolling the palette pick every frame. The window
+                     adapts per frame to the measured frame-to-frame
+                     noise (2.5x its median change) and N caps it; ~12
+                     is a safe cap: grainy scans use most of it, clean
+                     sources settle near 3-4 on their own
   --smooth N         spatial grain filter, 0-765 (default: 0 = off, or
                      16 with --dither auto): each pixel becomes the mean
                      of its 5x5 neighbours within N (|dR|+|dG|+|dB|);
@@ -498,18 +501,22 @@ fn run(args: &Args) -> io::Result<()> {
         drop(srx);
         let hold_handle = staged.then(|| {
             let tx = tx.clone();
-            scope.spawn(move || -> std::time::Duration {
+            scope.spawn(move || -> (std::time::Duration, u64, usize) {
                 let is_yuv = geom.is_some();
-                let (t, tmax) = if is_yuv {
-                    (
-                        input::hold::plane_threshold(hold) as u32,
-                        input::hold::plane_threshold(input::hold::max_deviation(hold)) as u32,
-                    )
+                // the caps from --hold N; the per-frame window adapts to the
+                // measured noise below them (see hold::adaptive_threshold)
+                let cap = if is_yuv {
+                    input::hold::plane_threshold(hold) as u32
                 } else {
-                    (hold, input::hold::max_deviation(hold))
+                    hold
                 };
                 let mut held_prev: Vec<u8> = Vec::new();
                 let mut held_mean: Vec<i16> = Vec::new();
+                // raw previous frame for the noise estimate (the held
+                // reference is not it: held pixels are older)
+                let mut raw_prev: Vec<u8> = Vec::new();
+                let mut hist = [0u32; 256];
+                let mut t_sum = 0u64;
                 let mut pending: std::collections::BTreeMap<usize, Frame> =
                     std::collections::BTreeMap::new();
                 let mut next = 0usize;
@@ -524,38 +531,56 @@ fn run(args: &Args) -> io::Result<()> {
                             };
                             if next == 0 {
                                 held_prev = buf.clone();
+                                raw_prev = buf.clone();
                                 held_mean = buf
                                     .iter()
                                     .map(|&v| (v as i16) << input::hold::MEAN_SHIFT)
                                     .collect();
                             } else if is_yuv {
+                                // noise from the luma plane's change
+                                hist.fill(0);
+                                let (_, yw, yh) = geom.as_ref().unwrap()[0];
+                                simdops::delta_hist_planes(
+                                    level,
+                                    &buf[..yw * yh],
+                                    &raw_prev[..yw * yh],
+                                    &mut hist,
+                                );
+                                let t = input::hold::adaptive_threshold(&hist, cap);
+                                t_sum += t as u64;
+                                raw_prev.copy_from_slice(buf);
                                 simdops::hold_planes_mean(
                                     level,
                                     buf,
                                     &mut held_prev,
                                     &mut held_mean,
                                     t as u8,
-                                    tmax as u8,
+                                    input::hold::max_deviation(t) as u8,
                                 );
                             } else {
+                                hist.fill(0);
+                                simdops::delta_hist_rgba(level, buf, &raw_prev, &mut hist);
+                                let t = input::hold::adaptive_threshold(&hist, cap);
+                                t_sum += t as u64;
+                                raw_prev.copy_from_slice(buf);
                                 simdops::hold_rgba_mean(
                                     level,
                                     buf,
                                     &mut held_prev,
                                     &mut held_mean,
                                     t,
-                                    tmax,
+                                    input::hold::max_deviation(t),
                                 );
                             }
                             t_hold += ts.elapsed();
                         }
                         if tx.send((next, f)).is_err() {
-                            return t_hold;
+                            return (t_hold, t_sum, next);
                         }
                         next += 1;
                     }
                 }
-                t_hold
+                (t_hold, t_sum, next)
             })
         });
         drop(tx);
@@ -714,14 +739,23 @@ fn run(args: &Args) -> io::Result<()> {
             }
         }
         let read_res = reader_handle.join().expect("reader thread panicked");
-        let t_hold = hold_handle
+        let (t_hold, hold_t_sum, hold_frames) = hold_handle
             .map(|h| h.join().expect("hold thread panicked"))
             .unwrap_or_default();
+        let hold_mean_t = if hold > 0 && hold_frames > 1 {
+            hold_t_sum as f64 / (hold_frames - 1) as f64
+        } else {
+            0.0
+        };
         let t_smooth =
             std::time::Duration::from_nanos(smooth_ns.load(std::sync::atomic::Ordering::Relaxed));
-        (read_res.map(|n| (n, t_smooth, t_hold)), frames, any_alpha)
+        (
+            read_res.map(|n| (n, t_smooth, t_hold, hold_mean_t)),
+            frames,
+            any_alpha,
+        )
     });
-    let (nread, t_smooth, t_hold) = read_res?;
+    let (nread, t_smooth, t_hold, hold_mean_t) = read_res?;
     if indexed_frames.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -983,10 +1017,15 @@ fn run(args: &Args) -> io::Result<()> {
             stdout.written
         );
         eprintln!(
-            "  read+hist {:?} (hist span {:?}; prefilter cpu: smooth {:?} hold {:?})  palette+lut {:?}  quantize+lzw {:?}  mux+write {:?}  total {:?}",
+            "  read+hist {:?} (hist span {:?}; prefilter cpu: smooth {:?} hold {:?}, mean hold window {:.1})  palette+lut {:?}  quantize+lzw {:?}  mux+write {:?}  total {:?}",
             t_read, t_hist,
             t_smooth,
-            t_hold, t_pal, t_qlzw, t_mux, t0.elapsed()
+            t_hold,
+            hold_mean_t,
+            t_pal,
+            t_qlzw,
+            t_mux,
+            t0.elapsed()
         );
         if let Some(b) = &band {
             let live = b.live_tiles.load(std::sync::atomic::Ordering::Relaxed);
