@@ -858,7 +858,7 @@ fn run(args: &Args) -> io::Result<()> {
                         (w, g, slab)
                     })
                     .collect();
-                tasks.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                tasks.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
                 tasks.into_par_iter().for_each(|(_, g, slab)| {
                     for r in &routed {
                         let s = &r.runs[r.offs[4 * g] as usize..r.offs[4 * g + 4] as usize];
@@ -877,7 +877,7 @@ fn run(args: &Args) -> io::Result<()> {
                         (w, b, hist)
                     })
                     .collect();
-                tasks.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                tasks.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
                 tasks.into_par_iter().for_each(|(_, b, hist)| {
                     for r in &routed {
                         let s = &r.runs[r.offs[b] as usize..r.offs[b + 1] as usize];
