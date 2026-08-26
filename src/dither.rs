@@ -159,6 +159,7 @@ impl QuantScratch {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 impl<'a> Quantizer<'a> {
     /// Quantize a frame (accessed row-by-row via `src`, so YUV conversion
     /// stays fused and cache-resident) into palette indices. Returns true
