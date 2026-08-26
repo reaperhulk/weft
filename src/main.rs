@@ -355,13 +355,15 @@ fn run(args: &Args) -> io::Result<()> {
     // `batch_cap` bounds the routed runs, which are the one genuinely
     // transient allocation here (up to 4 bytes per pixel per frame on
     // noisy content), so it gets a byte budget with the old two-per-worker
-    // as its floor. Sixteen per worker is where the corpus stops
-    // improving.
+    // as its floor. The budget is where it is because the runs are the
+    // only part of weft's footprint that grows with it: raising it past
+    // this buys under 1 % on the corpus and costs 20 MB of peak RSS on a
+    // clip that really does spend 4 bytes a pixel on runs.
     let frame_bytes = match meta.chroma {
         Some(c) => c.frame_bytes(w, h),
         None => w * h * 4,
     };
-    const RUN_BUDGET: usize = 192 << 20;
+    const RUN_BUDGET: usize = 128 << 20;
     let batch_cap = (RUN_BUDGET / (w * h * 4)).clamp(2 * nthreads, 8 * nthreads);
     // The channel is a different question: every frame it holds is a frame
     // the clip keeps anyway, so queueing them early costs nothing but the
