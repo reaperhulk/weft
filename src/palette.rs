@@ -2042,3 +2042,369 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wu's variance-minimising quantizer
+//
+// Xiaolin Wu, "Efficient Statistical Computations for Optimal Color
+// Quantization" (Graphics Gems II, 1991). Where median cut splits a box at
+// the count-weighted median of its widest axis, Wu evaluates *every* cut
+// plane on all three axes and takes the one that removes the most variance.
+// That is only affordable because the moments are precomputed as 3D prefix
+// sums over a coarse grid: the weight, per-axis sums and sum of squares of
+// any axis-aligned box then come from eight corner lookups, so a split
+// costs O(axes x cells-per-axis) instead of O(colours in the box).
+//
+// Two deliberate departures from the paper. The grid is laid out in OkLab,
+// not sRGB, so the cut planes and the variance being minimised are
+// perceptual -- matching what `median_cut` already does, and keeping the
+// palettes comparable. And the moments accumulate the exact OkLab
+// coordinates of the colours falling in each cell, so a box's mean is the
+// true weighted mean of its colours; only the cut planes are quantised.
+
+/// Cells per axis in the moment grid, and the cumulative grid's stride
+/// (one extra plane per axis holds the zero boundary).
+const WU_N: usize = 32;
+const WU_G: usize = WU_N + 1;
+
+#[inline(always)]
+fn wu_idx(i: usize, j: usize, k: usize) -> usize {
+    (i * WU_G + j) * WU_G + k
+}
+
+#[derive(Clone, Copy)]
+struct WuBox {
+    lo: [usize; 3],
+    hi: [usize; 3],
+    variance: f64,
+}
+
+/// Cumulative moments over the grid: `wt` is the pixel count, `m[c]` the
+/// weighted sum of OkLab axis `c`, and `m2` the weighted sum of squared
+/// magnitude. One scalar `m2` suffices because a box's total variance is
+/// `m2 - (mL^2 + ma^2 + mb^2) / wt`, already summed over the axes.
+struct WuMoments {
+    wt: Vec<f64>,
+    m: [Vec<f64>; 3],
+    m2: Vec<f64>,
+}
+
+impl WuMoments {
+    /// Signed 2D cumulative face of `b` at plane `p` on `axis`: the four
+    /// corners of the box's cross-section, inclusion-excluded.
+    #[inline(always)]
+    fn face(v: &[f64], b: &WuBox, axis: usize, p: usize) -> f64 {
+        let (o0, o1) = ((axis + 1) % 3, (axis + 2) % 3);
+        let mut c = [0usize; 3];
+        c[axis] = p;
+        let mut s = 0.0;
+        for (si, &i) in [b.hi[o0], b.lo[o0]].iter().enumerate() {
+            for (sj, &j) in [b.hi[o1], b.lo[o1]].iter().enumerate() {
+                c[o0] = i;
+                c[o1] = j;
+                let t = v[wu_idx(c[0], c[1], c[2])];
+                s += if (si + sj) % 2 == 0 { t } else { -t };
+            }
+        }
+        s
+    }
+
+    /// Eight-corner sum over the whole box (any axis gives the same value).
+    #[inline(always)]
+    fn vol(v: &[f64], b: &WuBox) -> f64 {
+        Self::face(v, b, 0, b.hi[0]) - Self::face(v, b, 0, b.lo[0])
+    }
+
+    /// Total squared error left in `b` once it is replaced by its mean.
+    fn variance(&self, b: &WuBox) -> f64 {
+        let w = Self::vol(&self.wt, b);
+        if w <= 0.0 {
+            return 0.0;
+        }
+        let s: f64 = (0..3)
+            .map(|c| {
+                let v = Self::vol(&self.m[c], b);
+                v * v
+            })
+            .sum();
+        (Self::vol(&self.m2, b) - s / w).max(0.0)
+    }
+
+    /// The count-weighted median plane on `axis`: the first plane whose
+    /// low side holds at least half the box's weight. This is `median_cut`'s
+    /// split rule expressed on the moment grid -- used to separate "does
+    /// Wu's speed come at the cost of its objective" from "does it come at
+    /// the cost of the grid".
+    fn median_cut_plane(&self, b: &WuBox, axis: usize) -> Option<(usize, f64)> {
+        let wl = Self::face(&self.wt, b, axis, b.lo[axis]);
+        let w_whole = Self::face(&self.wt, b, axis, b.hi[axis]) - wl;
+        if w_whole <= 0.0 {
+            return None;
+        }
+        let half = w_whole / 2.0;
+        let base: Vec<f64> = (0..3)
+            .map(|c| Self::face(&self.m[c], b, axis, b.lo[axis]))
+            .collect();
+        let whole: Vec<f64> = (0..3)
+            .map(|c| Self::face(&self.m[c], b, axis, b.hi[axis]) - base[c])
+            .collect();
+        for p in b.lo[axis] + 1..b.hi[axis] {
+            let w_bot = Self::face(&self.wt, b, axis, p) - wl;
+            let w_top = w_whole - w_bot;
+            if w_bot >= half && w_bot > 0.0 && w_top > 0.0 {
+                let mut sb = 0.0;
+                let mut st = 0.0;
+                for c in 0..3 {
+                    let bot = Self::face(&self.m[c], b, axis, p) - base[c];
+                    let top = whole[c] - bot;
+                    sb += bot * bot;
+                    st += top * top;
+                }
+                return Some((p, sb / w_bot + st / w_top));
+            }
+        }
+        None
+    }
+
+    /// Best cut plane on `axis`, as (plane, objective). The objective is
+    /// the sum of the two halves' `|sum|^2 / weight`; maximising it is the
+    /// same as minimising their combined variance, since the box's own
+    /// `m2` is constant across cut choices. Planes that would leave either
+    /// side empty are skipped, so a returned cut always splits the box.
+    fn best_cut(&self, b: &WuBox, axis: usize) -> Option<(usize, f64)> {
+        let wl = Self::face(&self.wt, b, axis, b.lo[axis]);
+        let wh = Self::face(&self.wt, b, axis, b.hi[axis]);
+        let w_whole = wh - wl;
+        let base: Vec<f64> = (0..3)
+            .map(|c| Self::face(&self.m[c], b, axis, b.lo[axis]))
+            .collect();
+        let whole: Vec<f64> = (0..3)
+            .map(|c| Self::face(&self.m[c], b, axis, b.hi[axis]) - base[c])
+            .collect();
+        let mut best: Option<(usize, f64)> = None;
+        for p in b.lo[axis] + 1..b.hi[axis] {
+            let w_bot = Self::face(&self.wt, b, axis, p) - wl;
+            if w_bot <= 0.0 {
+                continue;
+            }
+            let w_top = w_whole - w_bot;
+            if w_top <= 0.0 {
+                break; // every later plane is emptier still
+            }
+            let mut sb = 0.0;
+            let mut st = 0.0;
+            for c in 0..3 {
+                let bot = Self::face(&self.m[c], b, axis, p) - base[c];
+                let top = whole[c] - bot;
+                sb += bot * bot;
+                st += top * top;
+            }
+            let obj = sb / w_bot + st / w_top;
+            if best.is_none_or(|(_, o)| obj > o) {
+                best = Some((p, obj));
+            }
+        }
+        best
+    }
+}
+
+/// Wu's quantizer over `entries` (packed sRGB, pixel count), returning at
+/// most `max_colors` palette entries. Drop-in alternative to `median_cut`.
+pub fn wu_quantize(entries: Vec<(u32, u32)>, max_colors: usize) -> Vec<[u8; 3]> {
+    wu_quantize_with(entries, max_colors, false)
+}
+
+/// `median_rule` swaps Wu's variance-optimal cut plane for `median_cut`'s
+/// count-weighted median, keeping everything else (the moment grid, the
+/// O(1) splits, the box-mean palette).
+pub fn wu_quantize_with(
+    mut entries: Vec<(u32, u32)>,
+    max_colors: usize,
+    median_rule: bool,
+) -> Vec<[u8; 3]> {
+    if entries.is_empty() {
+        return vec![[0, 0, 0]];
+    }
+    if entries.len() <= max_colors {
+        return entries
+            .iter()
+            .map(|&(c, _)| [(c >> 16) as u8, (c >> 8) as u8, c as u8])
+            .collect();
+    }
+    // Same canonicalisation as median_cut: the grid accumulation below is a
+    // float sum, so the entry order has to be independent of how the
+    // histogram happened to be merged.
+    if entries.len() > 16384 {
+        entries.par_sort_unstable();
+    } else {
+        entries.sort_unstable();
+    }
+    let cv = LabConverter::new();
+    let labs: Vec<[f32; 3]> = entries
+        .par_iter()
+        .map(|&(c, _)| cv.srgb_to_oklab((c >> 16) as u8, (c >> 8) as u8, c as u8))
+        .collect();
+
+    // Fit the grid to the clip's actual OkLab extent rather than the whole
+    // sRGB gamut: cartoon content often occupies a fraction of it, and the
+    // cut planes are only as fine as the grid they sit on.
+    let mut lo = [f32::MAX; 3];
+    let mut hi = [f32::MIN; 3];
+    for l in &labs {
+        for c in 0..3 {
+            lo[c] = lo[c].min(l[c]);
+            hi[c] = hi[c].max(l[c]);
+        }
+    }
+    let scale: [f32; 3] = std::array::from_fn(|c| {
+        let span = hi[c] - lo[c];
+        if span > 0.0 {
+            WU_N as f32 / span
+        } else {
+            0.0
+        }
+    });
+    let cell = |l: &[f32; 3]| -> [usize; 3] {
+        std::array::from_fn(|c| (((l[c] - lo[c]) * scale[c]) as usize).min(WU_N - 1))
+    };
+
+    let n = WU_G * WU_G * WU_G;
+    let mut mom = WuMoments {
+        wt: vec![0.0; n],
+        m: [vec![0.0; n], vec![0.0; n], vec![0.0; n]],
+        m2: vec![0.0; n],
+    };
+    for (&(_, cnt), l) in entries.iter().zip(&labs) {
+        let g = cell(l);
+        // cell (0,0,0) of the cumulative grid is the zero boundary
+        let i = wu_idx(g[0] + 1, g[1] + 1, g[2] + 1);
+        let w = cnt as f64;
+        mom.wt[i] += w;
+        let mut sq = 0.0;
+        for (mc, &lc) in mom.m.iter_mut().zip(l.iter()) {
+            let v = lc as f64;
+            mc[i] += w * v;
+            sq += v * v;
+        }
+        mom.m2[i] += w * sq;
+    }
+
+    // 3D prefix sums (Wu's M3d): after this every cell holds the moment of
+    // the whole sub-box from the origin to it, so any box is eight lookups.
+    {
+        let WuMoments { wt, m, m2 } = &mut mom;
+        let [ml, ma, mb] = m;
+        // the five arrays are independent, and each is a strictly serial
+        // sweep, so this is the only parallelism the build offers
+        let mut arrs: Vec<&mut Vec<f64>> = vec![wt, ml, ma, mb, m2];
+        arrs.par_iter_mut().for_each(|v| {
+            for i in 1..WU_G {
+                let mut area = [0.0f64; WU_G];
+                for j in 1..WU_G {
+                    let mut line = 0.0f64;
+                    for (k, a) in area.iter_mut().enumerate().take(WU_G).skip(1) {
+                        line += v[wu_idx(i, j, k)];
+                        *a += line;
+                        v[wu_idx(i, j, k)] = v[wu_idx(i - 1, j, k)] + *a;
+                    }
+                }
+            }
+        });
+    }
+
+    let mut boxes = vec![WuBox {
+        lo: [0; 3],
+        hi: [WU_N; 3],
+        variance: 0.0,
+    }];
+    boxes[0].variance = mom.variance(&boxes[0]);
+    while boxes.len() < max_colors {
+        // split the box that still holds the most squared error
+        let Some(bi) = (0..boxes.len())
+            .filter(|&i| boxes[i].variance > 0.0)
+            .max_by(|&a, &b| {
+                boxes[a]
+                    .variance
+                    .partial_cmp(&boxes[b].variance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(b.cmp(&a)) // lowest index wins ties, deterministically
+            })
+        else {
+            break;
+        };
+        let cur = boxes[bi];
+        // every plane on every axis, each evaluated in constant time
+        let mut pick: Option<(usize, usize, f64)> = None;
+        for axis in 0..3 {
+            let cut = if median_rule {
+                mom.median_cut_plane(&cur, axis)
+            } else {
+                mom.best_cut(&cur, axis)
+            };
+            if let Some((p, obj)) = cut {
+                if pick.is_none_or(|(_, _, o)| obj > o) {
+                    pick = Some((axis, p, obj));
+                }
+            }
+        }
+        let Some((axis, p, _)) = pick else {
+            // indivisible: retire it so the loop can move on
+            boxes[bi].variance = 0.0;
+            continue;
+        };
+        let mut left = cur;
+        let mut right = cur;
+        left.hi[axis] = p;
+        right.lo[axis] = p;
+        left.variance = mom.variance(&left);
+        right.variance = mom.variance(&right);
+        boxes[bi] = left;
+        boxes.push(right);
+    }
+
+    // Box means, with the same exactness rules median_cut applies: a box
+    // holding one distinct colour, or overwhelmingly one colour, must
+    // reproduce it bit-exactly -- the f32 Lab->sRGB roundtrip drifts by
+    // +-1, and in a large flat region that shows as dither speckle.
+    let mut tag = vec![0u16; WU_N * WU_N * WU_N];
+    for (bi, b) in boxes.iter().enumerate() {
+        for i in b.lo[0]..b.hi[0] {
+            for j in b.lo[1]..b.hi[1] {
+                for k in b.lo[2]..b.hi[2] {
+                    tag[(i * WU_N + j) * WU_N + k] = bi as u16;
+                }
+            }
+        }
+    }
+    let mut dom: Vec<(u32, u32)> = vec![(0, 0); boxes.len()]; // (srgb, count)
+    let mut distinct = vec![0u32; boxes.len()];
+    for (&(c, cnt), l) in entries.iter().zip(&labs) {
+        let g = cell(l);
+        let bi = tag[(g[0] * WU_N + g[1]) * WU_N + g[2]] as usize;
+        distinct[bi] += 1;
+        if cnt > dom[bi].1 {
+            dom[bi] = (c, cnt);
+        }
+    }
+    boxes
+        .iter()
+        .enumerate()
+        .map(|(bi, b)| {
+            let w = WuMoments::vol(&mom.wt, b);
+            let exact = [
+                (dom[bi].0 >> 16) as u8,
+                (dom[bi].0 >> 8) as u8,
+                dom[bi].0 as u8,
+            ];
+            if distinct[bi] == 1 || (dom[bi].1 as f64) * 100.0 >= w * 99.0 {
+                return exact;
+            }
+            if w <= 0.0 {
+                return exact;
+            }
+            oklab_to_srgb(std::array::from_fn(|c| {
+                (WuMoments::vol(&mom.m[c], b) / w) as f32
+            }))
+        })
+        .collect()
+}

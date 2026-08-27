@@ -863,7 +863,11 @@ fn run(args: &Args) -> io::Result<()> {
     let entries = palette::maybe_fold(entries);
     let n_folded = entries.len();
     let t_cut_start = Instant::now();
-    let mut colors = palette::median_cut(entries.clone(), args.colors - 1);
+    let mut colors = match std::env::var("WEFT_WU").as_deref() {
+        Ok("1") => palette::wu_quantize(entries.clone(), args.colors - 1),
+        Ok("2") => palette::wu_quantize_with(entries.clone(), args.colors - 1, true),
+        _ => palette::median_cut(entries.clone(), args.colors - 1),
+    };
     let t_cut = t_cut_start.elapsed();
     let t_lloyd_start = Instant::now();
     palette::refine_lloyd(&mut colors, &entries, palette::LLOYD_ITERS);
