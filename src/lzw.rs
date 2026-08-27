@@ -42,7 +42,11 @@ fn should_clear(run_ewma: u32, pixels_left: usize, min_code_bits: u32) -> bool {
 /// average color is preserved along runs.
 pub struct LossyMap {
     starts: Vec<u32>, // len = 257
-    cands: Vec<u8>,
+    /// Substitution candidates, `static_sq_distance << 8 | index`, sorted
+    /// ascending. Carrying the distance lets the DFS stop scanning a list
+    /// once the remaining entries are provably over the error cap (see
+    /// `cand_limit`) instead of computing a dithered diff for each.
+    cands: Vec<u32>,
     colors: Vec<[i32; 3]>,
     trans_idx: u8,
     max_diff: u32,
@@ -85,7 +89,10 @@ impl LossyMap {
                 .collect();
             list.sort_by_key(|&(_, d)| d);
             list.truncate(LOSSY_MAX_CANDS);
-            cands.extend(list.iter().map(|&(j, _)| j));
+            // Packed so the sort order above is the order of the packed
+            // values too: `d` dominates, and ties keep index order, which
+            // is what the stable sort by `d` produced.
+            cands.extend(list.iter().map(|&(j, d)| ((d as u32) << 8) | j as u32));
         }
         starts.push(cands.len() as u32);
         LossyMap {
@@ -98,10 +105,24 @@ impl LossyMap {
     }
 
     #[inline(always)]
-    fn candidates(&self, symbol: u8) -> &[u8] {
+    fn candidates(&self, symbol: u8) -> &[u32] {
         let s = self.starts[symbol as usize] as usize;
         let e = self.starts[symbol as usize + 1] as usize;
         &self.cands[s..e]
+    }
+
+    /// Static squared distance past which no candidate can come in under
+    /// `cap`, so a distance-sorted list can stop there.
+    ///
+    /// With `u` the colour difference and `v` the carried dither, both
+    /// views `diff` takes are at least `(|u| - |v|)^2` once `|u| >= |v|`,
+    /// so a candidate passes only if `|u| <= |v| + sqrt(cap)`. Testing
+    /// `|u|^2 <= 2(|v|^2 + cap)` is weaker than that bound — it never cuts
+    /// a candidate the exact test would keep — and needs no square roots.
+    #[inline(always)]
+    fn cand_limit(dither: &[i32; 3], cap: u32) -> u32 {
+        let vn2 = (dither[0] * dither[0] + dither[1] * dither[1] + dither[2] * dither[2]) as u32;
+        2 * (vn2 + cap)
     }
 
     /// gifsicle color_diff: squared error between wanted and written,
@@ -111,12 +132,16 @@ impl LossyMap {
     fn diff(&self, want: u8, got: u8, dither: &[i32; 3]) -> u32 {
         let a = &self.colors[want as usize];
         let b = &self.colors[got as usize];
-        let mut dith = 0i64;
-        let mut undith = 0i64;
+        // i32 is enough: the carried dither is a decaying series bounded by
+        // 4*255, so each term stays under 1275^2 and the sum under 4.9e6.
+        let mut dith = 0i32;
+        let mut undith = 0i32;
         for c in 0..3 {
             let base = a[c] - b[c];
-            dith += ((base + dither[c]) as i64).pow(2);
-            undith += ((base + dither[c] / 2) as i64).pow(2);
+            let f = base + dither[c];
+            let h = base + dither[c] / 2;
+            dith += f * f;
+            undith += h * h;
         }
         dith.min(undith) as u32
     }
@@ -135,6 +160,19 @@ impl LossyMap {
             a[2] - b[2] + dither[2] * 3 / 4,
         ]
     }
+}
+
+/// The parts of a lossy DFS that never change during one search. Passing
+/// them as one reference instead of six arguments keeps the recursion's
+/// stack frame small: the search recurses once per matched pixel, so what
+/// each level spills is paid on every visited node.
+struct DfsCtx<'a> {
+    gen: u16,
+    data: &'a [u8],
+    map: &'a LossyMap,
+    scale: Option<&'a [u8]>,
+    visits: u32,
+    best: LossyBest,
 }
 
 struct LossyBest {
@@ -394,26 +432,23 @@ impl LzwEncoder {
             // First pixel of a match is always exact (gifsicle: the root
             // node is the actual symbol); substitutions apply from the
             // second pixel on.
-            let mut best = LossyBest {
-                code: data[pos] as u32,
-                end: pos + 1,
-                diff: 0,
-            };
-            // Visit budget bounds the DFS on pathological data; exhausting
-            // it degrades toward greedy matching, never to wrong output.
-            let mut visits = 4096u32;
-            self.lossy_dfs(
+            let mut ctx = DfsCtx {
                 gen,
                 data,
-                pos + 1,
-                data[pos] as u32,
-                [0; 3],
-                0,
-                &mut visits,
-                &mut best,
                 map,
                 scale,
-            );
+                // Visit budget bounds the DFS on pathological data;
+                // exhausting it degrades toward greedy matching, never to
+                // wrong output.
+                visits: 4096,
+                best: LossyBest {
+                    code: data[pos] as u32,
+                    end: pos + 1,
+                    diff: 0,
+                },
+            };
+            self.lossy_dfs(&mut ctx, pos + 1, data[pos] as u32, [0; 3], 0);
+            let best = ctx.best;
             bw.put(best.code, width);
             update_run_ewma(&mut run_ewma, (best.end - pos) as u32);
             pos = best.end;
@@ -461,23 +496,18 @@ impl LzwEncoder {
     /// match reaching the end of the data can't be beaten (nothing is
     /// longer, and equal length needs strictly lower error), so the whole
     /// DFS unwinds immediately.
-    #[allow(clippy::too_many_arguments)]
     fn lossy_dfs(
         &self,
-        gen: u16,
-        data: &[u8],
+        ctx: &mut DfsCtx,
         pos: usize,
         node_code: u32,
         dither: [i32; 3],
         accum: u64,
-        visits: &mut u32,
-        best: &mut LossyBest,
-        map: &LossyMap,
-        scale: Option<&[u8]>,
     ) -> bool {
+        let data = ctx.data;
         // Longest match wins; equal length prefers lower total error.
-        if pos > best.end || (pos == best.end && accum < best.diff) {
-            *best = LossyBest {
+        if pos > ctx.best.end || (pos == ctx.best.end && accum < ctx.best.diff) {
+            ctx.best = LossyBest {
                 code: node_code,
                 end: pos,
                 diff: accum,
@@ -486,15 +516,15 @@ impl LzwEncoder {
                 return true;
             }
         }
-        if pos >= data.len() || *visits == 0 {
+        if pos >= data.len() || ctx.visits == 0 {
             return false;
         }
-        *visits -= 1;
+        ctx.visits -= 1;
         // Leaf cut and bitmap gate: skipping a symbol the node has no
         // child for is exactly what a missed hash probe would do, minus
         // the probe (and, for candidates, minus the diff computation).
         let p = node_code as usize;
-        if self.child_gen[p] != gen {
+        if self.child_gen[p] != ctx.gen {
             return false;
         }
         let cb = &self.child_bits[p * 4..p * 4 + 4];
@@ -502,30 +532,27 @@ impl LzwEncoder {
         // Exact continuation: zero cost, dither decays.
         if cb[(b >> 6) as usize] & (1u64 << (b & 63)) != 0 {
             if let Ok(code) = self.probe((node_code << 8) | b as u32) {
-                let nd = map.next_dither(b, b, &dither);
-                if self.lossy_dfs(
-                    gen,
-                    data,
-                    pos + 1,
-                    code,
-                    nd,
-                    accum,
-                    visits,
-                    best,
-                    map,
-                    scale,
-                ) {
+                let nd = ctx.map.next_dither(b, b, &dither);
+                if self.lossy_dfs(ctx, pos + 1, code, nd, accum) {
                     return true;
                 }
             }
         }
+        let map = ctx.map;
         if b != map.trans_idx {
             // per-pixel cap: the frame's loss scale, if any, applies here
-            let cap = match scale {
+            let cap = match ctx.scale {
                 Some(s) => (map.max_diff * s[pos] as u32) >> 8,
                 None => map.max_diff,
             };
-            for &b2 in map.candidates(b) {
+            let limit = LossyMap::cand_limit(&dither, cap);
+            for &packed in map.candidates(b) {
+                // Distance-sorted: the first entry over the limit means
+                // every entry after it is too.
+                if (packed >> 8) > limit {
+                    break;
+                }
+                let b2 = packed as u8;
                 if cb[(b2 >> 6) as usize] & (1u64 << (b2 & 63)) == 0 {
                     continue;
                 }
@@ -535,18 +562,7 @@ impl LzwEncoder {
                 }
                 if let Ok(code) = self.probe((node_code << 8) | b2 as u32) {
                     let nd = map.next_dither(b, b2, &dither);
-                    if self.lossy_dfs(
-                        gen,
-                        data,
-                        pos + 1,
-                        code,
-                        nd,
-                        accum + d as u64,
-                        visits,
-                        best,
-                        map,
-                        scale,
-                    ) {
+                    if self.lossy_dfs(ctx, pos + 1, code, nd, accum + d as u64) {
                         return true;
                     }
                 }
