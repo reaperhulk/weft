@@ -450,8 +450,25 @@ fn eq32(a: &[u8], b: &[u8; 32]) -> bool {
 /// entries than there are bins (so folding always shrinks). Means stay
 /// within their (4-wide) cell, so output colors remain unique — a property
 /// `median_cut`'s tie-breaking relies on.
+/// Distinct-colour count above which the histogram is folded to the
+/// `GRID_BITS` grid.
+///
+/// The obvious threshold is `GRID_SIZE` — don't fold until there are more
+/// colours than cells to hold them — but that is a poor proxy for whether
+/// folding would help, because occupancy is clustered rather than
+/// uniform. A 41-frame cel clip with 221,808 distinct colours occupies
+/// only 53,036 of the 262,144 cells, so folding is already a 4x reduction
+/// well below the cell count, and median cut's cost is linear in what it
+/// is handed.
+///
+/// Half the cell count is where that stops paying for itself. It is also
+/// where the *short* clips sit: long clips accumulate past `GRID_SIZE` and
+/// fold on their own, so the old threshold charged full price to exactly
+/// the 40-150 frame clips that are the common case.
+pub const FOLD_MAX: usize = GRID_SIZE / 2;
+
 pub fn maybe_fold(entries: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
-    if entries.len() <= GRID_SIZE {
+    if entries.len() <= FOLD_MAX {
         return entries;
     }
     let mut bins = new_fold_bins();
