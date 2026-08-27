@@ -92,6 +92,14 @@ impl<'a> RowSource<'a> {
         matches!(self.frame, Frame::Yuv(_))
     }
 
+    /// Whether the frame representation guarantees opaque pixels. Pass 1
+    /// packs opaque RGBA frames to RGB, while every supported YUV format is
+    /// intrinsically opaque.
+    #[inline]
+    pub fn is_intrinsically_opaque(&self) -> bool {
+        matches!(self.frame, Frame::Rgb(_) | Frame::Yuv(_))
+    }
+
     /// Fill canonical `0xRRGGBB` histogram keys. Call only when
     /// `has_direct_rgb_keys` is true.
     #[inline]
