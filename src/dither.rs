@@ -500,16 +500,13 @@ impl<'a> Quantizer<'a> {
 
         // ---- pass B: staged pipeline, attenuation masked per tile --------
         let mut has_alpha = false;
+        let opaque = src.is_intrinsically_opaque();
         for y in 0..h {
-            // keys are not needed in pass B (c1 is stored); frames whose
-            // rows carry keys for free skip that work
-            let keys_ready = src.has_direct_rgb_keys();
-            if keys_ready {
-                src.fill_row(y, &mut scratch.row);
-            } else {
-                src.fill_row_with_grid_keys(y, &mut scratch.row, &mut scratch.keys);
-            }
-            let has_alpha_row = if gate_on && keys_ready {
+            // Keys are not needed in pass B (c1 is stored). Opaque RGB and
+            // YUV sources can therefore skip key generation and alpha
+            // detection while the activity pass reads their RGBA row.
+            src.fill_row(y, &mut scratch.row);
+            let has_alpha_row = if gate_on && opaque {
                 let prev: &[u8] = if y == 0 { &scratch.row } else { &scratch.row2 };
                 crate::simdops::bn_activity(level, &scratch.row, prev, self.gate, &mut scratch.att);
                 false
@@ -525,7 +522,7 @@ impl<'a> Quantizer<'a> {
                 )
             } else {
                 scratch.att.fill(256);
-                if !keys_ready {
+                if !opaque {
                     crate::simdops::bn_keys(level, &scratch.row, &mut scratch.keys)
                 } else {
                     false
@@ -957,6 +954,54 @@ mod tests {
         let mut scratch = QuantScratch::new(w);
         q.quantize(&src, w, h, mode, &mut scratch, &mut out, None);
         out
+    }
+
+    #[test]
+    fn auto_rgb_matches_opaque_rgba() {
+        let (w, h) = (77usize, 40usize);
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                rgba.extend_from_slice(&[
+                    (x * 3) as u8,
+                    (y * 5 + x / 3) as u8,
+                    (x * 2 + y * 3) as u8,
+                    255,
+                ]);
+            }
+        }
+        let rgb: Vec<u8> = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| [p[0], p[1], p[2]])
+            .collect();
+        let colors: Vec<[u8; 3]> = (0..16u8)
+            .map(|i| {
+                let v = i * 17;
+                [v, v, v]
+            })
+            .collect();
+        let nm = NearestMap::build(&colors);
+        let band = BandGate::new(&nm);
+        let q = Quantizer {
+            nearest: &nm,
+            trans_idx: colors.len() as u8,
+            exact_palette: false,
+            gate: 16,
+            band: Some(&band),
+        };
+        let run = |frame| {
+            let src = crate::color::RowSource::new(&frame, w, h, None);
+            let mut scratch = QuantScratch::new(w);
+            let mut out = vec![0u8; w * h];
+            let alpha = q.quantize(&src, w, h, Dither::Auto, &mut scratch, &mut out, None);
+            (alpha, out)
+        };
+        let (rgba_alpha, rgba_out) = run(crate::input::Frame::Rgba(rgba));
+        let (rgb_alpha, rgb_out) = run(crate::input::Frame::Rgb(rgb));
+        assert!(!rgba_alpha && !rgb_alpha);
+        assert_eq!(rgb_out, rgba_out);
     }
 
     #[test]
