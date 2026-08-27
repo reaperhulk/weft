@@ -886,10 +886,22 @@ fn run(args: &Args) -> io::Result<()> {
     // faults each buffer's pages once instead of allocating, zeroing, and
     // freeing ~w*h bytes per frame.
     let mut idx_block: Vec<Vec<u8>> = Vec::new();
-    // Per-pixel lossy scale maps (see `LzwEncoder::encode`): only the
-    // modes that leave regions undithered produce them; the others keep
-    // the flat cap and skip the buffers.
-    let scaled_lossy = args.lossy > 0 && matches!(args.dither, Dither::None | Dither::Auto);
+    // Per-pixel lossy scale maps (see `LzwEncoder::encode`): scaling the
+    // cap down in smooth regions stops lossy from hatching them, which is
+    // what `--dither none` wants, since nothing else is breaking those
+    // regions up.
+    //
+    // `auto` is the opposite case and used to be included here. It leaves
+    // a region undithered only when its banding gate found no contour
+    // there, so scaling the cap down in exactly those regions removes the
+    // lossy noise that was covering the contours the gate missed — and the
+    // gate does miss them: on the S06E21 clock clip every contour in the
+    // tiles it passed over measures OkLab dE 0.004-0.010, under the 0.012
+    // floor `BandGate` treats as visible. Keeping the flat cap under
+    // `auto` is smaller *and* flatter: on cghmc-bench, -7 to -21 % output
+    // and residual contours down from 98-186 per clip to 0-9, which is
+    // where plain `--dither bluenoise` sits.
+    let scaled_lossy = args.lossy > 0 && matches!(args.dither, Dither::None);
     let mut scale_block: Vec<Vec<u8>> = Vec::new();
     let mut t_quant = std::time::Duration::ZERO;
     let mut t_lzw = std::time::Duration::ZERO;
