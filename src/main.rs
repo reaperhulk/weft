@@ -419,7 +419,9 @@ fn run(args: &Args) -> io::Result<()> {
             tx.clone()
         };
         drop(stx);
-        let reader_handle = scope.spawn(move || -> io::Result<usize> {
+        type ReaderResult = (usize, [std::time::Duration; 3]);
+        let collect_stats = args.stats;
+        let reader_handle = scope.spawn(move || -> io::Result<ReaderResult> {
             let tx = reader_tx;
             // On a fast source (tmpfs, a pipe from a decoder already
             // ahead of us) most of the reader's time is page-faulting the
@@ -448,25 +450,38 @@ fn run(args: &Args) -> io::Result<()> {
                 }
             });
             let mut n = 0usize;
+            let mut reader_times = [std::time::Duration::ZERO; 3];
             let res = (|| {
                 loop {
+                    let t = collect_stats.then(Instant::now);
                     let buf = brx.recv().expect("prefault thread died");
+                    if let Some(t) = t {
+                        reader_times[0] += t.elapsed();
+                    }
+                    let t = collect_stats.then(Instant::now);
                     let frame = if is_y4m {
                         input::read_y4m_frame(&mut source, buf)?
                     } else {
                         input::read_rgba_frame(&mut source, buf)?
                     };
+                    if let Some(t) = t {
+                        reader_times[1] += t.elapsed();
+                    }
                     match frame {
                         Some(f) => {
+                            let t = collect_stats.then(Instant::now);
                             if tx.send((n, f)).is_err() {
                                 break; // consumer died; its error surfaces below
+                            }
+                            if let Some(t) = t {
+                                reader_times[2] += t.elapsed();
                             }
                             n += 1;
                         }
                         None => break,
                     }
                 }
-                Ok(n)
+                Ok((n, reader_times))
             })();
             drop(brx); // unblocks the helper's pending send
             prefault.join().expect("prefault thread panicked");
@@ -745,12 +760,12 @@ fn run(args: &Args) -> io::Result<()> {
         let t_smooth =
             std::time::Duration::from_nanos(smooth_ns.load(std::sync::atomic::Ordering::Relaxed));
         (
-            read_res.map(|n| (n, t_smooth, t_hold, hold_mean_t)),
+            read_res.map(|(n, reader_times)| (n, t_smooth, t_hold, hold_mean_t, reader_times)),
             frames,
             any_alpha,
         )
     });
-    let (nread, t_smooth, t_hold, hold_mean_t) = read_res?;
+    let (nread, t_smooth, t_hold, hold_mean_t, reader_times) = read_res?;
     if indexed_frames.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -797,14 +812,19 @@ fn run(args: &Args) -> io::Result<()> {
     let n_entries = entries.len();
     let entries = palette::maybe_fold(entries);
     let n_folded = entries.len();
+    let t_cut_start = Instant::now();
     let mut colors = palette::median_cut(entries.clone(), args.colors - 1);
+    let t_cut = t_cut_start.elapsed();
+    let t_lloyd_start = Instant::now();
     palette::refine_lloyd(&mut colors, &entries, palette::LLOYD_ITERS);
-    let t_mc = t2.elapsed();
+    let t_lloyd = t_lloyd_start.elapsed();
     let trans_idx = colors.len() as u8;
     let slots = colors.len() + 1;
     let gct_bits = (usize::BITS - (slots - 1).leading_zeros()).max(1) as u8;
     let min_code_size = gct_bits.max(2);
+    let t_lut_start = Instant::now();
     let nearest = palette::NearestMap::build(&colors);
+    let t_lut = t_lut_start.elapsed();
     let t_pal = t2.elapsed();
     if args.stats {
         let folded = if coarse_binned {
@@ -815,12 +835,14 @@ fn run(args: &Args) -> io::Result<()> {
             String::new()
         };
         eprintln!(
-            "  palette: {} colors from {} entries{}, nearest-map avg candidates/cell {:.2}, median_cut {:?}",
+            "  palette: {} colors from {} entries{}, nearest-map avg candidates/cell {:.2}, median_cut {:?}, lloyd {:?}, nearest-map {:?}",
             colors.len(),
             n_entries,
             folded,
             nearest.avg_candidates(),
-            t_mc
+            t_cut,
+            t_lloyd,
+            t_lut
         );
     }
 
@@ -869,6 +891,8 @@ fn run(args: &Args) -> io::Result<()> {
     // the flat cap and skip the buffers.
     let scaled_lossy = args.lossy > 0 && matches!(args.dither, Dither::None | Dither::Auto);
     let mut scale_block: Vec<Vec<u8>> = Vec::new();
+    let mut t_quant = std::time::Duration::ZERO;
+    let mut t_lzw = std::time::Duration::ZERO;
     // `for_each_init`/`map_init` state lives for only one parallel
     // operation. Since the block loop launches two new operations per
     // block, using them here would repeatedly allocate and zero the 1 MiB
@@ -913,6 +937,7 @@ fn run(args: &Args) -> io::Result<()> {
                 .collect();
             scale_block.extend(extra);
         }
+        let t_quant_start = args.stats.then(Instant::now);
         {
             let scale_slots: Vec<Option<&mut Vec<u8>>> = if scaled_lossy {
                 scale_block[..cn].iter_mut().map(Some).collect()
@@ -942,6 +967,10 @@ fn run(args: &Args) -> io::Result<()> {
                     );
                 });
         }
+        if let Some(t) = t_quant_start {
+            t_quant += t.elapsed();
+        }
+        let t_lzw_start = args.stats.then(Instant::now);
         encoded.par_extend((0..cn).into_par_iter().map(|j| {
             let wi = rayon::current_thread_index().unwrap_or(nthreads);
             let mut encode = worker_ctx[wi]
@@ -975,6 +1004,9 @@ fn run(args: &Args) -> io::Result<()> {
                 &mut encode,
             )
         }));
+        if let Some(t) = t_lzw_start {
+            t_lzw += t.elapsed();
+        }
         // The block's last indexed frame seeds the next block's first
         // delta; swap keeps both buffers in the recycled pool.
         match prev_last.as_mut() {
@@ -1005,6 +1037,7 @@ fn run(args: &Args) -> io::Result<()> {
 
     if args.stats {
         let n = encoded.len();
+        let t_qlzw_overhead = t_qlzw.saturating_sub(t_quant + t_lzw);
         eprintln!(
             "weft: {n} frames {w}x{h} @{}/{} fps, {} colors, {} bytes",
             meta.fps_num,
@@ -1013,13 +1046,20 @@ fn run(args: &Args) -> io::Result<()> {
             stdout.written
         );
         eprintln!(
-            "  read+hist {:?} (hist span {:?}; prefilter cpu: smooth {:?} hold {:?}, mean hold window {:.1})  palette+lut {:?}  quantize+lzw {:?}  mux+write {:?}  total {:?}",
-            t_read, t_hist,
+            "  read+hist {:?} (reader: buffer wait {:?}, read {:?}, send wait {:?}; hist span {:?}; prefilter cpu: smooth {:?} hold {:?}, mean hold window {:.1})  palette+lut {:?}  quantize+lzw {:?} (quantize {:?}; lzw {:?}; overhead {:?})  mux+write {:?}  total {:?}",
+            t_read,
+            reader_times[0],
+            reader_times[1],
+            reader_times[2],
+            t_hist,
             t_smooth,
             t_hold,
             hold_mean_t,
             t_pal,
             t_qlzw,
+            t_quant,
+            t_lzw,
+            t_qlzw_overhead,
             t_mux,
             t0.elapsed()
         );
