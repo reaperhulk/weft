@@ -135,9 +135,12 @@ pub struct QuantScratch {
 }
 
 impl QuantScratch {
-    pub fn new(w: usize) -> Self {
+    /// `nthreads` is how many of these run concurrently: it sizes the
+    /// memo cache so the workers' tables share L3 rather than evict each
+    /// other (see `palette::IDX_CACHE_BUDGET`).
+    pub fn new(w: usize, nthreads: usize) -> Self {
         QuantScratch {
-            cache: crate::palette::IdxCache::default(),
+            cache: crate::palette::IdxCache::for_threads(nthreads),
             row: vec![0u8; w * 4],
             row2: vec![0u8; w * 4],
             keys: vec![0; w],
@@ -934,7 +937,7 @@ mod tests {
         let frame = crate::input::Frame::Rgba(rgba);
         let src = crate::color::RowSource::new(&frame, 4, 1, None);
         let mut out = [9u8; 4];
-        let mut scratch = QuantScratch::new(4);
+        let mut scratch = QuantScratch::new(4, 1);
         let has_alpha = q.quantize(&src, 4, 1, Dither::None, &mut scratch, &mut out, None);
         assert!(has_alpha);
         assert_eq!(out, [2, 0, 1, 3]);
@@ -951,7 +954,7 @@ mod tests {
         let mut out = vec![0u8; w * h];
         let frame = crate::input::Frame::Rgba(rgba);
         let src = crate::color::RowSource::new(&frame, w, h, None);
-        let mut scratch = QuantScratch::new(w);
+        let mut scratch = QuantScratch::new(w, 1);
         q.quantize(&src, w, h, mode, &mut scratch, &mut out, None);
         out
     }
@@ -993,7 +996,7 @@ mod tests {
         };
         let run = |frame| {
             let src = crate::color::RowSource::new(&frame, w, h, None);
-            let mut scratch = QuantScratch::new(w);
+            let mut scratch = QuantScratch::new(w, 1);
             let mut out = vec![0u8; w * h];
             let alpha = q.quantize(&src, w, h, Dither::Auto, &mut scratch, &mut out, None);
             (alpha, out)
@@ -1194,7 +1197,7 @@ mod tests {
         let mut out = vec![0u8; 64];
         let frame = crate::input::Frame::Rgba(rgba);
         let src = crate::color::RowSource::new(&frame, 8, 8, None);
-        let mut scratch = QuantScratch::new(8);
+        let mut scratch = QuantScratch::new(8, 1);
         q.quantize(&src, 8, 8, Dither::Sierra2_4a, &mut scratch, &mut out, None);
         for (i, &o) in out.iter().enumerate() {
             assert_eq!(o as usize, i % 2);

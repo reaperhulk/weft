@@ -1308,7 +1308,7 @@ impl NearestMap {
         g: u8,
         b: u8,
     ) -> PackedNearest {
-        let (slot, color) = IdxCache::slot(r, g, b);
+        let (slot, color) = cache.slot(r, g, b);
         let e = cache.slots[slot];
         // the e != MAX guard keeps the empty sentinel (whose tag bits read
         // as 0xFFFFFF) from false-hitting on white; a real white entry has
@@ -1353,7 +1353,7 @@ impl NearestMap {
     /// entry's high 24 bits (the candidate list offset).
     #[inline]
     fn lookup_slow(&self, cache: &mut IdxCache, off: u32, r: u8, g: u8, b: u8) -> PackedNearest {
-        let (slot, color) = IdxCache::slot(r, g, b);
+        let (slot, color) = cache.slot(r, g, b);
         let e = cache.slots[slot];
         if (e >> 40) == color as u64 && e != u64::MAX {
             return e as u32;
@@ -1369,7 +1369,7 @@ impl NearestMap {
     /// hash-slot load, and the slot address needs only the color bytes.
     #[inline(always)]
     pub fn prefetch_cache_slot(&self, cache: &IdxCache, r: u8, g: u8, b: u8) {
-        prefetch_index(&cache.slots, IdxCache::slot(r, g, b).0);
+        prefetch_index(&cache.slots, cache.slot(r, g, b).0);
     }
 
     /// Prefetch the fast-path cell for a color a few pixels ahead of the
@@ -1413,38 +1413,87 @@ impl NearestMap {
     }
 }
 
-/// log2 of the memo cache's slot count. A miss costs a full `resolve_off`
-/// (sRGB->OkLab conversion plus the candidate scan), which is several
-/// times the rest of a pixel's work, so the cache is sized for hit rate
-/// rather than for staying L2-resident: 128K slots (1 MiB per worker)
-/// measured 2-7 % faster quantize than 64K (the more so the fewer the
-/// threads), 256K gained nothing further, and 16K/32K lost.
-const IDX_CACHE_BITS: u32 = 17;
+/// Total memo-cache budget across all quantize workers, in bytes.
+///
+/// The memo cache is per-worker, so what matters is not one worker's
+/// footprint but the sum of them against the last-level cache they share.
+/// A miss costs a full `resolve_off` (sRGB->OkLab conversion plus the
+/// candidate scan), so a bigger table is better right up until the
+/// workers' tables stop fitting in L3 together -- past that, a *hit*
+/// costs a DRAM round trip and the table's whole purpose is defeated.
+///
+/// Measured on a 2x20-core Xeon Gold 6248 (16 MiB L3 per socket), median
+/// of 7 interleaved runs, quantize phase, relative to the best cell:
+///
+/// ```text
+///  threads   128 KiB  256 KiB  512 KiB  1 MiB   2 MiB   <- per worker
+///       10     1.000    0.993    0.953   0.939   0.969
+///       20     1.000    0.988    0.986   1.035   1.179
+///       40     1.000    1.036    1.117   1.327   1.739
+/// ```
+///
+/// The optimum moves with the thread count and lands, at every count, on
+/// whatever size keeps the total near this budget -- so divide it rather
+/// than fixing a per-worker size. The old fixed 1 MiB was tuned at a low
+/// thread count and cost 33% of the quantize phase at 40.
+const IDX_CACHE_BUDGET: usize = 8 << 20;
+/// Slot-count bounds: below the floor the hit rate collapses regardless of
+/// residency, above the ceiling a single worker's table is bigger than any
+/// L3 it might share.
+const IDX_CACHE_MIN_BITS: u32 = 13;
+const IDX_CACHE_MAX_BITS: u32 = 17;
 
-/// Direct-mapped memo cache for multi-candidate nearest lookups (128K
-/// slots, see `IDX_CACHE_BITS`). Each u64 packs
-/// `query_color<<40 | palette_rgb<<8 | idx`, so a probe touches one cache
-/// line and a hit returns the palette color along with the index. Empty
-/// slots are u64::MAX (see the sentinel guard in `lookup_packed`).
+/// Slot count for one worker's memo cache, given how many run at once.
+pub fn idx_cache_slots(nthreads: usize) -> usize {
+    let per_worker = IDX_CACHE_BUDGET / nthreads.max(1);
+    let slots = (per_worker / std::mem::size_of::<u64>()).next_power_of_two();
+    // next_power_of_two rounds up; step back to stay inside the budget
+    let slots = if slots * std::mem::size_of::<u64>() > per_worker {
+        slots / 2
+    } else {
+        slots
+    };
+    slots.clamp(1 << IDX_CACHE_MIN_BITS, 1 << IDX_CACHE_MAX_BITS)
+}
+
+/// Direct-mapped memo cache for multi-candidate nearest lookups, sized by
+/// `idx_cache_slots`. Each u64 packs `query_color<<40 | palette_rgb<<8 |
+/// idx`, so a probe touches one cache line and a hit returns the palette
+/// color along with the index. Empty slots are u64::MAX (see the sentinel
+/// guard in `lookup_packed`).
 pub struct IdxCache {
     slots: Vec<u64>,
+    /// Right-shift that maps the multiplicative hash onto `slots.len()`.
+    shift: u32,
 }
 
 impl Default for IdxCache {
     fn default() -> Self {
-        IdxCache {
-            slots: vec![u64::MAX; 1 << IDX_CACHE_BITS],
-        }
+        Self::with_slots(1 << IDX_CACHE_MAX_BITS)
     }
 }
 
 impl IdxCache {
+    /// `slots` must be a power of two.
+    pub fn with_slots(slots: usize) -> Self {
+        debug_assert!(slots.is_power_of_two());
+        IdxCache {
+            slots: vec![u64::MAX; slots],
+            shift: 32 - slots.trailing_zeros(),
+        }
+    }
+
+    /// Sized for `nthreads` workers sharing one last-level cache.
+    pub fn for_threads(nthreads: usize) -> Self {
+        Self::with_slots(idx_cache_slots(nthreads))
+    }
+
     /// Slot index and packed 24-bit color for a query.
     #[inline(always)]
-    fn slot(r: u8, g: u8, b: u8) -> (usize, u32) {
+    fn slot(&self, r: u8, g: u8, b: u8) -> (usize, u32) {
         let color = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
         (
-            (color.wrapping_mul(0x9E37_79B1) >> (32 - IDX_CACHE_BITS)) as usize,
+            (color.wrapping_mul(0x9E37_79B1) >> self.shift) as usize,
             color,
         )
     }
