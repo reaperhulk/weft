@@ -370,6 +370,18 @@ independent minimal GIF decoder and compares canvases byte-for-byte.
 Dependencies: rayon and fearless_simd; the musl static build adds
 mimalloc.
 
+## Optimisation history
+
+[`docs/experiments.md`](docs/experiments.md) records optimisations that
+were implemented, measured and **rejected**, with the numbers that killed
+them — Wu's quantizer, several `--dither auto` gate reworks, half a dozen
+histogram and cache changes — along with the literature behind them. Read
+the relevant entry before trying one of these again: the goal is to start
+from where the last attempt stopped rather than from zero. It also carries
+the measurement discipline this benchmark needs (interleave A/B runs; the
+`read+hist` noise floor is ~5%), which is worth reading before producing
+any number of your own.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
