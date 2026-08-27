@@ -59,9 +59,11 @@ weft --colors 64 --dither none --no-loop < input.y4m > out.gif
                    encoding of the quantized frames; ~30 is subtle and
                    much smaller on dithered content)
 --hold N           temporal hold, 0-765 (default: 0 = off): a pixel that
-                   stays within N (|dR|+|dG|+|dB|) of its running mean and
-                   within 1.5N of its held value keeps that value; ~8-12
-                   is invisible and much smaller on compressed-video input
+                   stays within the hold window of its running mean (and
+                   1.5x it of its held value) keeps that value. The window
+                   adapts per frame to the measured frame-to-frame noise
+                   and N caps it; ~12 is a safe cap, and much smaller on
+                   compressed-video input
 --smooth N         spatial grain filter, 0-765 (default: 0 = off): each
                    pixel becomes the mean of
                    its 5x5 neighbours within N; edges are excluded so
@@ -84,29 +86,30 @@ so a clip that mixes them pays only for the frames that need it.
 ## Benchmarks
 
 640×360 @30fps, 150 frames (5 s) except `big` (1280×720, 300 frames);
-40-vCPU Xeon 6248 (KVM guest); ffmpeg 8.0.1 running its single-command
-in-memory two-pass `split[a][b];[a]palettegen[p];[b][p]paletteuse`. Best
-of 2 runs. PSNR/SSIM measured on the decoded GIF against the decoded
-source at the source frame rate.
+40-vCPU Xeon 6248 (KVM guest); ffmpeg 8.0.1-3ubuntu2 running its
+single-command in-memory two-pass
+`split[a][b];[a]palettegen[p];[b][p]paletteuse`. Best of 3 runs
+(`RUNS=3 bench/run.sh`). PSNR/SSIM measured on the decoded GIF against the
+decoded source at the source frame rate.
 
 | clip      | encoder | time (s) | peak RSS (MB) | size (KB) | PSNR (dB) | SSIM  |
 |-----------|---------|---------:|--------------:|----------:|----------:|------:|
-| rgba¹     | ffmpeg  | 1.62     | 216           | 2296      | 40.07     | 0.9847|
-| rgba¹     | weft    | **0.13** | 189           | **2002**  | **40.89** | **0.9865**|
-| testsrc   | ffmpeg  | 1.54     | 208           | 2296      | 40.07     | 0.985 |
-| testsrc   | weft    | **0.11** | 119           | **2015**  | **40.41**²| 0.900²|
-| big (720p)| ffmpeg  | 9.93     | 1165          | 13751     | 42.16     | 0.993 |
-| big (720p)| weft    | **0.53** | 535           | **12341** | 42.10²    | 0.901²|
-| mandel    | ffmpeg  | 6.46     | 273           | 16762     | 31.40     | 0.886 |
-| mandel    | weft    | **0.20** | 173           | **16130** | **32.20** | 0.873 |
-| gradients | ffmpeg  | 1.15     | 198           | 2340      | 67.1³     | 0.9998|
-| gradients | weft    | **0.11** | 125           | **2290**  | 49.2²³    | 0.9993|
-| life      | ffmpeg  | 1.11     | 198           | 2947      | 75.4³     | 0.9997|
-| life      | weft    | **0.09** | 106           | **2844**  | 54.2²³    | 0.993 |
-| static    | ffmpeg  | 1.15     | 198           | 15        | inf³      | 1.000 |
-| static    | weft    | **0.08** | 106           | **11**    | 49.7²³    | 0.976 |
+| rgba¹     | ffmpeg  | 1.55     | 214           | 2296      | 40.07     | 0.9847|
+| rgba¹     | weft    | **0.12** | 155           | **2024**  | **42.27** | **0.9880**|
+| testsrc   | ffmpeg  | 1.54     | 207           | 2296      | 40.07     | 0.9847|
+| testsrc   | weft    | **0.11** | 83            | **2047**  | **41.64**²| 0.902²|
+| big (720p)| ffmpeg  | 10.02    | 1166          | 13751     | 42.16     | 0.9925|
+| big (720p)| weft    | **0.56** | 491           | **12588** | **43.31**²| 0.902²|
+| mandel    | ffmpeg  | 6.48     | 273           | 16762     | 31.40     | 0.8858|
+| mandel    | weft    | **0.19** | 113           | **16055** | **32.99** | 0.8843|
+| gradients | ffmpeg  | 1.13     | 198           | 2340      | 67.13³    | 0.9998|
+| gradients | weft    | **0.11** | 91            | **2286**  | 49.17²³   | 0.9993|
+| life      | ffmpeg  | 1.08     | 198           | 2947      | 75.41³    | 0.9997|
+| life      | weft    | **0.08** | 73            | **2844**  | 54.21²³   | 0.9927|
+| static    | ffmpeg  | 1.11     | 198           | 15        | inf³      | 1.000 |
+| static    | weft    | **0.08** | 72            | **11**    | 49.74²³   | 0.9762|
 
-**10–32× faster, smaller output on every clip, 1.1–2.2× less memory.**
+**10–34× faster, smaller output on every clip, 1.4–2.8× less memory.**
 
 Each encoder runs its default dither: sierra2 error diffusion for
 ffmpeg's paletteuse, `auto` for weft (blue noise where the picture bands,
@@ -114,7 +117,7 @@ plain nearest colour elsewhere; see below).
 
 ¹ `rgba` is the apples-to-apples row: identical input bytes for both
 encoders, no YUV→RGB conversion anywhere. weft measures *higher* PSNR
-and SSIM than ffmpeg on identical input, with a 13% smaller file.
+and SSIM than ffmpeg on identical input, with a 12% smaller file.
 
 ² The y4m rows undercount weft's quality: the PSNR/SSIM reference is
 decoded with swscale, which *truncates* in YUV→RGB where weft rounds to
@@ -136,18 +139,18 @@ timed as the sum of both stages:
 
 | clip      | pipeline          | time (s) | size (KB) | PSNR (dB) | SSIM  |
 |-----------|-------------------|---------:|----------:|----------:|------:|
-| testsrc   | ffmpeg + gifsicle | 7.68     | 2188      | 39.75     | 0.965 |
-| testsrc   | weft --lossy 30   | **0.13** | **1924**  | **40.16**²| 0.893²|
-| big (720p)| ffmpeg + gifsicle | 61.1     | 13493     | 42.16     | 0.992 |
-| big (720p)| weft --lossy 30   | **0.73** | **11334** | 41.74²    | 0.899²|
-| mandel    | ffmpeg + gifsicle | 31.5     | 16341     | 31.39     | 0.886 |
-| mandel    | weft --lossy 30   | **0.28** | **12714** | 31.34     | 0.821 |
-| gradients | ffmpeg + gifsicle | 3.89     | 1594      | 61.6³     | 0.9994|
-| gradients | weft --lossy 30   | **0.15** | **1222**  | 48.8²³    | 0.9983|
+| testsrc   | ffmpeg + gifsicle | 7.63     | 2188      | 39.75     | 0.965 |
+| testsrc   | weft --lossy 30   | **0.13** | **1869**  | **40.72**²| 0.881²|
+| big (720p)| ffmpeg + gifsicle | 60.4     | 13493     | 42.16     | 0.992 |
+| big (720p)| weft --lossy 30   | **0.71** | **11009** | **42.42**²| 0.898²|
+| mandel    | ffmpeg + gifsicle | 30.9     | 16341     | 31.39     | 0.886 |
+| mandel    | weft --lossy 30   | **0.26** | **12546** | **32.01** | 0.834 |
+| gradients | ffmpeg + gifsicle | 3.84     | 1594      | 61.64³    | 0.9994|
+| gradients | weft --lossy 30   | **0.12** | **770**   | 47.93²³   | 0.9964|
 
-**26–113× faster than the two-tool pipeline, 12–23% smaller on every
-clip**, and quality within the reference-decoder gap above (the weft
-rows inherit footnote ²).
+**32–119× faster than the two-tool pipeline, 15–52% smaller on every
+clip**, and higher PSNR on three of the four (the fourth is the
+few-colour case of footnote ³; the weft rows also inherit footnote ²).
 
 Reproduce with:
 
@@ -235,22 +238,33 @@ dramatically better. Measured at `--lossy 30` (same clips as above):
 
 | clip      | lossless | --lossy 30 | Δ size | Δ PSNR | gifsicle --lossy=30¹ |
 |-----------|---------:|-----------:|-------:|-------:|---------------------:|
-| gradients | 4906 KB  | **1287 KB**| −74%   | −1.8 dB| 1335 KB              |
-| mandel    | 16130 KB | **12710 KB**| −21%  | −0.9 dB| 11667 KB             |
-| testsrc   | 2170 KB  | **1992 KB**| −8%    | −0.7 dB| 1858 KB              |
-| big (720p)| 13117 KB | **11602 KB**| −12%  | −0.6 dB| 11424 KB             |
+| gradients | 2286 KB  | **770 KB** | −66%   | −1.2 dB| 1648 KB              |
+| mandel    | 16055 KB | **12546 KB**| −22%  | −1.0 dB| 15743 KB             |
+| testsrc   | 2047 KB  | **1869 KB**| −9%    | −0.9 dB| 1931 KB              |
+| big (720p)| 12588 KB | **11009 KB**| −13%  | −0.9 dB| 12428 KB             |
 
-¹ gifsicle 1.94 `-O3 --lossy=30` applied to weft's lossless output.
+weft's own lossy pass now beats post-processing its lossless output with
+gifsicle on all four clips, which was not true when this table was first
+measured — gifsicle then won on everything but `gradients`.
 
-With `--dither none` or `auto`, the error cap is scaled per pixel: full
-where a pixel is dithered (`auto`'s live tiles) or the source is busy,
-falling to ~3% of it in perfectly smooth undithered regions. Lossy
+¹ gifsicle 1.96 `-O3 --lossy=30` applied to weft's lossless output.
+
+With `--dither none`, the error cap is scaled per pixel: full where the
+source is busy, falling to ~3% of it in perfectly smooth regions. Lossy
 substitution there is what produces the plateaus and hatching that make
 undithered gradients look posterized — the encoder's error feedback
 toggles between two indices to hold the average, and with no dither
-texture to hide in the toggling shows — while the small residual budget
+texture to hide in, the toggling shows — while the small residual budget
 still allows the invisible swaps between adjacent entries of a smooth
-ramp. `bluenoise` keeps the flat cap (dither absorbs the substitutions).
+ramp.
+
+`bluenoise` and `auto` keep the flat cap. For `bluenoise` the dither
+absorbs the substitutions. For `auto` the reason is less obvious and was
+found the hard way: `auto` leaves a region undithered precisely where its
+gate found no contour, so scaling the cap down in those regions strips out
+the LZW noise that had been masking the contours the gate *missed* — and
+it does miss them, at OkLab ΔE below the 0.012 floor it treats as visible.
+Keeping the flat cap under `auto` measured both smaller and flatter.
 
 Two structural pieces land alongside it (and improve lossless output too):
 each delta frame is encoded both transparency-punched and plain-opaque and
@@ -263,7 +277,7 @@ holds up (gifsicle's EWMA heuristic) instead of resetting at 4096 codes.
 ## Palette
 
 The global palette is a variance median cut in OkLab over the clip's
-exact colour histogram, followed by three Lloyd (k-means) passes: each
+colour histogram, followed by three Lloyd (k-means) passes: each
 colour moves to the count-weighted mean of the colours that actually map
 to it. Median cut places colours at box means, but once the neighbouring
 boxes exist a colour's nearest set is not its box; the passes correct
@@ -272,6 +286,14 @@ that, and on the measured clips are worth +0.4-0.8 dB mean PSNR (up to
 gradients, which median cut alone under-serves. Clusters dominated by a
 single colour snap to it exactly, so flat fills and sources with few
 colours stay lossless.
+
+The histogram is exact up to 131k distinct colours and folds to a
+6-bit/channel grid above that, which bounds median cut's input on sources
+with millions of distinct colours. Real footage crosses that line more
+often than it looks like it should: three of the four cartoon clips in
+our production corpus fold, because they arrive as decoded video and
+carry the codec's noise, not as clean cel art. Synthetic and few-colour
+sources stay exact.
 
 ## Prefilters: `--hold` and `--smooth`
 
@@ -283,9 +305,13 @@ encoder. Two optional prefilters, both running as pipeline stages between
 the reader and the histogram pass, address this at the source:
 
 - `--hold N` keeps a pixel at its held value while the input stays within
-  N of a per-pixel running mean (and within 1.5N of the held value, which
-  bounds the lag on slow drifts). Static regions become byte-identical
-  across frames and drop out of the delta entirely.
+  the hold window of a per-pixel running mean (and within 1.5x that of the
+  held value, which bounds the lag on slow drifts). The window is not N
+  itself: it adapts per frame to the measured frame-to-frame noise — 2.5x
+  its median change, floor 4 — and N is the cap, so a clean source settles
+  around 4-5 whatever cap you set and only a grainy one uses the whole
+  budget. Static regions become byte-identical across frames and drop out
+  of the delta entirely.
 - `--smooth N` replaces each pixel with the mean of the 5x5 neighbours
   within N of it, so grain averages out inside fills while nothing across
   an edge is touched. With the grain gone, far fewer pixels escape the
@@ -304,18 +330,26 @@ without.
 
 ## Design
 
-Every heavy stage is embarrassingly parallel across frames (rayon):
+Every heavy stage is parallel under rayon — across frames, and for the
+histogram across row strips within a frame as well:
 
 1. **Read + histogram, overlapped.** A reader thread streams frames into a
-   bounded channel while workers accumulate per-thread exact-color
-   histograms (open-addressed hash keyed by 24-bit color, run-length
-   batched). Palette statistics cost ~nothing beyond input I/O. RGBA rows
-   are hashed in place, straight out of the frame; only y4m pays a
-   conversion into a scratch row. This pass also records, per frame,
-   whether any pixel is transparent — the pipeline needs that before
-   quantization to pick a disposal mode, and it doubles as the test for
-   packing an all-opaque frame down to 3 bytes/pixel for the rest of the
-   run.
+   bounded channel while workers RLE-scan them into packed runs and route
+   those runs into 256 buckets by red byte; a second pass then accumulates
+   one bucket per task into an open-addressed table keyed by 24-bit color.
+   Bucketing rather than giving each worker its own table is what keeps the
+   merge free — bucket order *is* sorted order, so there is no duplicate
+   per-worker state to dedup afterwards. Above 131k distinct colors the
+   histogram folds to a 6-bit/channel grid, which is the common path on
+   real footage; below 255 the palette is exact and the whole search is
+   skipped. Scanning is split across 32-row strips as well as across
+   frames, because a batch is only as deep as the reader has queued and
+   that measured 12-15 frames against 40 workers. RGBA rows are hashed in
+   place, straight out of the frame; only y4m pays a conversion into a
+   scratch row. This pass also records, per frame, whether any pixel is
+   transparent — the pipeline needs that before quantization to pick a
+   disposal mode, and it doubles as the test for packing an all-opaque
+   frame down to 3 bytes/pixel for the rest of the run.
 2. **Palette: variance median cut in OkLab**, mirroring ffmpeg ≥5.x
    palettegen: the box with the largest single-channel squared error (in
    Lab) splits at its count-weighted median along that channel; each box
@@ -325,10 +359,16 @@ Every heavy stage is embarrassingly parallel across frames (rayon):
 3. **Exact nearest-color lookup** via per-cell candidate lists over a
    6-bit/channel RGB grid (locally sorted search): a triangle-inequality
    bound makes the argmin over the cell's candidates the true OkLab
-   nearest for every color in the cell. Most cells hold one candidate, so
-   the hot path is a single table load; multi-candidate lookups memoize in
-   a per-thread direct-mapped cache. The build's 262k-cell × 256-color
-   distance sweep runs on fearless_simd's portable f32 lanes.
+   nearest for every color in the cell. Single-candidate cells answer from
+   one table load, but on real footage 90-98% of *pixels* land in
+   multi-candidate cells, so the hot path is really a probe of a
+   per-thread direct-mapped memo cache, with the grid touched only on a
+   miss. That cache is sized by dividing a fixed budget across the
+   workers rather than fixing a per-worker size: what decides whether a
+   probe is cheap is the sum of the workers' tables against the L3 they
+   share, and past that point a cache *hit* costs a DRAM round trip. The
+   build's 262k-cell × 256-color distance sweep runs on fearless_simd's
+   portable f32 lanes.
 
 Two hot paths are vectorized with fearless_simd behind runtime dispatch
 (SSE4.2/AVX2/AVX-512/NEON picked per machine, so the baseline-CPU static
@@ -359,7 +399,10 @@ hotspot).
    its neighbor — no serial canvas walk. LZW uses a generation-stamped
    open-addressed table (no per-clear reset), a 64-bit bit accumulator,
    and gifsicle-style deferred dictionary clears; `--lossy` adds the
-   error-bounded match search described above.
+   error-bounded match search described above, which intersects a
+   symbol's substitution candidates with the trie node's children as a
+   bitmask before walking the list — most nodes share no candidate with
+   their children at all, and almost all of the rest share exactly one.
 6. **Mux.** Single sequential write of pre-encoded chunks.
 
 Correctness is pinned by unit tests (LZW roundtrip incl. forced clears,
