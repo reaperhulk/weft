@@ -329,6 +329,11 @@ fn run(args: &Args) -> io::Result<()> {
     let batch_cap = 2 * nthreads;
     let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(batch_cap);
     const BUCKETS: usize = 256;
+    /// Rows per strip when a frame's scan is split across threads. 32 rows
+    /// of 480 px is ~60 KiB of source and ~40 KiB of runs -- big enough
+    /// that the per-strip Vec and merge are noise, small enough that a
+    /// 12-frame batch still yields ~140 tasks.
+    const STRIP_ROWS: usize = 32;
     // Bucket state: one exact table per red-byte bucket, until the tables
     // together exceed FOLD_MAX distinct colors. Past that the palette
     // input is getting grid-folded regardless (see maybe_fold), so the
@@ -363,6 +368,12 @@ fn run(args: &Args) -> io::Result<()> {
         alpha: bool,
         runs: Vec<palette::PackedRun>, // this frame's runs, bucket-sorted
         offs: Vec<u32>,                // BUCKETS + 1 bucket boundaries into runs
+    }
+    /// One row strip's scan output, before the per-frame merge.
+    struct StripOut {
+        runs: Vec<palette::PackedRun>,
+        counts: [u32; BUCKETS],
+        alpha: bool,
     }
     let mut coarse = false;
     // Per-frame run buffers are recycled between batches: a fresh ~MB
@@ -671,53 +682,92 @@ fn run(args: &Args) -> io::Result<()> {
                 }
                 continue;
             }
-            // phase A: frames -> bucket-sorted runs, all threads
-            let routed: Vec<Routed> = batch
+            // phase A: frames -> bucket-sorted runs, all threads.
+            //
+            // A batch is only as deep as the reader/hold chain has queued
+            // -- measured at 12-15 frames against a cap of 80 -- so
+            // parallelising over frames alone leaves most of a 40-thread
+            // machine idle. Split each frame into row strips too, and run
+            // every (frame, strip) pair from a single flat parallel region:
+            // nesting one par_iter inside another instead would re-run the
+            // per-thread init for every frame and make each frame's inner
+            // collect a barrier. The scan is per-row and the strips are
+            // concatenated in order, so the runs -- and the palette -- are
+            // exactly what the sequential row order produced.
+            let nstrips = h.div_ceil(STRIP_ROWS);
+            let frames_in: Vec<&Frame> = batch.iter().map(|(_, f)| f).collect();
+            let strip_out: Vec<StripOut> = (0..frames_in.len() * nstrips)
                 .into_par_iter()
                 .map_init(
-                    || (vec![0u8; w * 4], vec![0u32; w], Vec::new()),
-                    |(row, keys, all), (i, f)| {
-                        all.clear();
+                    || (vec![0u8; w * 4], vec![0u32; w]),
+                    |(row, keys), t| {
+                        let (fi, si) = (t / nstrips, t % nstrips);
+                        let y0 = si * STRIP_ROWS;
+                        let y1 = ((si + 1) * STRIP_ROWS).min(h);
+                        // one run per pixel is the worst case, so this
+                        // capacity is never exceeded and never regrown
+                        let mut runs = Vec::with_capacity((y1 - y0) * w);
                         let mut counts = [0u32; BUCKETS];
                         let mut alpha = false;
-                        {
-                            let src = color::RowSource::new(&f, w, h, meta_ref.chroma);
-                            if src.has_direct_rgb_keys() {
-                                for y in 0..h {
-                                    src.fill_rgb_keys(y, keys);
-                                    palette::scan_rgb_key_runs_counted(keys, all, &mut counts);
-                                }
-                            } else {
-                                for y in 0..h {
-                                    alpha |= palette::scan_rgba_runs_counted(
-                                        rgba_row(&src, y, row),
-                                        all,
-                                        &mut counts,
-                                    );
-                                }
+                        let src = color::RowSource::new(frames_in[fi], w, h, meta_ref.chroma);
+                        if src.has_direct_rgb_keys() {
+                            for y in y0..y1 {
+                                src.fill_rgb_keys(y, keys);
+                                palette::scan_rgb_key_runs_counted(keys, &mut runs, &mut counts);
+                            }
+                        } else {
+                            for y in y0..y1 {
+                                alpha |= palette::scan_rgba_runs_counted(
+                                    rgba_row(&src, y, row),
+                                    &mut runs,
+                                    &mut counts,
+                                );
                             }
                         }
-                        let mut runs = run_pool.lock().unwrap().pop().unwrap_or_default();
-                        let offs = palette::bucket_runs(all, &counts, &mut runs);
-                        // The scan just told us whether this frame uses any
-                        // transparency; when it doesn't, the alpha plane is
-                        // a constant and the frame can be packed to RGB for
-                        // the rest of its (clip-long) life. The RGBA buffer
-                        // is freed immediately, so the extra resident bytes
-                        // are one frame per busy worker, not one per clip.
-                        let frame = match f {
-                            Frame::Rgba(rgba) if !alpha => Frame::Rgb(color::rgba_to_rgb(&rgba)),
-                            other => other,
-                        };
-                        Routed {
-                            idx: i,
-                            frame,
-                            alpha,
+                        StripOut {
                             runs,
-                            offs,
+                            counts,
+                            alpha,
                         }
                     },
                 )
+                .collect();
+            drop(frames_in);
+            let routed: Vec<Routed> = batch
+                .into_par_iter()
+                .enumerate()
+                .map(|(fi, (i, f))| {
+                    let strips = &strip_out[fi * nstrips..(fi + 1) * nstrips];
+                    let mut counts = [0u32; BUCKETS];
+                    let mut alpha = false;
+                    for st in strips {
+                        for (t, v) in counts.iter_mut().zip(st.counts.iter()) {
+                            *t += v;
+                        }
+                        alpha |= st.alpha;
+                    }
+                    let chunks: Vec<&[palette::PackedRun]> =
+                        strips.iter().map(|st| st.runs.as_slice()).collect();
+                    let mut runs = run_pool.lock().unwrap().pop().unwrap_or_default();
+                    let offs = palette::bucket_runs_chunks(&chunks, &counts, &mut runs);
+                    // The scan just told us whether this frame uses any
+                    // transparency; when it doesn't, the alpha plane is
+                    // a constant and the frame can be packed to RGB for
+                    // the rest of its (clip-long) life. The RGBA buffer
+                    // is freed immediately, so the extra resident bytes
+                    // are one frame per busy worker, not one per clip.
+                    let frame = match f {
+                        Frame::Rgba(rgba) if !alpha => Frame::Rgb(color::rgba_to_rgb(&rgba)),
+                        other => other,
+                    };
+                    Routed {
+                        idx: i,
+                        frame,
+                        alpha,
+                        runs,
+                        offs,
+                    }
+                })
                 .collect();
             // phase B: one task per bucket, all of the batch's runs for it
             if coarse && bins.is_empty() {

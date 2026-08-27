@@ -317,8 +317,24 @@ pub fn scan_rgba_runs_counted(
 /// Scatter a frame's packed runs by red byte into `sorted` (reused;
 /// overwritten) given their per-bucket counts. Returns the 257 bucket
 /// boundaries.
+/// Single-slice `bucket_runs_chunks`. The encoder always has strips, so
+/// this is the tests' convenience wrapper.
+#[cfg(test)]
 pub fn bucket_runs(
     runs: &[PackedRun],
+    counts: &[u32; 256],
+    sorted: &mut Vec<PackedRun>,
+) -> Vec<u32> {
+    bucket_runs_chunks(std::slice::from_ref(&runs), counts, sorted)
+}
+
+/// `bucket_runs` over runs that arrive as consecutive chunks (the row
+/// strips a frame's scan is split across). Scattering the chunks in order
+/// is exactly scattering their concatenation, so this saves materializing
+/// that concatenation without changing the result: within a bucket, runs
+/// keep the row order they were scanned in.
+pub fn bucket_runs_chunks(
+    chunks: &[&[PackedRun]],
     counts: &[u32; 256],
     sorted: &mut Vec<PackedRun>,
 ) -> Vec<u32> {
@@ -328,11 +344,13 @@ pub fn bucket_runs(
     }
     let mut pos = offs.clone();
     sorted.clear();
-    sorted.resize(runs.len(), 0);
-    for &e in runs {
-        let b = (e >> 24) as usize;
-        sorted[pos[b] as usize] = e;
-        pos[b] += 1;
+    sorted.resize(chunks.iter().map(|c| c.len()).sum(), 0);
+    for chunk in chunks {
+        for &e in chunk.iter() {
+            let b = (e >> 24) as usize;
+            sorted[pos[b] as usize] = e;
+            pos[b] += 1;
+        }
     }
     offs
 }
