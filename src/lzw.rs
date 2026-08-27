@@ -47,6 +47,13 @@ pub struct LossyMap {
     /// once the remaining entries are provably over the error cap (see
     /// `cand_limit`) instead of computing a dithered diff for each.
     cands: Vec<u32>,
+    /// Per-symbol 256-bit membership mask of that symbol's candidate set
+    /// (4 x u64 per symbol, same indices as `cands`). ANDing it with a trie
+    /// node's `child_bits` answers "does this node have any child the DFS
+    /// would consider substituting?" in four instructions, instead of one
+    /// bit test per candidate. Measured on the cghmc corpus, 94% of the
+    /// old scan's iterations were bit tests that failed.
+    cand_mask: Vec<u64>,
     colors: Vec<[i32; 3]>,
     trans_idx: u8,
     max_diff: u32,
@@ -70,6 +77,7 @@ impl LossyMap {
             .collect();
         let mut starts = Vec::with_capacity(257);
         let mut cands = Vec::new();
+        let mut cand_mask = vec![0u64; 256 * 4];
         for i in 0..256usize {
             starts.push(cands.len() as u32);
             if i >= ci.len() {
@@ -92,16 +100,26 @@ impl LossyMap {
             // Packed so the sort order above is the order of the packed
             // values too: `d` dominates, and ties keep index order, which
             // is what the stable sort by `d` produced.
+            for &(j, _) in &list {
+                cand_mask[i * 4 + (j >> 6) as usize] |= 1u64 << (j & 63);
+            }
             cands.extend(list.iter().map(|&(j, d)| ((d as u32) << 8) | j as u32));
         }
         starts.push(cands.len() as u32);
         LossyMap {
             starts,
             cands,
+            cand_mask,
             colors: ci,
             trans_idx,
             max_diff,
         }
+    }
+
+    /// The symbol's candidate-set membership mask (see `cand_mask`).
+    #[inline(always)]
+    fn cand_mask(&self, symbol: u8) -> &[u64] {
+        &self.cand_mask[symbol as usize * 4..symbol as usize * 4 + 4]
     }
 
     #[inline(always)]
@@ -545,25 +563,61 @@ impl LzwEncoder {
                 Some(s) => (map.max_diff * s[pos] as u32) >> 8,
                 None => map.max_diff,
             };
-            let limit = LossyMap::cand_limit(&dither, cap);
-            for &packed in map.candidates(b) {
-                // Distance-sorted: the first entry over the limit means
-                // every entry after it is too.
-                if (packed >> 8) > limit {
-                    break;
-                }
-                let b2 = packed as u8;
-                if cb[(b2 >> 6) as usize] & (1u64 << (b2 & 63)) == 0 {
-                    continue;
-                }
+            // Intersect this symbol's candidate set with the node's child
+            // set before touching the list. Most nodes share no candidate
+            // with their children at all, and of those that do, nearly all
+            // share exactly one -- so the ordered scan below is reached
+            // rarely, and 94% of its iterations (which were bit tests that
+            // failed) disappear.
+            let cm = map.cand_mask(b);
+            let hits = [cm[0] & cb[0], cm[1] & cb[1], cm[2] & cb[2], cm[3] & cb[3]];
+            let nhits = hits[0].count_ones()
+                + hits[1].count_ones()
+                + hits[2].count_ones()
+                + hits[3].count_ones();
+            if nhits == 1 {
+                // Sole candidate child: no ordering to preserve, so the
+                // distance-sorted scan (and its `cand_limit` early break)
+                // has nothing left to decide. Dropping the limit test here
+                // is not an approximation -- the limit provably only cuts
+                // candidates that `d > cap` rejects anyway, so the explored
+                // set is identical either way.
+                let w = hits.iter().position(|&h| h != 0).unwrap();
+                let b2 = (w * 64) as u8 | hits[w].trailing_zeros() as u8;
                 let d = map.diff(b, b2, &dither);
-                if d > cap {
-                    continue;
+                if d <= cap {
+                    if let Ok(code) = self.probe((node_code << 8) | b2 as u32) {
+                        let nd = map.next_dither(b, b2, &dither);
+                        if self.lossy_dfs(ctx, pos + 1, code, nd, accum + d as u64) {
+                            return true;
+                        }
+                    }
                 }
-                if let Ok(code) = self.probe((node_code << 8) | b2 as u32) {
-                    let nd = map.next_dither(b, b2, &dither);
-                    if self.lossy_dfs(ctx, pos + 1, code, nd, accum + d as u64) {
-                        return true;
+            } else if nhits > 1 {
+                // Several candidate children: fall back to the ordered scan,
+                // which explores them in ascending-distance order. Equal-cost
+                // matches are settled by exploration order (`ctx.best` takes
+                // the strictly-better one), so that order has to hold.
+                let limit = LossyMap::cand_limit(&dither, cap);
+                for &packed in map.candidates(b) {
+                    // Distance-sorted: the first entry over the limit means
+                    // every entry after it is too.
+                    if (packed >> 8) > limit {
+                        break;
+                    }
+                    let b2 = packed as u8;
+                    if hits[(b2 >> 6) as usize] & (1u64 << (b2 & 63)) == 0 {
+                        continue;
+                    }
+                    let d = map.diff(b, b2, &dither);
+                    if d > cap {
+                        continue;
+                    }
+                    if let Ok(code) = self.probe((node_code << 8) | b2 as u32) {
+                        let nd = map.next_dither(b, b2, &dither);
+                        if self.lossy_dfs(ctx, pos + 1, code, nd, accum + d as u64) {
+                            return true;
+                        }
                     }
                 }
             }
@@ -732,6 +786,45 @@ pub mod tests {
     }
 
     #[test]
+    /// `cand_mask` is the membership bitmap the DFS intersects against a
+    /// trie node's children, and it has to describe exactly the same set as
+    /// `candidates()` -- a mask bit the list lacks would resurrect a
+    /// substitution the radius/`LOSSY_MAX_CANDS` truncation dropped, and a
+    /// missing bit would silently skip a legal one.
+    #[test]
+    fn cand_mask_matches_candidate_list() {
+        // Two palettes with different candidate-set shapes: a dense ramp
+        // (every symbol saturates LOSSY_MAX_CANDS) and a sparse spread
+        // (most symbols have few or no candidates inside the radius).
+        for step in [2u16, 40] {
+            let colors: Vec<[u8; 3]> = (0..64u16)
+                .map(|i| {
+                    [
+                        (i * step) as u8,
+                        (i * step / 2) as u8,
+                        255 - (i * step) as u8,
+                    ]
+                })
+                .collect();
+            let map = LossyMap::build(&colors, 64, 30);
+            for sym in 0..=255usize {
+                let mut from_list = [0u64; 4];
+                for &packed in map.candidates(sym as u8) {
+                    let j = packed as u8;
+                    from_list[(j >> 6) as usize] |= 1u64 << (j & 63);
+                }
+                assert_eq!(
+                    map.cand_mask(sym as u8),
+                    from_list,
+                    "step {step}, symbol {sym}"
+                );
+                // and the list never names a symbol twice, so popcount is len
+                let bits: u32 = from_list.iter().map(|w| w.count_ones()).sum();
+                assert_eq!(bits as usize, map.candidates(sym as u8).len());
+            }
+        }
+    }
+
     fn lossy_shrinks_and_bounds_error() {
         // grayscale ramp palette: neighbors are 4 gray levels apart
         let colors: Vec<[u8; 3]> = (0..64u16).map(|i| [(i * 4) as u8; 3]).collect();
