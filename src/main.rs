@@ -330,7 +330,7 @@ fn run(args: &Args) -> io::Result<()> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(batch_cap);
     const BUCKETS: usize = 256;
     // Bucket state: one exact table per red-byte bucket, until the tables
-    // together exceed GRID_SIZE distinct colors. Past that the palette
+    // together exceed FOLD_MAX distinct colors. Past that the palette
     // input is getting grid-folded regardless (see maybe_fold), so the
     // tables fold into 6-bit bins — one bin array per red slab (r >> 2,
     // four adjacent buckets; the 64 slabs together are exactly the 8 MB
@@ -667,7 +667,7 @@ fn run(args: &Args) -> io::Result<()> {
                 }
                 if !coarse {
                     let distinct: usize = hists.iter().map(|h| h.len()).sum();
-                    coarse = distinct > palette::GRID_SIZE;
+                    coarse = distinct > palette::FOLD_MAX;
                 }
                 continue;
             }
@@ -739,7 +739,7 @@ fn run(args: &Args) -> io::Result<()> {
                     }
                 });
                 let distinct: usize = hists.iter().map(|h| h.len()).sum();
-                coarse = distinct > palette::GRID_SIZE;
+                coarse = distinct > palette::FOLD_MAX;
             }
             let mut pool = run_pool.lock().unwrap();
             for r in routed {
