@@ -1,6 +1,6 @@
 [package]
 name = "weft"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Fast parallel GIF encoder: raw RGBA or yuv4mpegpipe on stdin, GIF on stdout"
 license = "Apache-2.0"
