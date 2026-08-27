@@ -907,8 +907,8 @@ fn run(args: &Args) -> io::Result<()> {
     let mut t_lzw = std::time::Duration::ZERO;
     // `for_each_init`/`map_init` state lives for only one parallel
     // operation. Since the block loop launches two new operations per
-    // block, using them here would repeatedly allocate and zero the 1 MiB
-    // nearest-color cache and recreate the encoder buffers. Keep one state
+    // block, using them here would repeatedly allocate and zero the
+    // nearest-color memo cache and recreate the encoder buffers. Keep one state
     // bundle per Rayon worker for the whole clip instead. Initialize each
     // half lazily on the worker that first uses it: eagerly constructing
     // nthreads caches here serializes tens of MiB of first-touch writes on
@@ -964,7 +964,7 @@ fn run(args: &Args) -> io::Result<()> {
                     let wi = rayon::current_thread_index().unwrap_or(nthreads);
                     let mut scratch = worker_ctx[wi]
                         .quant
-                        .get_or_init(|| Mutex::new(dither::QuantScratch::new(w)))
+                        .get_or_init(|| Mutex::new(dither::QuantScratch::new(w, nthreads)))
                         .lock()
                         .unwrap();
                     let src = color::RowSource::new(&f, w, h, meta.chroma);
