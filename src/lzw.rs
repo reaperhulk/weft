@@ -785,7 +785,6 @@ pub mod tests {
         }
     }
 
-    #[test]
     /// `cand_mask` is the membership bitmap the DFS intersects against a
     /// trie node's children, and it has to describe exactly the same set as
     /// `candidates()` -- a mask bit the list lacks would resurrect a
@@ -825,6 +824,7 @@ pub mod tests {
         }
     }
 
+    #[test]
     fn lossy_shrinks_and_bounds_error() {
         // grayscale ramp palette: neighbors are 4 gray levels apart
         let colors: Vec<[u8; 3]> = (0..64u16).map(|i| [(i * 4) as u8; 3]).collect();
