@@ -1,0 +1,8 @@
+# x86_64 builds target x86-64-v3 (AVX2, FMA, BMI1/2, MOVBE: Intel Haswell
+# 2013 and AMD Excavator/Zen onward). The SIMD kernels dispatch at runtime
+# regardless; this lifts the scalar code around them and measures ~1.5%
+# faster end to end on 480x360 RGBA at 40 threads. Override for an older
+# machine with RUSTFLAGS="-C target-cpu=x86-64", which wins over this file.
+# aarch64 is left at its baseline (NEON is already part of it).
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v3"]

@@ -25,9 +25,17 @@ built by CI for every push, in two flavors:
 
 If unsure, take the musl binary; it runs everywhere the gnu one does.
 
+The x86_64 binaries require an x86-64-v3 CPU or better (AVX2, FMA, BMI2:
+Intel Haswell from 2013, AMD Zen from 2017, or later). On an older
+machine they die with an illegal-instruction error at startup; build from
+source with `RUSTFLAGS="-C target-cpu=x86-64"` instead. The aarch64
+binaries run on any 64-bit ARM.
+
 From source: `cargo build --release` (or
 `cargo build --release --target x86_64-unknown-linux-musl` for the static
-build; needs `musl-tools`).
+build; needs `musl-tools`). `.cargo/config.toml` sets `target-cpu` to
+x86-64-v3 for x86_64 targets; a `RUSTFLAGS` in the environment overrides
+it.
 
 ## Usage
 
@@ -371,8 +379,8 @@ histogram across row strips within a frame as well:
    portable f32 lanes.
 
 Two hot paths are vectorized with fearless_simd behind runtime dispatch
-(SSE4.2/AVX2/AVX-512/NEON picked per machine, so the baseline-CPU static
-binaries lose nothing), both verified byte-identical to the scalar paths:
+(SSE4.2/AVX2/AVX-512/NEON picked per machine, independent of the build's
+`target-cpu`), both verified byte-identical to the scalar paths:
 the YUV→RGBA row conversion (16 px/iteration through widen/zip, feeding
 both the histogram and quantize passes) and the nearest-map distance
 sweep. 720p end-to-end: 2.48 s → 2.13 s. Bulk histogram run extension
