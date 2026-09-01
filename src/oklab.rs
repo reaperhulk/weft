@@ -43,26 +43,39 @@ impl LabConverter {
     /// `srgb_to_oklab` with the fast cube root — for per-pixel hot paths.
     #[inline(always)]
     pub fn srgb_to_oklab_fast(&self, r: u8, g: u8, b: u8) -> [f32; 3] {
-        self.srgb_to_oklab_with(r, g, b, cbrt_fast)
+        let [l, m, s] = self.lms(r, g, b);
+        let [l_, m_, s_] = cbrt3_fast(l, m, s);
+        lab_from_cbrt_lms(l_, m_, s_)
     }
 
     #[inline(always)]
     fn srgb_to_oklab_with(&self, r: u8, g: u8, b: u8, cbrt: impl Fn(f32) -> f32) -> [f32; 3] {
+        let [l, m, s] = self.lms(r, g, b);
+        lab_from_cbrt_lms(cbrt(l), cbrt(m), cbrt(s))
+    }
+
+    /// Linear-light LMS cone response for an sRGB colour.
+    #[inline(always)]
+    fn lms(&self, r: u8, g: u8, b: u8) -> [f32; 3] {
         let lr = self.lut[r as usize];
         let lg = self.lut[g as usize];
         let lb = self.lut[b as usize];
-        let l = 0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb;
-        let m = 0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb;
-        let s = 0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb;
-        let l_ = cbrt(l);
-        let m_ = cbrt(m);
-        let s_ = cbrt(s);
         [
-            0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
-            1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
-            0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,
+            0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb,
+            0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb,
+            0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb,
         ]
     }
+}
+
+/// OkLab from the cube-rooted LMS response.
+#[inline(always)]
+fn lab_from_cbrt_lms(l_: f32, m_: f32, s_: f32) -> [f32; 3] {
+    [
+        0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+        1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+        0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,
+    ]
 }
 
 /// Fast cube root for non-negative finite f32: Kahan-style bit-trick seed
@@ -70,9 +83,14 @@ impl LabConverter {
 /// of ULPs of libm's cbrtf at a fraction of the cost. Used on hot paths
 /// where the OkLab *geometry* matters but correctly-rounded rounding does
 /// not (nearest-color argmins; candidate bounds carry an explicit margin).
+///
+/// On x86_64 the hot path uses the packed `cbrt3_fast`; this scalar form
+/// is its reference (the test proves them bit-identical) and the path
+/// other architectures take.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 #[inline(always)]
 pub fn cbrt_fast(x: f32) -> f32 {
-    let mut y = f32::from_bits(x.to_bits() / 3 + 709_921_077);
+    let mut y = f32::from_bits(cbrt_seed_bits(x));
     // Halley: y <- y * (y^3 + 2x) / (2y^3 + x); at x == 0 this decays y
     // toward zero, so no special case is needed.
     let y3 = y * y * y;
@@ -80,6 +98,56 @@ pub fn cbrt_fast(x: f32) -> f32 {
     let y3 = y * y * y;
     y *= (y3 + 2.0 * x) / (2.0 * y3 + x);
     y
+}
+
+#[inline(always)]
+fn cbrt_seed_bits(x: f32) -> u32 {
+    x.to_bits() / 3 + 709_921_077
+}
+
+/// Three `cbrt_fast`s in one 4-lane vector, bit-identical to calling
+/// `cbrt_fast` per channel (same operations in the same order, IEEE
+/// per lane, no contraction).
+///
+/// Written out explicitly rather than left to the compiler for a
+/// reason: built with AVX enabled (`-C target-cpu=x86-64-v3`), LLVM's
+/// SLP vectoriser packs the three scalar chains into one 128-bit vector
+/// itself -- but pads the fourth lane with whatever it has, which is a
+/// zero from the LMS matrix. The seed for x = 0 cubes to a subnormal,
+/// and every subnormal operand costs a ~150-cycle microcode assist on
+/// Intel cores, on every call: `resolve_off` went from 6% to 24% of all
+/// cycles and the "v3 build is 25% slower" that Cargo.toml used to warn
+/// about was entirely this. The pad lane here is 1.0, whose seed is
+/// normal, so the packed form is safe under any target features.
+#[inline(always)]
+pub fn cbrt3_fast(l: f32, m: f32, s: f32) -> [f32; 3] {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2 is part of the x86_64 baseline, so these intrinsics
+    // are always available; the loads and stores are on local arrays.
+    unsafe {
+        use std::arch::x86_64::*;
+        let x = _mm_set_ps(1.0, s, m, l);
+        let mut y = _mm_castsi128_ps(_mm_set_epi32(
+            cbrt_seed_bits(1.0) as i32,
+            cbrt_seed_bits(s) as i32,
+            cbrt_seed_bits(m) as i32,
+            cbrt_seed_bits(l) as i32,
+        ));
+        let x2 = _mm_add_ps(x, x);
+        for _ in 0..2 {
+            let y3 = _mm_mul_ps(_mm_mul_ps(y, y), y);
+            let num = _mm_add_ps(y3, x2);
+            let den = _mm_add_ps(_mm_add_ps(y3, y3), x);
+            y = _mm_mul_ps(y, _mm_div_ps(num, den));
+        }
+        let mut out = [0f32; 4];
+        _mm_storeu_ps(out.as_mut_ptr(), y);
+        [out[0], out[1], out[2]]
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        [cbrt_fast(l), cbrt_fast(m), cbrt_fast(s)]
+    }
 }
 
 pub fn oklab_to_srgb(lab: [f32; 3]) -> [u8; 3] {
@@ -128,6 +196,24 @@ mod tests {
                     "{c:?} -> {back:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn cbrt3_fast_matches_scalar_on_every_colour() {
+        // Every sRGB colour, so the packed path is proven bit-identical
+        // on the exact inputs the nearest-colour scan feeds it.
+        let cv = LabConverter::new();
+        let step = if cfg!(debug_assertions) { 7 } else { 1 };
+        for c in (0..1u32 << 24).step_by(step) {
+            let (r, g, b) = ((c >> 16) as u8, (c >> 8) as u8, c as u8);
+            let want = cv.srgb_to_oklab_with(r, g, b, cbrt_fast);
+            let got = cv.srgb_to_oklab_fast(r, g, b);
+            assert_eq!(
+                want.map(f32::to_bits),
+                got.map(f32::to_bits),
+                "({r},{g},{b}): {want:?} vs {got:?}"
+            );
         }
     }
 

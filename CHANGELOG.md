@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- **x86_64 binaries now require an x86-64-v3 CPU** (AVX2/FMA/BMI2: Intel
+  Haswell 2013+, AMD Zen 2017+). `.cargo/config.toml` sets the target
+  level; older machines can build with `RUSTFLAGS="-C target-cpu=x86-64"`.
+- The fast OkLab cube roots in the nearest-colour scan are computed as
+  one explicit 4-lane vector with a safe padding lane. Left to the
+  compiler, an AVX build packed them with a zero pad lane that went
+  subnormal on every call, which is why `target-cpu=x86-64-v3` used to
+  measure up to 1.6x slower on the quantize phase. Output is
+  byte-identical; -3% to -4% end to end on 480x360 RGBA at 8 and 40
+  threads together with the v3 build.
+
 ## 0.4.1
 
 Performance and documentation. **Output is byte-identical to 0.4.0**,
