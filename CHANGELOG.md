@@ -1,17 +1,30 @@
 # Changelog
 
-## Unreleased
+## 0.4.2
+
+Performance and one build-requirement change. **Output is byte-identical
+to 0.4.1**, verified on four 480×360 RGBA clips at every thread count
+measured. No flag or default changed.
 
 - **x86_64 binaries now require an x86-64-v3 CPU** (AVX2/FMA/BMI2: Intel
-  Haswell 2013+, AMD Zen 2017+). `.cargo/config.toml` sets the target
-  level; older machines can build with `RUSTFLAGS="-C target-cpu=x86-64"`.
+  Haswell 2013+, AMD Zen 2017+); older machines fail at startup with an
+  illegal-instruction error. `.cargo/config.toml` sets the target level
+  for x86_64 builds, and `RUSTFLAGS="-C target-cpu=x86-64"` overrides it
+  for a baseline build. aarch64 is unchanged.
 - The fast OkLab cube roots in the nearest-colour scan are computed as
   one explicit 4-lane vector with a safe padding lane. Left to the
   compiler, an AVX build packed them with a zero pad lane that went
-  subnormal on every call, which is why `target-cpu=x86-64-v3` used to
-  measure up to 1.6x slower on the quantize phase. Output is
-  byte-identical; -3% to -4% end to end on 480x360 RGBA at 8 and 40
-  threads together with the v3 build.
+  subnormal on every call, and each subnormal operand is a ~150-cycle
+  microcode assist — which is why `target-cpu=x86-64-v3` used to measure
+  up to 1.6× slower on the quantize phase. With the pad lane fixed the
+  v3 build wins: −3% to −4% end to end on 480×360 RGBA at 8 and 40
+  threads (the explicit vector alone is −2% to −3% on a baseline build).
+  A test proves the packed and scalar paths bit-identical over every one
+  of the 2²⁴ sRGB colours.
+
+Measured and rejected on the same workload (see the Cargo.toml notes):
+`x86-64-v4` and `native` builds are 2–4% slower than v3 on Cascade Lake,
+and mimalloc on the glibc build is 40% slower at 40 threads.
 
 ## 0.4.1
 
