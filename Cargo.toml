@@ -21,13 +21,18 @@ mimalloc = { version = "0.1", default-features = false }
 excessive_precision = "allow"
 
 [profile.release]
-# Leave target-cpu alone: the SIMD kernels are runtime-dispatched
-# (fearless_simd), and building with -C target-cpu=x86-64-v3 or =native
-# measured ~2.7x SLOWER end to end (quantize+lzw 0.49s -> 1.81s on the
-# gradients bench clip) — global target features defeat the dispatched
-# kernels' specialization. PGO was also measured: neutral, since fat LTO
-# + codegen-units=1 already settle layout. The default baseline build is
-# the fast configuration.
+# target-cpu is left at the baseline so the release binaries run
+# anywhere; the SIMD kernels are runtime-dispatched (fearless_simd) and
+# pick AVX2/NEON on their own. Building with -C target-cpu=x86-64-v3
+# used to measure far SLOWER (quantize+lzw up to 1.6x): with AVX enabled
+# LLVM packed the three cube roots in `oklab::srgb_to_oklab_fast` into
+# one vector whose padding lane went subnormal on every call, and each
+# subnormal operand is a ~150-cycle microcode assist. `cbrt3_fast` now
+# writes that vector out explicitly with a safe pad lane, so a v3 build
+# is safe and measures ~1-2% faster than baseline on 480x360 RGBA at
+# 40 threads — worthwhile only for a binary built for a known machine.
+# PGO was also measured: neutral, since fat LTO + codegen-units=1
+# already settle layout.
 opt-level = 3
 lto = "fat"
 codegen-units = 1
