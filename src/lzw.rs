@@ -182,8 +182,8 @@ impl LossyMap {
 
 /// The parts of a lossy DFS that never change during one search. Passing
 /// them as one reference instead of six arguments keeps the recursion's
-/// stack frame small: the search recurses once per matched pixel, so what
-/// each level spills is paid on every visited node.
+/// stack frame small: branching nodes recurse to preserve search order,
+/// while exact-only chains advance in a loop.
 struct DfsCtx<'a> {
     gen: u16,
     data: &'a [u8],
@@ -517,118 +517,201 @@ impl LzwEncoder {
     fn lossy_dfs(
         &self,
         ctx: &mut DfsCtx,
-        pos: usize,
-        node_code: u32,
-        dither: [i32; 3],
+        mut pos: usize,
+        mut node_code: u32,
+        mut dither: [i32; 3],
         accum: u64,
     ) -> bool {
-        let data = ctx.data;
-        // Longest match wins; equal length prefers lower total error.
-        if pos > ctx.best.end || (pos == ctx.best.end && accum < ctx.best.diff) {
-            ctx.best = LossyBest {
-                code: node_code,
-                end: pos,
-                diff: accum,
-            };
-            if pos >= data.len() && accum == 0 {
-                return true;
-            }
-        }
-        if pos >= data.len() || ctx.visits == 0 {
-            return false;
-        }
-        ctx.visits -= 1;
-        // Leaf cut and bitmap gate: skipping a symbol the node has no
-        // child for is exactly what a missed hash probe would do, minus
-        // the probe (and, for candidates, minus the diff computation).
-        let p = node_code as usize;
-        if self.child_gen[p] != ctx.gen {
-            return false;
-        }
-        let cb = &self.child_bits[p * 4..p * 4 + 4];
-        let b = data[pos];
-        // Exact continuation: zero cost, dither decays.
-        if cb[(b >> 6) as usize] & (1u64 << (b & 63)) != 0 {
-            if let Ok(code) = self.probe((node_code << 8) | b as u32) {
-                let nd = ctx.map.next_dither(b, b, &dither);
-                if self.lossy_dfs(ctx, pos + 1, code, nd, accum) {
+        loop {
+            let data = ctx.data;
+            // Longest match wins; equal length prefers lower total error.
+            if pos > ctx.best.end || (pos == ctx.best.end && accum < ctx.best.diff) {
+                ctx.best = LossyBest {
+                    code: node_code,
+                    end: pos,
+                    diff: accum,
+                };
+                if pos >= data.len() && accum == 0 {
                     return true;
                 }
             }
-        }
-        let map = ctx.map;
-        if b != map.trans_idx {
-            // per-pixel cap: the frame's loss scale, if any, applies here
-            let cap = match ctx.scale {
-                Some(s) => (map.max_diff * s[pos] as u32) >> 8,
-                None => map.max_diff,
+            if pos >= data.len() || ctx.visits == 0 {
+                return false;
+            }
+            ctx.visits -= 1;
+            // Leaf cut and bitmap gate: skipping a symbol the node has no
+            // child for is exactly what a missed hash probe would do, minus
+            // the probe (and, for candidates, minus the diff computation).
+            let p = node_code as usize;
+            if self.child_gen[p] != ctx.gen {
+                return false;
+            }
+            let cb = &self.child_bits[p * 4..p * 4 + 4];
+            let b = data[pos];
+            let map = ctx.map;
+            // Intersect candidates with existing children before probing.
+            // Most nodes have no alternative child, or only one.
+            let hits = if b != map.trans_idx {
+                let cm = map.cand_mask(b);
+                [cm[0] & cb[0], cm[1] & cb[1], cm[2] & cb[2], cm[3] & cb[3]]
+            } else {
+                [0; 4]
             };
-            // Intersect this symbol's candidate set with the node's child
-            // set before touching the list. Most nodes share no candidate
-            // with their children at all, and of those that do, nearly all
-            // share exactly one -- so the ordered scan below is reached
-            // rarely, and 94% of its iterations (which were bit tests that
-            // failed) disappear.
-            let cm = map.cand_mask(b);
-            let hits = [cm[0] & cb[0], cm[1] & cb[1], cm[2] & cb[2], cm[3] & cb[3]];
-            let nhits = hits[0].count_ones()
-                + hits[1].count_ones()
-                + hits[2].count_ones()
-                + hits[3].count_ones();
-            if nhits == 1 {
-                // Sole candidate child: no ordering to preserve, so the
-                // distance-sorted scan (and its `cand_limit` early break)
-                // has nothing left to decide. Dropping the limit test here
-                // is not an approximation -- the limit provably only cuts
-                // candidates that `d > cap` rejects anyway, so the explored
-                // set is identical either way.
-                let w = hits.iter().position(|&h| h != 0).unwrap();
-                let b2 = (w * 64) as u8 | hits[w].trailing_zeros() as u8;
-                let d = map.diff(b, b2, &dither);
-                if d <= cap {
-                    if let Ok(code) = self.probe((node_code << 8) | b2 as u32) {
-                        let nd = map.next_dither(b, b2, &dither);
-                        if self.lossy_dfs(ctx, pos + 1, code, nd, accum + d as u64) {
-                            return true;
-                        }
+            // Exact continuation: zero cost, dither decays.
+            if cb[(b >> 6) as usize] & (1u64 << (b & 63)) != 0 {
+                if let Ok(code) = self.probe((node_code << 8) | b as u32) {
+                    let nd = map.next_dither(b, b, &dither);
+                    if hits == [0; 4] {
+                        // No alternatives remain after the exact branch, so
+                        // continue without a recursive call. The loop still
+                        // updates the best match and visit budget at each node.
+                        pos += 1;
+                        node_code = code;
+                        dither = nd;
+                        continue;
+                    }
+                    if self.lossy_dfs(ctx, pos + 1, code, nd, accum) {
+                        return true;
                     }
                 }
-            } else if nhits > 1 {
-                // Several candidate children: fall back to the ordered scan,
-                // which explores them in ascending-distance order. Equal-cost
-                // matches are settled by exploration order (`ctx.best` takes
-                // the strictly-better one), so that order has to hold.
-                let limit = LossyMap::cand_limit(&dither, cap);
-                for &packed in map.candidates(b) {
-                    // Distance-sorted: the first entry over the limit means
-                    // every entry after it is too.
-                    if (packed >> 8) > limit {
-                        break;
-                    }
-                    let b2 = packed as u8;
-                    if hits[(b2 >> 6) as usize] & (1u64 << (b2 & 63)) == 0 {
-                        continue;
-                    }
+            }
+            if hits != [0; 4] {
+                // per-pixel cap: the frame's loss scale, if any, applies here
+                let cap = match ctx.scale {
+                    Some(s) => (map.max_diff * s[pos] as u32) >> 8,
+                    None => map.max_diff,
+                };
+                let nhits = hits[0].count_ones()
+                    + hits[1].count_ones()
+                    + hits[2].count_ones()
+                    + hits[3].count_ones();
+                if nhits == 1 {
+                    // Sole candidate child: no ordering to preserve, so the
+                    // distance-sorted scan (and its `cand_limit` early break)
+                    // has nothing left to decide. Dropping the limit test here
+                    // is not an approximation -- the limit provably only cuts
+                    // candidates that `d > cap` rejects anyway, so the explored
+                    // set is identical either way.
+                    let w = hits.iter().position(|&h| h != 0).unwrap();
+                    let b2 = (w * 64) as u8 | hits[w].trailing_zeros() as u8;
                     let d = map.diff(b, b2, &dither);
-                    if d > cap {
-                        continue;
+                    if d <= cap {
+                        if let Ok(code) = self.probe((node_code << 8) | b2 as u32) {
+                            let nd = map.next_dither(b, b2, &dither);
+                            if self.lossy_dfs(ctx, pos + 1, code, nd, accum + d as u64) {
+                                return true;
+                            }
+                        }
                     }
-                    if let Ok(code) = self.probe((node_code << 8) | b2 as u32) {
-                        let nd = map.next_dither(b, b2, &dither);
-                        if self.lossy_dfs(ctx, pos + 1, code, nd, accum + d as u64) {
-                            return true;
+                } else if nhits > 1 {
+                    // Several candidate children: fall back to the ordered scan,
+                    // which explores them in ascending-distance order. Equal-cost
+                    // matches are settled by exploration order (`ctx.best` takes
+                    // the strictly-better one), so that order has to hold.
+                    let limit = LossyMap::cand_limit(&dither, cap);
+                    for &packed in map.candidates(b) {
+                        // Distance-sorted: the first entry over the limit means
+                        // every entry after it is too.
+                        if (packed >> 8) > limit {
+                            break;
+                        }
+                        let b2 = packed as u8;
+                        if hits[(b2 >> 6) as usize] & (1u64 << (b2 & 63)) == 0 {
+                            continue;
+                        }
+                        let d = map.diff(b, b2, &dither);
+                        if d > cap {
+                            continue;
+                        }
+                        if let Ok(code) = self.probe((node_code << 8) | b2 as u32) {
+                            let nd = map.next_dither(b, b2, &dither);
+                            if self.lossy_dfs(ctx, pos + 1, code, nd, accum + d as u64) {
+                                return true;
+                            }
                         }
                     }
                 }
             }
+            return false;
         }
-        false
     }
 }
 
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    #[test]
+    fn exact_chains_preserve_lossy_search_order_and_budget() {
+        let map = LossyMap::build(&[[100, 100, 100], [101, 100, 100], [240, 240, 240]], 3, 1);
+        let mut enc = LzwEncoder::default();
+        enc.ensure_lossy_scratch();
+        enc.bump_gen();
+        // Two exact-only links lead to a fork: the exact branch ends at
+        // code 8, while substituting symbol 1 reaches the longer code 10.
+        for (parent, symbol, code) in [
+            (0u32, 0u32, 6u32),
+            (6, 0, 7),
+            (7, 0, 8),
+            (7, 1, 9),
+            (9, 0, 10),
+        ] {
+            let key = (parent << 8) | symbol;
+            let slot = enc.probe(key).unwrap_err();
+            enc.table[slot] = (key << 12) | code;
+            let p = parent as usize;
+            enc.child_gen[p] = enc.gen;
+            enc.child_bits[p * 4 + (symbol >> 6) as usize] |= 1u64 << (symbol & 63);
+        }
+        let data = [0u8; 5];
+        for (budget, code, end, diff, remaining) in [
+            (0, 0, 1, 0, 0),
+            (1, 6, 2, 0, 0),
+            (2, 7, 3, 0, 0),
+            (3, 8, 4, 0, 0),
+            (4, 8, 4, 0, 0),
+            (5, 10, 5, 1, 0),
+            (6, 10, 5, 1, 1),
+        ] {
+            let mut ctx = DfsCtx {
+                gen: enc.gen,
+                data: &data,
+                map: &map,
+                scale: None,
+                visits: budget,
+                best: LossyBest {
+                    code: 0,
+                    end: 1,
+                    diff: 0,
+                },
+            };
+            assert!(!enc.lossy_dfs(&mut ctx, 1, 0, [0; 3], 0));
+            assert_eq!(
+                (ctx.best.code, ctx.best.end, ctx.best.diff, ctx.visits),
+                (code, end, diff, remaining),
+                "budget={budget}"
+            );
+        }
+        // A zero-error exact match reaching EOF must stop the whole
+        // search before the alternative branch consumes any visits.
+        let mut ctx = DfsCtx {
+            gen: enc.gen,
+            data: &data[..4],
+            map: &map,
+            scale: None,
+            visits: 16,
+            best: LossyBest {
+                code: 0,
+                end: 1,
+                diff: 0,
+            },
+        };
+        assert!(enc.lossy_dfs(&mut ctx, 1, 0, [0; 3], 0));
+        assert_eq!(
+            (ctx.best.code, ctx.best.end, ctx.best.diff, ctx.visits),
+            (8, 4, 0, 13)
+        );
+    }
 
     /// Reference GIF-LZW decoder used by tests (and the integration test's
     /// full GIF decoder).

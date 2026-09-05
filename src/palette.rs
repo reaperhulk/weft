@@ -1029,8 +1029,7 @@ pub fn refine_lloyd(colors: &mut [[u8; 3]], entries: &[(u32, u32)], iters: usize
                 let mut dom = vec![(0u32, 0u32); n];
                 let mut dists = vec![0f32; padded];
                 for (&(c, k), &lab) in chunk.iter().zip(lchunk) {
-                    let min = crate::simdops::cell_distances(level, &soa, lab, &mut dists);
-                    let i = dists[..n].iter().position(|&d| d == min).unwrap_or(0);
+                    let i = crate::simdops::nearest_color(level, &soa, lab, &mut dists, n);
                     for ch in 0..3 {
                         sum[i][ch] += lab[ch] as f64 * k as f64;
                     }
@@ -1197,11 +1196,11 @@ impl NearestMap {
                         let bound = dmin2.sqrt() + 2.0 * rmax + 1e-6;
                         let bound2 = bound * bound;
                         let off = arena.len();
-                        for (i, &d) in dists[..pal_lab.len()].iter().enumerate() {
-                            if d <= bound2 {
-                                arena.push(i as u8);
-                            }
-                        }
+                        crate::simdops::cell_candidates(
+                            &dists[..pal_lab.len()],
+                            bound2,
+                            &mut arena,
+                        );
                         refs.push(CellRef {
                             off: off as u32,
                             len: (arena.len() - off) as u16,

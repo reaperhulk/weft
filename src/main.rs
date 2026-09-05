@@ -395,8 +395,9 @@ fn run(args: &Args) -> io::Result<()> {
         // reader thread. Smoothing is frame-independent and runs on a small
         // pool (whole frames per task: the per-row rayon form measured 5x
         // slower under contention with the histogram workers); the hold
-        // carries state from frame to frame, so one thread applies it in
-        // sequence order, reordering the pool's output as needed. Every
+        // carries state from frame to frame, so a coordinator applies it
+        // in sequence order, using a small separate pool for disjoint
+        // pixel ranges within each frame. Every
         // stage hands frames on through bounded channels; the main thread
         // sorts by index afterwards, so only the hold's order matters.
         let staged = smooth > 0 || hold > 0;
@@ -542,6 +543,23 @@ fn run(args: &Args) -> io::Result<()> {
                 // the cap from --hold N; the per-frame window adapts to the
                 // measured noise below it (see hold::adaptive_threshold)
                 let cap = hold;
+                let hold_workers = if hold > 0 && w * h >= 65536 {
+                    (nthreads / 4).clamp(1, 4)
+                } else {
+                    1
+                };
+                let hold_pool = (hold_workers > 1).then(|| {
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(hold_workers)
+                        .build()
+                        .expect("hold pool")
+                });
+                // Align each piece to the histogram's 64-pixel sampling
+                // period so splitting does not change the noise estimate.
+                let sample_period = 16 * simdops::HOLD_HIST_STRIDE;
+                let hold_chunk =
+                    (w * h).div_ceil(hold_workers).div_ceil(sample_period) * sample_period * 4;
+                let mut hold_hists = vec![[0u32; 256]; hold_workers];
                 let mut held_prev: Vec<u8> = Vec::new();
                 let mut held_mean: Vec<i16> = Vec::new();
                 // raw previous frame for the noise estimate (the held
@@ -582,16 +600,44 @@ fn run(args: &Args) -> io::Result<()> {
                                 let t = input::hold::adaptive_threshold(&hist, cap);
                                 t_sum += t as u64;
                                 hist.fill(0);
-                                simdops::hold_rgba_mean(
-                                    level,
-                                    buf,
-                                    &mut held_prev,
-                                    &mut held_mean,
-                                    &mut raw_prev,
-                                    &mut hist,
-                                    t,
-                                    input::hold::max_deviation(t),
-                                );
+                                if let Some(pool) = &hold_pool {
+                                    pool.install(|| {
+                                        buf.par_chunks_mut(hold_chunk)
+                                            .zip(held_prev.par_chunks_mut(hold_chunk))
+                                            .zip(held_mean.par_chunks_mut(hold_chunk))
+                                            .zip(raw_prev.par_chunks_mut(hold_chunk))
+                                            .zip(hold_hists.par_iter_mut())
+                                            .for_each(|((((cur, prev), mean), raw), hist)| {
+                                                hist.fill(0);
+                                                simdops::hold_rgba_mean(
+                                                    level,
+                                                    cur,
+                                                    prev,
+                                                    mean,
+                                                    raw,
+                                                    hist,
+                                                    t,
+                                                    input::hold::max_deviation(t),
+                                                );
+                                            });
+                                    });
+                                    for h in &hold_hists {
+                                        for (sum, &count) in hist.iter_mut().zip(h) {
+                                            *sum += count;
+                                        }
+                                    }
+                                } else {
+                                    simdops::hold_rgba_mean(
+                                        level,
+                                        buf,
+                                        &mut held_prev,
+                                        &mut held_mean,
+                                        &mut raw_prev,
+                                        &mut hist,
+                                        t,
+                                        input::hold::max_deviation(t),
+                                    );
+                                }
                             }
                             t_hold += ts.elapsed();
                         }
@@ -926,7 +972,11 @@ fn run(args: &Args) -> io::Result<()> {
     // Enough frames per block that both halves keep every worker busy;
     // small enough that the block's index buffers stay a modest, clip-
     // length-independent working set.
-    let block = 4 * nthreads;
+    // Small pools get up to sixteen frames per worker, capped at 160,
+    // so common 96/156-frame clips avoid a small, underutilized tail block.
+    // At twenty or more workers, retain eight frames per worker. Storage
+    // remains bounded independently of clip length.
+    let block = (8 * nthreads).max((16 * nthreads).min(160));
     let mut encoded: Vec<gif::EncodedFrame> = Vec::with_capacity(nread);
     let mut prev_last: Option<Vec<u8>> = None;
     let mut frames_it = frames.into_iter();

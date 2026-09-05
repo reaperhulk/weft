@@ -1,5 +1,6 @@
-//! SIMD kernels (fearless_simd): runtime-dispatched, so the shipped
-//! baseline-CPU binaries still use AVX2/NEON where the machine has it.
+//! Runtime-dispatched SIMD kernels: fearless_simd provides AVX2/NEON and
+//! newer AVX-512 backends; x86 palette kernels also support the AVX-512F
+//! subset on Skylake and Cascade Lake.
 
 #[allow(unused_imports)]
 use fearless_simd::prelude::*;
@@ -8,6 +9,9 @@ use fearless_simd::{
     u8x64, Level, Simd,
 };
 use std::sync::OnceLock;
+
+#[cfg(target_arch = "x86_64")]
+mod x86;
 
 /// Runtime-detected SIMD level, cached (feature detection once).
 pub fn level() -> Level {
@@ -816,7 +820,46 @@ impl PalSoa {
 /// color i and return the minimum. `dists` must be at least the padded
 /// palette length.
 pub fn cell_distances(level: Level, pal: &PalSoa, q: [f32; 3], dists: &mut [f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if pal.l.len() >= x86::MIN_PALETTE_LEN && x86::has_avx512() {
+        // SAFETY: The kernel's target features were detected.
+        return unsafe { x86::cell_distances(pal, q, dists) };
+    }
     fearless_simd::dispatch!(level, simd => cell_distances_impl(simd, pal, q, dists))
+}
+
+/// Append palette indices within the candidate bound, in palette order.
+pub fn cell_candidates(dists: &[f32], bound2: f32, arena: &mut Vec<u8>) {
+    #[cfg(target_arch = "x86_64")]
+    if dists.len() >= x86::MIN_PALETTE_LEN && x86::has_avx512() {
+        // SAFETY: The kernel's target features were detected.
+        unsafe { x86::cell_candidates(dists, bound2, arena) };
+        return;
+    }
+    for (i, &d) in dists.iter().enumerate() {
+        if d <= bound2 {
+            arena.push(i as u8);
+        }
+    }
+}
+
+/// Nearest palette color, breaking equal-distance ties by palette index.
+/// Generic backends reuse `dists` as scratch; AVX-512 keeps the argmin in
+/// registers and avoids storing and rescanning the distance buffer.
+pub fn nearest_color(
+    level: Level,
+    pal: &PalSoa,
+    q: [f32; 3],
+    dists: &mut [f32],
+    n: usize,
+) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if pal.l.len() >= x86::MIN_PALETTE_LEN && x86::has_avx512() {
+        // SAFETY: The kernel's target features were detected.
+        return unsafe { x86::nearest_color(pal, q) };
+    }
+    let min = cell_distances(level, pal, q, dists);
+    dists[..n].iter().position(|&d| d == min).unwrap_or(0)
 }
 
 #[inline(always)]
