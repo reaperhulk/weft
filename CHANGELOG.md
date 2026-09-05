@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.4.3
+
+Performance improvements for production encoding, including smaller worker
+pools. **Output remains byte-identical on the benchmark and regression
+corpora** across the optimisation stages. No CLI flag, default, palette
+quality, or compression threshold changed. (#49)
+
+- Temporal hold processes disjoint pixel ranges on a separate pool of up
+  to four workers, preserving frame order and the adaptive noise threshold.
+  Small images and fewer than eight configured workers retain serial hold.
+- Auto dithering skips a redundant pass on opaque rows with no active
+  dither tiles when no activity scale is needed.
+- Palette construction uses runtime-dispatched AVX-512F kernels for
+  distances, nearest-colour selection, and candidate filtering on supported
+  x86_64 CPUs. Short palettes retain the existing paths; the x86-64-v3
+  build requirement and AVX2/NEON fallbacks are unchanged.
+- Lossy LZW follows exact-only trie continuations in a loop, reducing
+  recursive calls while preserving candidate order, visit budgets, error
+  bounds, and match selection.
+- Larger quantize/encode batches reduce underutilised tail batches on
+  short clips. Batch size increases from four frames per worker to
+  `max(8 * workers, min(16 * workers, 160))` frames. Buffer storage remains
+  bounded independently of clip length, but larger batches and the
+  additional hold workers can increase peak memory.
+
+The recorded 14-clip RGBA benchmarks use `--lossy 30 --dither auto --hold 12`.
+The first optimisation stage improved geometric-mean throughput by 14.0%
+on a Xeon E5-2696 v4 at 22 workers. On Cascade Lake, the work through the
+AVX-512 stage measured 5.7% over 0.4.2 at 40 workers; the subsequent LZW and
+small-pool batching changes added 7.0%, 2.9%, and 1.3% at 10, 20, and 40
+workers respectively, relative to the AVX-512 stage. These are separate
+comparisons on specific hosts and corpora, not a universal speedup. See
+[the benchmark log](bench/hill-climb.md) for per-clip results, memory
+measurements, and validation.
+
+Regression coverage now includes production flags at 10, 20, and 40
+workers, duplicate frames spanning batch boundaries, skipped dither rows,
+AVX-512 equivalence, and exact-only LZW traversal.
+
 ## 0.4.2
 
 Performance and one build-requirement change. **Output is byte-identical
