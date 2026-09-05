@@ -504,7 +504,23 @@ impl<'a> Quantizer<'a> {
         // ---- pass B: staged pipeline, attenuation masked per tile --------
         let mut has_alpha = false;
         let opaque = src.is_intrinsically_opaque();
+        let mut skipped_row = false;
         for y in 0..h {
+            let tlive = &scratch.tile_live[(y / T) * tx..(y / T + 1) * tx];
+            // An opaque row with no live tiles already has its final
+            // indices. No activity, colour expansion, or threshold work
+            // is needed unless the caller requested an activity scale.
+            if opaque && scale.is_none() && tlive.iter().all(|&v| v == 0) {
+                out[y * w..(y + 1) * w].copy_from_slice(&scratch.idx_frame[y * w..(y + 1) * w]);
+                skipped_row = true;
+                continue;
+            }
+            // A skipped tile row did not populate the activity reference.
+            // Refill it before dithering resumes.
+            if gate_on && skipped_row {
+                src.fill_row(y - 1, &mut scratch.row2);
+            }
+            skipped_row = false;
             // Keys are not needed in pass B (c1 is stored). Opaque RGB and
             // YUV sources can therefore skip key generation and alpha
             // detection while the activity pass reads their RGBA row.
@@ -532,7 +548,6 @@ impl<'a> Quantizer<'a> {
                 }
             };
             has_alpha |= has_alpha_row;
-            let tlive = &scratch.tile_live[(y / T) * tx..(y / T + 1) * tx];
             if let Some(scale) = scale.as_deref_mut() {
                 // lossy cap: full in dithered tiles, activity-scaled elsewhere
                 let srow = &mut scale[y * w..(y + 1) * w];
@@ -1005,6 +1020,66 @@ mod tests {
         let (rgb_alpha, rgb_out) = run(crate::input::Frame::Rgb(rgb));
         assert!(!rgba_alpha && !rgb_alpha);
         assert_eq!(rgb_out, rgba_out);
+    }
+
+    #[test]
+    fn auto_skipped_rows_preserve_activity_reference() {
+        let (w, h) = (77usize, 193usize);
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                // One live tile row between flat rows. Adjacent bands
+                // have long runs, and the last frame row is partial.
+                let v = if (64..96).contains(&y) {
+                    60 + (x / 10) as u8 * 17
+                } else if y < 64 {
+                    90
+                } else {
+                    // Pass A ends on a different value, so a stale row
+                    // buffer cannot stand in for the skipped reference.
+                    200
+                };
+                rgba.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let rgb: Vec<u8> = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| [p[0], p[1], p[2]])
+            .collect();
+        let colors: Vec<[u8; 3]> = (0..16u8)
+            .map(|i| {
+                let v = i * 17;
+                [v, v, v]
+            })
+            .collect();
+        let nm = NearestMap::build(&colors);
+        let mut band = BandGate::new(&nm);
+        // Make every distinct pair eligible so the fixture definitely
+        // transitions from skipped rows to a dithered row and back.
+        band.pairs.fill(1);
+        let q = Quantizer {
+            nearest: &nm,
+            trans_idx: colors.len() as u8,
+            exact_palette: false,
+            gate: 16,
+            band: Some(&band),
+        };
+        let run = |frame| {
+            let src = crate::color::RowSource::new(&frame, w, h, None);
+            let mut scratch = QuantScratch::new(w, 1);
+            let mut out = vec![0u8; w * h];
+            let alpha = q.quantize(&src, w, h, Dither::Auto, &mut scratch, &mut out, None);
+            (alpha, out)
+        };
+        let (rgba_alpha, rgba_out) = run(crate::input::Frame::Rgba(rgba));
+        let (rgb_alpha, rgb_out) = run(crate::input::Frame::Rgb(rgb));
+        assert!(!rgba_alpha && !rgb_alpha);
+        assert_eq!(rgb_out, rgba_out);
+        let live = band.live_tiles.load(std::sync::atomic::Ordering::Relaxed);
+        let total = band.total_tiles.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(live > 0 && live < total);
     }
 
     #[test]

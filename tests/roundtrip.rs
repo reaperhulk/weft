@@ -596,3 +596,45 @@ fn smooth_flattens_grain_and_keeps_edges() {
         );
     }
 }
+
+/// Exercise parallel hold chunks with a partial SIMD tail, changes near
+/// the hold threshold, and changing alpha. Chunking must preserve both
+/// the running mean and the next frame's adaptive noise histogram.
+#[test]
+fn production_flags_are_identical_across_hold_workers() {
+    let (w, h, n) = (257usize, 257usize, 9usize);
+    let mut raw = Vec::with_capacity(w * h * n * 4);
+    for frame in 0..n {
+        for p in 0..w * h {
+            let base = ((p / 113) % 24 * 8 + 16) as u8;
+            let jitter = ((p + frame * 3) % 5) as u8;
+            let moved = if frame > 4 && p % 97 < 3 { 30 } else { 0 };
+            let alpha = if frame == 3 && p % 71 == 0 { 0 } else { 255 };
+            raw.extend_from_slice(&[base + jitter + moved, base, base + jitter, alpha]);
+        }
+    }
+    let args = [
+        "--size",
+        "257x257",
+        "--fps",
+        "24",
+        "--lossy",
+        "30",
+        "--dither",
+        "auto",
+        "--hold",
+        "12",
+        "--threads",
+        "1",
+    ];
+    let expected = run_weft(&args, &raw);
+    for threads in ["8", "22"] {
+        let mut parallel = args;
+        parallel[11] = threads;
+        assert_eq!(run_weft(&parallel, &raw), expected, "threads={threads}");
+    }
+    let decoded = decode_gif(&expected);
+    assert_eq!(decoded.width, w);
+    assert_eq!(decoded.height, h);
+    assert!(!decoded.frames.is_empty());
+}
