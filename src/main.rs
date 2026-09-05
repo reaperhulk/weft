@@ -972,10 +972,11 @@ fn run(args: &Args) -> io::Result<()> {
     // Enough frames per block that both halves keep every worker busy;
     // small enough that the block's index buffers stay a modest, clip-
     // length-independent working set.
-    // Eight frames per worker usually fits a short production clip in
-    // one block. Four left a small tail block at common frame counts,
-    // paying another quantize/encode barrier with few workers busy.
-    let block = 8 * nthreads;
+    // Small pools get up to sixteen frames per worker, capped at 160,
+    // so common 96/156-frame clips avoid a small, underutilized tail block.
+    // At twenty or more workers, retain eight frames per worker. Storage
+    // remains bounded independently of clip length.
+    let block = (8 * nthreads).max((16 * nthreads).min(160));
     let mut encoded: Vec<gif::EncodedFrame> = Vec::with_capacity(nread);
     let mut prev_last: Option<Vec<u8>> = None;
     let mut frames_it = frames.into_iter();

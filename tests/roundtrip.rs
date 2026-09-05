@@ -628,7 +628,7 @@ fn production_flags_are_identical_across_hold_workers() {
         "1",
     ];
     let expected = run_weft(&args, &raw);
-    for threads in ["8", "22", "40"] {
+    for threads in ["8", "10", "20", "22", "40"] {
         let mut parallel = args;
         parallel[11] = threads;
         assert_eq!(run_weft(&parallel, &raw), expected, "threads={threads}");
@@ -637,4 +637,49 @@ fn production_flags_are_identical_across_hold_workers() {
     assert_eq!(decoded.width, w);
     assert_eq!(decoded.height, h);
     assert!(!decoded.frames.is_empty());
+}
+
+/// Quantize/encode blocks must carry the preceding frame's indices across
+/// their boundaries, including when duplicate frames straddle a boundary.
+#[test]
+fn production_flags_are_identical_across_block_boundaries() {
+    let (w, h, n) = (65usize, 33usize, 173usize);
+    let mut raw = Vec::with_capacity(w * h * n * 4);
+    for frame in 0..n {
+        for y in 0..h {
+            for x in 0..w {
+                let moved = (x + frame / 3) % w < 9;
+                let base = if moved { 180 } else { 40 };
+                raw.extend_from_slice(&[base + (y % 5) as u8, base, base, 255]);
+            }
+        }
+    }
+    let args = [
+        "--size",
+        "65x33",
+        "--fps",
+        "24",
+        "--lossy",
+        "30",
+        "--dither",
+        "auto",
+        "--hold",
+        "12",
+        "--threads",
+        "1",
+    ];
+    let expected = run_weft(&args, &raw);
+    for threads in ["10", "20", "40"] {
+        let mut parallel = args;
+        parallel[11] = threads;
+        assert_eq!(run_weft(&parallel, &raw), expected, "threads={threads}");
+    }
+    let decoded = decode_gif(&expected);
+    assert_eq!(decoded.width, w);
+    assert_eq!(decoded.height, h);
+    assert!(decoded.frames.len() > 1);
+    assert_eq!(
+        decoded.frames.iter().map(|(_, delay)| delay).sum::<u32>(),
+        ((n * 100 + 12) / 24) as u32
+    );
 }

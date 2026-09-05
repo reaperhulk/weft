@@ -1,3 +1,114 @@
+# Cascade Lake hill climb at 10 and 20 workers — 2026-09-05
+
+Baseline: `3d936621a8d2257881703539bb3a1d583133f261`, the pushed AVX-512 palette work documented below. This round adds to that work. The preceding main hill climb used 40 workers, with one- and eight-worker spot checks; this round explicitly tunes and measures 10 and 20 workers, with 40 as a regression comparison.
+
+Same host and toolchain: Intel Xeon Gold 6248 (Cascade Lake), 40 exposed CPUs under KVM, Rust 1.98.1 / LLVM 22.1.8. Both builds use the repository release profile and `x86-64-v3`; AVX-512 palette dispatch remains enabled. Flags are `--lossy 30 --dither auto --hold 12 --fps 24 --stats`, varying `--threads` among 10, 20, and 40.
+
+## Results
+
+The same 14 predecoded RGBA clips receive one warm-up per binary/worker count and **15 timed runs per combination: 1,260 observations**. Clip/worker/iteration groups are deterministically shuffled, and baseline/candidate order is shuffled within each group, keeping comparisons close in time. Each figure below is the median complete process wall time, including cached input reads, output writes, startup, and teardown. No builds or profiling run concurrently with timing. Every output SHA-256 matches across both binaries and all three worker counts.
+
+| Workers | Geometric mean wall time, before → after | Throughput gain | CPU-time reduction |
+|---|---:|---:|---:|
+| 10 | 145.7 → 136.2 ms | **7.0%** | 5.0% |
+| 20 | 114.5 → 111.3 ms | **2.9%** | 4.3% |
+| 40 | 109.9 → 108.5 ms | **1.3%** | 2.7% |
+
+CPU time is aggregate child-process user + system time from the same timing runs. Throughput gain is the geometric mean of the per-clip baseline/candidate median wall-time ratios. All gains above are relative to `3d93662`, not the branch's original baseline.
+
+| Clip | 10 workers, before → after ms | Gain | 20 workers, before → after ms | Gain | 40 workers, before → after ms | Gain |
+|---|---:|---:|---:|---:|---:|---:|
+| old | 209.6 → 191.9 | 9.2% | 149.7 → 146.5 | 2.2% | 139.6 → 136.5 | 2.3% |
+| cel | 202.1 → 183.9 | 9.9% | 152.9 → 146.1 | 4.6% | 137.0 → 135.9 | 0.8% |
+| modern | 134.8 → 127.3 | 5.8% | 111.7 → 109.5 | 2.0% | 110.0 → 108.0 | 1.9% |
+| modern2 | 135.9 → 127.9 | 6.2% | 108.0 → 106.8 | 1.2% | 103.8 → 107.1 | -3.0% |
+| grain | 172.1 → 159.5 | 7.9% | 131.1 → 126.7 | 3.5% | 122.2 → 121.6 | 0.5% |
+| wide | 221.5 → 206.1 | 7.5% | 168.3 → 165.7 | 1.6% | 156.8 → 156.7 | 0.1% |
+| caption | 113.9 → 105.6 | 7.8% | 93.4 → 91.1 | 2.5% | 92.5 → 92.8 | -0.3% |
+| old2 | 203.8 → 197.4 | 3.3% | 150.6 → 147.9 | 1.8% | 142.5 → 139.9 | 1.8% |
+| short | 96.9 → 93.0 | 4.3% | 76.4 → 77.2 | -1.1% | 79.9 → 77.6 | 3.0% |
+| long | 163.8 → 149.5 | 9.6% | 122.3 → 122.1 | 0.1% | 118.3 → 116.7 | 1.3% |
+| gradient | 85.4 → 78.2 | 9.2% | 79.5 → 71.4 | 11.5% | 80.2 → 77.5 | 3.5% |
+| motion | 92.1 → 85.8 | 7.3% | 77.6 → 72.7 | 6.7% | 75.9 → 73.8 | 2.9% |
+| live1 | 132.3 → 122.9 | 7.6% | 104.8 → 100.5 | 4.3% | 102.4 → 100.2 | 2.2% |
+| live2 | 171.8 → 166.7 | 3.1% | 129.1 → 128.8 | 0.3% | 115.5 → 113.3 | 2.0% |
+
+All 14 clips improve at 10 workers; 13 improve at 20. At 40, the aggregate gain is small and two clips regress, most noticeably `modern2` by 3.0%. A separate seven-run full-corpus screen of the combined changes measured 7.3%, 2.6%, and 1.3% gains at 10/20/40, respectively, consistent with the final aggregate results.
+
+On the final build, **20 workers take 2.6% longer than 40 but use 33.3% less CPU time**, geometrically averaged across this corpus. Ten workers take 25.5% longer than 40 but use 49.4% less CPU time. Thus 20 is a useful efficiency setting for these short clips; 40 still gives the lowest aggregate single-encode latency. The default worker count is unchanged. These are single-process measurements, not a benchmark of several simultaneous encodes. The configured worker count also does not include the separate hold pool of up to four workers.
+
+The host showed intermittent slowdowns. One early five-run candidate screen was heavily affected across both binaries and all measured phases and was discarded as a basis for selecting changes. The close-pair scheduling above was introduced before repeating that screen. The final run retains every observation, including 35 of 1,260 observations exceeding 1.5 times their binary/clip/worker median; reported results use medians without deleting outliers. Raw data remain available for inspection.
+
+## Retained changes and profiling
+
+- Turn exact-only LZW trie continuations into a loop. A node with no alternative candidate child has no work left after its exact branch returns, so it need not create another recursive frame. Branching nodes retain exact-first recursion followed by the original candidate order. Best-match selection, visit-budget accounting at every node, dither decay, transparency handling, error caps, and early termination at a zero-error EOF match remain unchanged.
+- Increase quantize/encode batches for pools below 20 workers: `max(8 * nthreads, min(16 * nthreads, 160))`. At 10 workers, the former 80-frame batch left a small tail on common 96-frame clips; the new 160-frame batch fits both 96- and 156-frame clips in one pass. At 20 and 40 workers, batch sizes remain 160 and 320. Buffer storage remains bounded independently of clip length.
+
+Hardware counters became available during this round (`perf_event_paranoid=1`). User-cycle profiles of eight repeated `old` encodes at each worker count attributed about 27.6%/25.4% of samples to `lossy_dfs` at 10/20 workers, 26.0%/23.5% to quantization, and 7.9%/9.2% to nearest-map resolution. Annotation showed substantial sampled cost around recursive call/return and register restoration in LZW, motivating the exact-only loop. The older CPU's rejected exact-continuation experiment was therefore revisited with measurements on this CPU and smaller pools.
+
+The final timing run's mean of per-clip median LZW phase times fell from **37.84 → 28.67 ms** at 10 workers, **22.50 → 19.83 ms** at 20, and **17.89 → 16.54 ms** at 40. At 10 workers this includes the batch change as well as the LZW loop.
+
+A separate five-run, paired and shuffled `perf stat` comparison on `old`, `wide`, `long`, and `live1` supports reduced execution cost:
+
+| Workers | User-cycle reduction | User-instruction reduction | User branch-miss reduction |
+|---|---:|---:|---:|
+| 10 | 3.8% | 2.4% | 24.1% |
+| 20 | 4.3% | 2.1% | 22.1% |
+| 40 | 5.0% | 2.0% | 21.7% |
+
+These are geometric means of per-clip median ratios. All counters report 100% running time, without multiplexing. Total user branches rise about 1.1–1.3%; mispredictions fall. Counter runs are separate from the wall-time results because instrumentation changes execution cost. Profiles and counter files are under ignored `gif_bench/results/`; `DEBUGINFOD_URLS=` prevents perf reporting from waiting on external debug-info downloads.
+
+## Memory tradeoff
+
+Five additional paired and shuffled runs per binary/clip/worker count use `/usr/bin/time`, with neither perf nor `--stats`. Median peak process RSS in MiB:
+
+| Clip | 10 workers, before → after | 20 workers, before → after | 40 workers, before → after |
+|---|---:|---:|---:|
+| old | 103.1 → 106.3 | 94.2 → 91.8 | 97.1 → 95.8 |
+| wide | 158.7 → 162.5 | 150.4 → 145.1 | 156.9 → 151.4 |
+| long | 102.3 → 101.8 | 106.7 → 100.1 | 107.7 → 102.8 |
+| live1 | 75.3 → 74.2 | 71.3 → 71.3 | 76.0 → 77.0 |
+
+At 10 workers, observed RSS changes range from -1.1 to +3.9 MiB on these samples. The increased index-buffer bound is 80 additional frames, or 9.9 MiB at 480×270 when a clip fills the new batch; `--dither none` with lossy encoding can require the same additional space for scale maps. Actual process peaks also depend on source frames being freed during quantization and on allocator/scheduling behavior. The batch allocation bound does not change at 20 or 40 workers; their measured RSS variation should not be interpreted as a guaranteed memory saving.
+
+## Rejected experiments
+
+- Total nearest-index cache budgets of 4, 16, and 32 MiB, versus the existing 8 MiB budget split across workers: mixed results, no repeatable overall gain.
+- Prefetching the nearest-map direct table in addition to the memo cache: approximately +1.0% at 10 workers and neutral at 20 in the nine-run repeat; insufficiently consistent to retain.
+- Memoizing direct and single-candidate nearest-map answers as well as ambiguous lookups: approximately +0.6% at 10 workers and neutral at 20; rejected.
+- Applying 16 frames per worker at every pool size: the useful gain came from smaller pools. The retained formula caps the extra batching at 160 frames and preserves the larger-pool allocation bounds.
+
+The LZW loop alone measured about +4.1%/+2.5% at 10/20 in the nine-run six-clip repeat, then +3.7%/+2.2% in the seven-run full-corpus screen. The larger small-pool batches add the remaining 10-worker gain.
+
+## Validation and reproduction
+
+- `cargo fmt --check` and `cargo clippy --release --all-targets -- -D warnings` pass.
+- `cargo test --release`: **63 unit tests and 12 integration tests pass**.
+- The new LZW regression test checks exact chains leading to a substitution fork, longest-match selection, exact-first traversal under different visit budgets, and early termination at a zero-error EOF match.
+- Production integration coverage includes 10 and 20 workers. A new 173-frame clip checks identical output across 1/10/20/40 workers when duplicate frames cross quantize/encode batch boundaries, including total frame timing.
+- **56 baseline/final CLI comparisons** pass: RGBA and Y4M; 1/8/10/20/40 workers; changing alpha at 0/127/128/255 across all five dither modes; smoothing with hold; and a 173-frame boundary-crossing input.
+- FFmpeg independently decoded all 42 final corpus GIF files (14 clips at three worker counts).
+- A five-run one-worker spot check on `old`, `long`, and `live1` measured 6.6% geometric-mean throughput improvement (individual gains 5.9–7.8%), with byte-identical output.
+
+All copied harness code, local drivers, inputs, binaries, GIFs, profiles, and raw measurements remain under ignored `gif_bench/` and are uncommitted. The corpus provenance and original preparation commands are documented in the preceding Cascade Lake round below. Reproduction using `tbase` built from `3d93662` and `tfinal` built from this change:
+
+```bash
+THREADS=10,20,40 RUNS=7 python3 gif_bench/thread_measure.py thread-full-candidates tbase ttail tcombo
+THREADS=10,20,40 RUNS=15 SEED=661 python3 gif_bench/thread_measure.py thread-final tbase tfinal
+python3 gif_bench/thread_resources.py
+python3 gif_bench/thread_memory.py
+python3 gif_bench/thread_verify.py
+THREADS=1 RUNS=5 CLIPS=old,live1,long SEED=517 python3 gif_bench/thread_measure.py thread-one-worker tbase tfinal
+DEBUGINFOD_URLS= perf record -q -e cycles:u -F 499 --call-graph dwarf,4096 \
+  -o gif_bench/results/profile-old10.data -- python3 gif_bench/profile.py tbase 10 old 8
+DEBUGINFOD_URLS= perf report --stdio --no-children -g none --percent-limit .7 \
+  -i gif_bench/results/profile-old10.data
+```
+
+Raw results: `thread-initial.json`, `thread-cache-block.json`, `thread-profile-repeat.json`, `thread-full-candidates.json`, `thread-final.json`, `thread-resources.json`, `thread-memory.json`, and `thread-one-worker.json` in `gif_bench/results/`. The excluded noisy screen is retained as `thread-profile-candidates.json`.
+
+---
+
 # Cascade Lake performance hill climb — 2026-09-05
 
 Baseline: `13b87d753eb453df358b41e19249bdb1ab72d8d6`, including the previous hill climb below.
