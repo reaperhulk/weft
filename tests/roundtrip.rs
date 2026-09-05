@@ -628,7 +628,7 @@ fn production_flags_are_identical_across_hold_workers() {
         "1",
     ];
     let expected = run_weft(&args, &raw);
-    for threads in ["8", "22"] {
+    for threads in ["8", "22", "40"] {
         let mut parallel = args;
         parallel[11] = threads;
         assert_eq!(run_weft(&parallel, &raw), expected, "threads={threads}");
