@@ -338,8 +338,19 @@ without.
 
 ## Design
 
-Every heavy stage is parallel under rayon — across frames, and for the
-histogram across row strips within a frame as well:
+Every heavy stage is parallel across frames, and the histogram across row
+strips within a frame as well. The pool that runs them is weft's own
+(`src/pool.rs`): every parallel region here is the same shape — n
+independent items, run to completion before the caller continues — so it
+publishes one closure pointer per region and lets workers claim item
+ranges from a single atomic cursor, with no deques, no per-region
+allocation, and a stable worker index each closure can use to reach its
+own scratch buffers. Replacing rayon with it left every output byte
+identical and made encoding 3% faster at one worker, 6% at 22 (one per
+core on the measured host), and 9% at 44, for 5-20% less CPU time and
+80-90% fewer context switches; on a rate-limited input, where the pool
+mostly idles, it costs 13% less CPU than rayon did (see
+[bench/pool.md](bench/pool.md)).
 
 1. **Read + histogram, overlapped.** A reader thread streams frames into a
    bounded channel while workers RLE-scan them into packed runs and route
@@ -418,8 +429,7 @@ palette exactness, nearest-map-vs-brute-force in OkLab, y4m parsing, delay
 accumulation) and an end-to-end test that decodes weft's output with an
 independent minimal GIF decoder and compares canvases byte-for-byte.
 
-Dependencies: rayon and fearless_simd; the musl static build adds
-mimalloc.
+Dependencies: fearless_simd; the musl static build adds mimalloc.
 
 ## Optimisation history
 

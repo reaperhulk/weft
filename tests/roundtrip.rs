@@ -218,13 +218,14 @@ fn run_weft(args: &[&str], input: &[u8]) -> Vec<u8> {
         .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn weft");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input)
-        .expect("write stdin");
+    // Feed stdin from its own thread: weft streams the GIF out as it
+    // encodes, and a clip whose output exceeds the pipe buffer would
+    // otherwise deadlock against a parent still writing frames in.
+    let mut stdin = child.stdin.take().unwrap();
+    let input = input.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&input).expect("write stdin"));
     let out = child.wait_with_output().expect("wait");
+    writer.join().expect("stdin writer panicked");
     assert!(out.status.success(), "weft exited with {:?}", out.status);
     out.stdout
 }
@@ -628,7 +629,7 @@ fn production_flags_are_identical_across_hold_workers() {
         "1",
     ];
     let expected = run_weft(&args, &raw);
-    for threads in ["8", "10", "20", "22", "40"] {
+    for threads in ["2", "3", "8", "10", "20", "22", "40"] {
         let mut parallel = args;
         parallel[11] = threads;
         assert_eq!(run_weft(&parallel, &raw), expected, "threads={threads}");
@@ -682,4 +683,49 @@ fn production_flags_are_identical_across_block_boundaries() {
         decoded.frames.iter().map(|(_, delay)| delay).sum::<u32>(),
         ((n * 100 + 12) / 24) as u32
     );
+}
+
+/// A clip with more distinct colours than the histogram keeps exactly:
+/// past `FOLD_MAX` the buckets fold to the coarse grid, and the folded
+/// entries take the parallel radix sort rather than arriving sorted. Both
+/// paths only run above their thresholds and both feed the palette, so
+/// their results have to be independent of the worker count.
+#[test]
+fn many_colors_are_identical_across_thread_counts() {
+    let (w, h, n) = (200usize, 150usize, 5usize);
+    let mut raw = Vec::with_capacity(w * h * n * 4);
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    for _ in 0..n * w * h {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        raw.extend_from_slice(&[
+            (state >> 8) as u8,
+            (state >> 24) as u8,
+            (state >> 40) as u8,
+            255,
+        ]);
+    }
+    let args = [
+        "--size",
+        "200x150",
+        "--fps",
+        "24",
+        "--lossy",
+        "30",
+        "--dither",
+        "auto",
+        "--threads",
+        "1",
+    ];
+    let expected = run_weft(&args, &raw);
+    for threads in ["2", "3", "5", "8", "22"] {
+        let mut parallel = args;
+        parallel[9] = threads;
+        assert_eq!(run_weft(&parallel, &raw), expected, "threads={threads}");
+    }
+    let decoded = decode_gif(&expected);
+    assert_eq!(decoded.width, w);
+    assert_eq!(decoded.height, h);
+    assert_eq!(decoded.frames.len(), n);
 }
