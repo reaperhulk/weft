@@ -13,11 +13,12 @@ mod input;
 mod lzw;
 mod oklab;
 mod palette;
+mod pool;
 mod simdops;
 
 use dither::{Dither, Quantizer};
 use input::{Frame, VideoIn};
-use rayon::prelude::*;
+use pool::Pool;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -217,10 +218,7 @@ fn main() {
         }
     };
     if let Some(n) = args.threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global()
-            .expect("rayon pool");
+        pool::init(n);
     }
     if let Err(e) = run(&args) {
         eprintln!("error: {e}");
@@ -321,7 +319,8 @@ fn run(args: &Args) -> io::Result<()> {
     // detected here too: pass 2+3 needs it before the first frame is
     // quantized.
     let t1 = Instant::now();
-    let nthreads = rayon::current_num_threads().max(1);
+    let pool = pool::global();
+    let nthreads = pool.threads();
     // A batch is whatever the reader has queued when the previous batch
     // finishes — small on a slow source (maximum overlap with input), the
     // cap on a fast one. The cap bounds the routed runs, which can reach 4
@@ -351,16 +350,13 @@ fn run(args: &Args) -> io::Result<()> {
         .collect();
     let mut bins: Vec<Vec<[u64; 4]>> = Vec::new();
     let fold_slabs = |hists: &[palette::ColorHist]| -> Vec<Vec<[u64; 4]>> {
-        hists
-            .par_chunks(4)
-            .map(|slab| {
-                let mut b = vec![[0u64; 4]; palette::SLAB_BINS];
-                for h in slab {
-                    palette::accumulate_entries_coarse(&mut b, &h.entries());
-                }
-                b
-            })
-            .collect()
+        pool.map(hists.len() / 4, |_, g| {
+            let mut b = vec![[0u64; 4]; palette::SLAB_BINS];
+            for h in &hists[4 * g..4 * g + 4] {
+                palette::accumulate_entries_coarse(&mut b, &h.entries());
+            }
+            b
+        })
     };
     struct Routed {
         idx: usize,
@@ -393,11 +389,11 @@ fn run(args: &Args) -> io::Result<()> {
         // --smooth and --hold run as pipeline stages between the reader and
         // the histogram pass, so nothing but the read() itself sits on the
         // reader thread. Smoothing is frame-independent and runs on a small
-        // pool (whole frames per task: the per-row rayon form measured 5x
-        // slower under contention with the histogram workers); the hold
-        // carries state from frame to frame, so a coordinator applies it
-        // in sequence order, using a small separate pool for disjoint
-        // pixel ranges within each frame. Every
+        // pool (whole frames per task: splitting a frame by rows across
+        // the shared pool measured 5x slower under contention with the
+        // histogram workers); the hold carries state from frame to frame,
+        // so a coordinator applies it in sequence order, using a small
+        // separate pool for disjoint pixel ranges within each frame. Every
         // stage hands frames on through bounded channels; the main thread
         // sorts by index afterwards, so only the hold's order matters.
         let staged = smooth > 0 || hold > 0;
@@ -548,12 +544,7 @@ fn run(args: &Args) -> io::Result<()> {
                 } else {
                     1
                 };
-                let hold_pool = (hold_workers > 1).then(|| {
-                    rayon::ThreadPoolBuilder::new()
-                        .num_threads(hold_workers)
-                        .build()
-                        .expect("hold pool")
-                });
+                let hold_pool = (hold_workers > 1).then(|| Pool::new(hold_workers));
                 // Align each piece to the histogram's 64-pixel sampling
                 // period so splitting does not change the noise estimate.
                 let sample_period = 16 * simdops::HOLD_HIST_STRIDE;
@@ -600,27 +591,35 @@ fn run(args: &Args) -> io::Result<()> {
                                 let t = input::hold::adaptive_threshold(&hist, cap);
                                 t_sum += t as u64;
                                 hist.fill(0);
-                                if let Some(pool) = &hold_pool {
-                                    pool.install(|| {
-                                        buf.par_chunks_mut(hold_chunk)
-                                            .zip(held_prev.par_chunks_mut(hold_chunk))
-                                            .zip(held_mean.par_chunks_mut(hold_chunk))
-                                            .zip(raw_prev.par_chunks_mut(hold_chunk))
-                                            .zip(hold_hists.par_iter_mut())
-                                            .for_each(|((((cur, prev), mean), raw), hist)| {
-                                                hist.fill(0);
-                                                simdops::hold_rgba_mean(
-                                                    level,
-                                                    cur,
-                                                    prev,
-                                                    mean,
-                                                    raw,
-                                                    hist,
-                                                    t,
-                                                    input::hold::max_deviation(t),
-                                                );
-                                            });
-                                    });
+                                if let Some(hold_pool) = &hold_pool {
+                                    // One item per disjoint pixel range.
+                                    // Zipping the five slices up front is a
+                                    // handful of pointers per frame and
+                                    // keeps the region's closure free of
+                                    // aliasing reasoning.
+                                    let ranges: Vec<_> = buf
+                                        .chunks_mut(hold_chunk)
+                                        .zip(held_prev.chunks_mut(hold_chunk))
+                                        .zip(held_mean.chunks_mut(hold_chunk))
+                                        .zip(raw_prev.chunks_mut(hold_chunk))
+                                        .zip(hold_hists.iter_mut())
+                                        .collect();
+                                    hold_pool.for_each_into(
+                                        ranges,
+                                        |_, _, ((((cur, prev), mean), raw), hist)| {
+                                            hist.fill(0);
+                                            simdops::hold_rgba_mean(
+                                                level,
+                                                cur,
+                                                prev,
+                                                mean,
+                                                raw,
+                                                hist,
+                                                t,
+                                                input::hold::max_deviation(t),
+                                            );
+                                        },
+                                    );
                                     for h in &hold_hists {
                                         for (sum, &count) in hist.iter_mut().zip(h) {
                                             *sum += count;
@@ -735,100 +734,94 @@ fn run(args: &Args) -> io::Result<()> {
             // parallelising over frames alone leaves most of a 40-thread
             // machine idle. Split each frame into row strips too, and run
             // every (frame, strip) pair from a single flat parallel region:
-            // nesting one par_iter inside another instead would re-run the
-            // per-thread init for every frame and make each frame's inner
-            // collect a barrier. The scan is per-row and the strips are
-            // concatenated in order, so the runs -- and the palette -- are
-            // exactly what the sequential row order produced.
+            // a region per frame would re-run the per-worker init for every
+            // frame and make each frame's collect a barrier. The scan is
+            // per-row and the strips are concatenated in order, so the runs
+            // -- and the palette -- are exactly what the sequential row
+            // order produced.
             let nstrips = h.div_ceil(STRIP_ROWS);
             let frames_in: Vec<&Frame> = batch.iter().map(|(_, f)| f).collect();
-            let strip_out: Vec<StripOut> = (0..frames_in.len() * nstrips)
-                .into_par_iter()
-                .map_init(
-                    || (vec![0u8; w * 4], vec![0u32; w]),
-                    |(row, keys), t| {
-                        let (fi, si) = (t / nstrips, t % nstrips);
-                        let y0 = si * STRIP_ROWS;
-                        let y1 = ((si + 1) * STRIP_ROWS).min(h);
-                        // one run per pixel is the worst case, so this
-                        // capacity is never exceeded and never regrown
-                        let mut runs = Vec::with_capacity((y1 - y0) * w);
-                        let mut counts = [0u32; BUCKETS];
-                        let mut alpha = false;
-                        let src = color::RowSource::new(frames_in[fi], w, h, meta_ref.chroma);
-                        if src.has_direct_rgb_keys() {
-                            for y in y0..y1 {
-                                src.fill_rgb_keys(y, keys);
-                                palette::scan_rgb_key_runs_counted(keys, &mut runs, &mut counts);
-                            }
-                        } else {
-                            for y in y0..y1 {
-                                alpha |= palette::scan_rgba_runs_counted(
-                                    rgba_row(&src, y, row),
-                                    &mut runs,
-                                    &mut counts,
-                                );
-                            }
-                        }
-                        StripOut {
-                            runs,
-                            counts,
-                            alpha,
-                        }
-                    },
-                )
-                .collect();
-            drop(frames_in);
-            let routed: Vec<Routed> = batch
-                .into_par_iter()
-                .enumerate()
-                .map(|(fi, (i, f))| {
-                    let strips = &strip_out[fi * nstrips..(fi + 1) * nstrips];
+            let strip_out: Vec<StripOut> = pool.map_init(
+                frames_in.len() * nstrips,
+                || (vec![0u8; w * 4], vec![0u32; w]),
+                |(row, keys), _, t| {
+                    let (fi, si) = (t / nstrips, t % nstrips);
+                    let y0 = si * STRIP_ROWS;
+                    let y1 = ((si + 1) * STRIP_ROWS).min(h);
+                    // one run per pixel is the worst case, so this
+                    // capacity is never exceeded and never regrown
+                    let mut runs = Vec::with_capacity((y1 - y0) * w);
                     let mut counts = [0u32; BUCKETS];
                     let mut alpha = false;
-                    for st in strips {
-                        for (t, v) in counts.iter_mut().zip(st.counts.iter()) {
-                            *t += v;
+                    let src = color::RowSource::new(frames_in[fi], w, h, meta_ref.chroma);
+                    if src.has_direct_rgb_keys() {
+                        for y in y0..y1 {
+                            src.fill_rgb_keys(y, keys);
+                            palette::scan_rgb_key_runs_counted(keys, &mut runs, &mut counts);
                         }
-                        alpha |= st.alpha;
+                    } else {
+                        for y in y0..y1 {
+                            alpha |= palette::scan_rgba_runs_counted(
+                                rgba_row(&src, y, row),
+                                &mut runs,
+                                &mut counts,
+                            );
+                        }
                     }
-                    let chunks: Vec<&[palette::PackedRun]> =
-                        strips.iter().map(|st| st.runs.as_slice()).collect();
-                    let mut runs = run_pool.lock().unwrap().pop().unwrap_or_default();
-                    let offs = palette::bucket_runs_chunks(&chunks, &counts, &mut runs);
-                    // The scan just told us whether this frame uses any
-                    // transparency; when it doesn't, the alpha plane is
-                    // a constant and the frame can be packed to RGB for
-                    // the rest of its (clip-long) life. The RGBA buffer
-                    // is freed immediately, so the extra resident bytes
-                    // are one frame per busy worker, not one per clip.
-                    let frame = match f {
-                        Frame::Rgba(rgba) if !alpha => Frame::Rgb(color::rgba_to_rgb(&rgba)),
-                        other => other,
-                    };
-                    Routed {
-                        idx: i,
-                        frame,
-                        alpha,
+                    StripOut {
                         runs,
-                        offs,
+                        counts,
+                        alpha,
                     }
-                })
-                .collect();
+                },
+            );
+            drop(frames_in);
+            let routed: Vec<Routed> = pool.map_into(batch, |_, fi, (i, f)| {
+                let strips = &strip_out[fi * nstrips..(fi + 1) * nstrips];
+                let mut counts = [0u32; BUCKETS];
+                let mut alpha = false;
+                for st in strips {
+                    for (t, v) in counts.iter_mut().zip(st.counts.iter()) {
+                        *t += v;
+                    }
+                    alpha |= st.alpha;
+                }
+                let chunks: Vec<&[palette::PackedRun]> =
+                    strips.iter().map(|st| st.runs.as_slice()).collect();
+                let mut runs = run_pool.lock().unwrap().pop().unwrap_or_default();
+                let offs = palette::bucket_runs_chunks(&chunks, &counts, &mut runs);
+                // The scan just told us whether this frame uses any
+                // transparency; when it doesn't, the alpha plane is
+                // a constant and the frame can be packed to RGB for
+                // the rest of its (clip-long) life. The RGBA buffer
+                // is freed immediately, so the extra resident bytes
+                // are one frame per busy worker, not one per clip.
+                let frame = match f {
+                    Frame::Rgba(rgba) if !alpha => Frame::Rgb(color::rgba_to_rgb(&rgba)),
+                    other => other,
+                };
+                Routed {
+                    idx: i,
+                    frame,
+                    alpha,
+                    runs,
+                    offs,
+                }
+            });
             // phase B: one task per bucket, all of the batch's runs for it
             if coarse && bins.is_empty() {
                 bins = fold_slabs(&hists);
                 hists = Vec::new();
             }
             if coarse {
-                bins.par_iter_mut().enumerate().for_each(|(g, slab)| {
+                pool.for_each_mut(&mut bins, |_, g, slab| {
                     for r in &routed {
                         let s = &r.runs[r.offs[4 * g] as usize..r.offs[4 * g + 4] as usize];
                         palette::accumulate_runs_coarse(slab, s);
                     }
                 });
             } else {
-                hists.par_iter_mut().enumerate().for_each(|(b, hist)| {
+                pool.for_each_mut(&mut hists, |_, b, hist| {
                     for r in &routed {
                         let s = &r.runs[r.offs[b] as usize..r.offs[b + 1] as usize];
                         palette::accumulate_runs(hist, s);
@@ -837,11 +830,11 @@ fn run(args: &Args) -> io::Result<()> {
                 let distinct: usize = hists.iter().map(|h| h.len()).sum();
                 coarse = distinct > palette::FOLD_MAX;
             }
-            let mut pool = run_pool.lock().unwrap();
+            let mut recycle = run_pool.lock().unwrap();
             for r in routed {
                 any_alpha |= r.alpha;
                 frames.push((r.idx, r.frame));
-                pool.push(r.runs);
+                recycle.push(r.runs);
             }
         }
         let read_res = reader_handle.join().expect("reader thread panicked");
@@ -879,23 +872,18 @@ fn run(args: &Args) -> io::Result<()> {
             hists = Vec::new();
         }
         // slab order is grid order, and each slab's bins are in grid order
-        let slabs: Vec<Vec<(u32, u32)>> = bins
-            .par_iter()
-            .map(|b| palette::fold_bins_to_entries(b))
-            .collect();
+        let slabs: Vec<Vec<(u32, u32)>> =
+            pool.map(bins.len(), |_, i| palette::fold_bins_to_entries(&bins[i]));
         slabs.concat()
     } else {
         // Each color lives in exactly one bucket, so per-bucket sorted
         // entries concatenate to the sorted, deduplicated histogram
         // (median_cut's canonicalizing sort is then a no-op).
-        let per: Vec<Vec<(u32, u32)>> = hists
-            .par_iter()
-            .map(|h| {
-                let mut e = h.entries();
-                e.sort_unstable();
-                e
-            })
-            .collect();
+        let per: Vec<Vec<(u32, u32)>> = pool.map(hists.len(), |_, i| {
+            let mut e = hists[i].entries();
+            e.sort_unstable();
+            e
+        });
         per.concat()
     };
     drop(hists);
@@ -1005,25 +993,24 @@ fn run(args: &Args) -> io::Result<()> {
     let mut scale_block: Vec<Vec<u8>> = Vec::new();
     let mut t_quant = std::time::Duration::ZERO;
     let mut t_lzw = std::time::Duration::ZERO;
-    // `for_each_init`/`map_init` state lives for only one parallel
-    // operation. Since the block loop launches two new operations per
-    // block, using them here would repeatedly allocate and zero the
-    // nearest-color memo cache and recreate the encoder buffers. Keep one state
-    // bundle per Rayon worker for the whole clip instead. Initialize each
-    // half lazily on the worker that first uses it: eagerly constructing
-    // nthreads caches here serializes tens of MiB of first-touch writes on
-    // large machines, and an encode-only worker never needs QuantScratch.
-    // A worker executes only one closure at a time, so these locks are
-    // uncontended; they provide safe indexed ownership across independent
-    // parallel calls.
+    // `Pool::map_init` state lives for only one region. Since the block
+    // loop launches two new regions per block, using it here would
+    // repeatedly allocate and zero the nearest-color memo cache and
+    // recreate the encoder buffers. Keep one state bundle per pool worker
+    // for the whole clip instead. Initialize each half lazily on the worker
+    // that first uses it: eagerly constructing nthreads caches here
+    // serializes tens of MiB of first-touch writes on large machines, and
+    // an encode-only worker never needs QuantScratch. A worker executes
+    // only one closure at a time, so these locks are uncontended; they
+    // provide safe indexed ownership across independent regions.
     struct WorkerCtx {
         quant: OnceLock<Mutex<dither::QuantScratch>>,
         encode: OnceLock<Mutex<gif::EncodeCtx>>,
     }
-    // The extra slot covers Rayon's single-item/sequential fast path, which
-    // can execute the closure on the calling thread (and therefore has no
-    // Rayon worker index).
-    let worker_ctx: Vec<WorkerCtx> = (0..=nthreads)
+    // One slot per pool participant: worker indices are dense and always
+    // valid, including on the submitting thread, so there is no
+    // "ran outside the pool" case to reserve a spare slot for.
+    let worker_ctx: Vec<WorkerCtx> = (0..nthreads)
         .map(|_| WorkerCtx {
             quant: OnceLock::new(),
             encode: OnceLock::new(),
@@ -1036,17 +1023,11 @@ fn run(args: &Args) -> io::Result<()> {
             // Allocate (and first-touch) the block's index buffers in
             // parallel: done serially this is several ms of page faults
             // per clip on a wide machine, all before any worker starts.
-            let extra: Vec<Vec<u8>> = (idx_block.len()..cn)
-                .into_par_iter()
-                .map(|_| vec![0u8; w * h])
-                .collect();
+            let extra: Vec<Vec<u8>> = pool.map(cn - idx_block.len(), |_, _| vec![0u8; w * h]);
             idx_block.extend(extra);
         }
         if scaled_lossy && scale_block.len() < cn {
-            let extra: Vec<Vec<u8>> = (scale_block.len()..cn)
-                .into_par_iter()
-                .map(|_| vec![255u8; w * h])
-                .collect();
+            let extra: Vec<Vec<u8>> = pool.map(cn - scale_block.len(), |_, _| vec![255u8; w * h]);
             scale_block.extend(extra);
         }
         let t_quant_start = args.stats.then(Instant::now);
@@ -1056,35 +1037,38 @@ fn run(args: &Args) -> io::Result<()> {
             } else {
                 (0..cn).map(|_| None).collect()
             };
-            chunk
-                .into_par_iter()
-                .zip(idx_block[..cn].par_iter_mut())
-                .zip(scale_slots.into_par_iter())
-                .for_each(|((f, idx), scale)| {
-                    let wi = rayon::current_thread_index().unwrap_or(nthreads);
-                    let mut scratch = worker_ctx[wi]
-                        .quant
-                        .get_or_init(|| Mutex::new(dither::QuantScratch::new(w, nthreads)))
-                        .lock()
-                        .unwrap();
-                    let src = color::RowSource::new(&f, w, h, meta.chroma);
-                    quant.quantize(
-                        &src,
-                        w,
-                        h,
-                        args.dither,
-                        &mut scratch,
-                        idx,
-                        scale.map(|v| v.as_mut_slice()),
-                    );
-                });
+            /// One frame's quantize work: source frame, its index buffer,
+            /// and its lossy scale map when `--lossy` needs one.
+            type QuantJob<'a> = (Frame, &'a mut Vec<u8>, Option<&'a mut Vec<u8>>);
+            let jobs: Vec<QuantJob> = chunk
+                .into_iter()
+                .zip(idx_block[..cn].iter_mut())
+                .zip(scale_slots)
+                .map(|((f, idx), scale)| (f, idx, scale))
+                .collect();
+            pool.for_each_into(jobs, |wi, _, (f, idx, scale)| {
+                let mut scratch = worker_ctx[wi]
+                    .quant
+                    .get_or_init(|| Mutex::new(dither::QuantScratch::new(w, nthreads)))
+                    .lock()
+                    .unwrap();
+                let src = color::RowSource::new(&f, w, h, meta.chroma);
+                quant.quantize(
+                    &src,
+                    w,
+                    h,
+                    args.dither,
+                    &mut scratch,
+                    idx,
+                    scale.map(|v| v.as_mut_slice()),
+                );
+            });
         }
         if let Some(t) = t_quant_start {
             t_quant += t.elapsed();
         }
         let t_lzw_start = args.stats.then(Instant::now);
-        encoded.par_extend((0..cn).into_par_iter().map(|j| {
-            let wi = rayon::current_thread_index().unwrap_or(nthreads);
+        encoded.extend(pool.map(cn, |wi, j| {
             let mut encode = worker_ctx[wi]
                 .encode
                 .get_or_init(|| Mutex::new(gif::EncodeCtx::default()))

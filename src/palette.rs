@@ -20,7 +20,7 @@
 //!   single candidate, collapsing lookup to one load.
 
 use crate::oklab::{oklab_to_srgb, LabConverter};
-use rayon::prelude::*;
+use crate::pool;
 
 pub const GRID_BITS: u32 = 6;
 pub const GRID_SIZE: usize = 1 << (3 * GRID_BITS); // 262144
@@ -592,7 +592,9 @@ fn make_box(bins: &[HBin], start: usize, len: usize) -> Box_ {
         moments
     };
     let moments = if len >= PAR_BOX {
-        let parts: Vec<Moments> = slice.par_chunks(BOX_CHUNK).map(accumulate).collect();
+        let parts: Vec<Moments> = pool::global().map(len.div_ceil(BOX_CHUNK), |_, c| {
+            accumulate(&slice[c * BOX_CHUNK..((c + 1) * BOX_CHUNK).min(len)])
+        });
         let mut parts = parts.into_iter();
         let mut total = parts.next().unwrap();
         for b in parts {
@@ -853,21 +855,18 @@ pub fn median_cut(mut entries: Vec<(u32, u32)>, max_colors: usize) -> Vec<[u8; 3
     // Canonicalize the entries order (histogram layout depends on merge
     // order): boxes are only partitioned below, never sorted, so this
     // initial srgb order is what makes every later float sum — and thus
-    // the palette — independent of thread scheduling. (A no-op-cost sort
-    // for callers that already sorted, e.g. the exact histogram path.)
-    if entries.len() > 16384 {
-        entries.par_sort_unstable();
-    } else {
-        entries.sort_unstable();
-    }
-    let mut bins: Vec<HBin> = entries
-        .par_iter()
-        .map(|&(c, n)| HBin {
+    // the palette — independent of thread scheduling. (Near-free for
+    // callers that already sorted, e.g. the exact histogram path.)
+    let pool = pool::global();
+    pool::sort_entries(pool, &mut entries);
+    let mut bins: Vec<HBin> = pool.map(entries.len(), |_, i| {
+        let (c, n) = entries[i];
+        HBin {
             count: n,
             srgb: c,
             lab: cv.srgb_to_oklab((c >> 16) as u8, (c >> 8) as u8, c as u8),
-        })
-        .collect();
+        }
+    });
 
     let n = bins.len();
     let mut sel_keys: Vec<u64> = vec![0; n];
@@ -1005,10 +1004,11 @@ pub fn refine_lloyd(colors: &mut [[u8; 3]], entries: &[(u32, u32)], iters: usize
     let cv = LabConverter::new();
     let level = crate::simdops::level();
     let n = colors.len();
-    let labs: Vec<[f32; 3]> = entries
-        .par_iter()
-        .map(|&(c, _)| cv.srgb_to_oklab((c >> 16) as u8, (c >> 8) as u8, c as u8))
-        .collect();
+    let pool = pool::global();
+    let labs: Vec<[f32; 3]> = pool.map(entries.len(), |_, i| {
+        let c = entries[i].0;
+        cv.srgb_to_oklab((c >> 16) as u8, (c >> 8) as u8, c as u8)
+    });
     for _ in 0..iters {
         let pal_lab: Vec<[f32; 3]> = colors
             .iter()
@@ -1020,50 +1020,46 @@ pub fn refine_lloyd(colors: &mut [[u8; 3]], entries: &[(u32, u32)], iters: usize
         // 4096-entry chunks left most of a 40-worker pool idle: a
         // histogram of 54k unique colours is only thirteen of them.
         const ASSIGN_CHUNK: usize = 1024;
-        let parts: Vec<LloydPartial> = entries
-            .par_chunks(ASSIGN_CHUNK)
-            .zip(labs.par_chunks(ASSIGN_CHUNK))
-            .map(|(chunk, lchunk)| {
-                let mut sum = vec![[0f64; 3]; n];
-                let mut cnt = vec![0u64; n];
-                let mut dom = vec![(0u32, 0u32); n];
-                let mut dists = vec![0f32; padded];
-                for (&(c, k), &lab) in chunk.iter().zip(lchunk) {
-                    let i = crate::simdops::nearest_color(level, &soa, lab, &mut dists, n);
-                    for ch in 0..3 {
-                        sum[i][ch] += lab[ch] as f64 * k as f64;
-                    }
-                    cnt[i] += k as u64;
-                    if k > dom[i].0 {
-                        dom[i] = (k, c);
-                    }
+        let nchunks = entries.len().div_ceil(ASSIGN_CHUNK);
+        let parts: Vec<LloydPartial> = pool.map(nchunks, |_, ci| {
+            let range = ci * ASSIGN_CHUNK..((ci + 1) * ASSIGN_CHUNK).min(entries.len());
+            let (chunk, lchunk) = (&entries[range.clone()], &labs[range]);
+            let mut sum = vec![[0f64; 3]; n];
+            let mut cnt = vec![0u64; n];
+            let mut dom = vec![(0u32, 0u32); n];
+            let mut dists = vec![0f32; padded];
+            for (&(c, k), &lab) in chunk.iter().zip(lchunk) {
+                let i = crate::simdops::nearest_color(level, &soa, lab, &mut dists, n);
+                for ch in 0..3 {
+                    sum[i][ch] += lab[ch] as f64 * k as f64;
                 }
-                (sum, cnt, dom)
-            })
-            .collect();
+                cnt[i] += k as u64;
+                if k > dom[i].0 {
+                    dom[i] = (k, c);
+                }
+            }
+            (sum, cnt, dom)
+        });
         // Merge per palette slot rather than per chunk: each slot still
         // sums its chunks in chunk order, so the f64 association — and so
         // the palette — is exactly what the serial merge produced, but the
         // pass is parallel over slots instead of growing with the chunk
         // count. That is what lets the chunks be small enough to balance.
-        let merged: Vec<([f64; 3], u64, (u32, u32))> = (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let mut sum = [0f64; 3];
-                let mut cnt = 0u64;
-                let mut dom = (0u32, 0u32);
-                for (s, c, d) in &parts {
-                    for ch in 0..3 {
-                        sum[ch] += s[i][ch];
-                    }
-                    cnt += c[i];
-                    if d[i].0 > dom.0 {
-                        dom = d[i];
-                    }
+        let merged: Vec<([f64; 3], u64, (u32, u32))> = pool.map(n, |_, i| {
+            let mut sum = [0f64; 3];
+            let mut cnt = 0u64;
+            let mut dom = (0u32, 0u32);
+            for (s, c, d) in &parts {
+                for ch in 0..3 {
+                    sum[ch] += s[i][ch];
                 }
-                (sum, cnt, dom)
-            })
-            .collect();
+                cnt += c[i];
+                if d[i].0 > dom.0 {
+                    dom = d[i];
+                }
+            }
+            (sum, cnt, dom)
+        });
         let sum: Vec<[f64; 3]> = merged.iter().map(|m| m.0).collect();
         let cnt: Vec<u64> = merged.iter().map(|m| m.1).collect();
         let dom: Vec<(u32, u32)> = merged.iter().map(|m| m.2).collect();
@@ -1162,54 +1158,48 @@ impl NearestMap {
             arena: Vec<u8>,
         }
         let nchunks = GRID_SIZE.div_ceil(CELL_CHUNK);
-        let cell_chunks: Vec<CellChunk> = (0..nchunks)
-            .into_par_iter()
-            .map_init(
-                || (LabConverter::new(), vec![0f32; soa.l.len()]),
-                |(cv, dists), chunk| {
-                    let start = chunk * CELL_CHUNK;
-                    let end = (start + CELL_CHUNK).min(GRID_SIZE);
-                    let mut refs = Vec::with_capacity(end - start);
-                    let mut arena = Vec::with_capacity((end - start) * colors.len().min(8));
-                    for key in start..end {
-                        let rb = (((key >> (2 * GRID_BITS)) & 63) as u8) << 2;
-                        let gb = (((key >> GRID_BITS) & 63) as u8) << 2;
-                        let bb = ((key & 63) as u8) << 2;
-                        let q = cv.srgb_to_oklab(rb + 2, gb + 2, bb + 2);
-                        // All 8 corners in SIMD lanes (slightly inflated to
-                        // stay an upper bound): candidate lists built from it
-                        // are supersets of the exact-rmax lists, so lookups
-                        // still return the true nearest.
-                        let mut lr = [0f32; 8];
-                        let mut lg = [0f32; 8];
-                        let mut lb = [0f32; 8];
-                        for corner in 0..8 {
-                            lr[corner] = cv.linear(rb + if corner & 1 != 0 { 3 } else { 0 });
-                            lg[corner] = cv.linear(gb + if corner & 2 != 0 { 3 } else { 0 });
-                            lb[corner] = cv.linear(bb + if corner & 4 != 0 { 3 } else { 0 });
-                        }
-                        let rmax2 = crate::simdops::corner_rmax2(level, &lr, &lg, &lb, q);
-                        let rmax = rmax2.sqrt();
-                        // one SIMD distance pass, buffered, shared by the dmin
-                        // scan and the candidate filter
-                        let dmin2 = crate::simdops::cell_distances(level, &soa, q, dists);
-                        let bound = dmin2.sqrt() + 2.0 * rmax + 1e-6;
-                        let bound2 = bound * bound;
-                        let off = arena.len();
-                        crate::simdops::cell_candidates(
-                            &dists[..pal_lab.len()],
-                            bound2,
-                            &mut arena,
-                        );
-                        refs.push(CellRef {
-                            off: off as u32,
-                            len: (arena.len() - off) as u16,
-                        });
+        let cell_chunks: Vec<CellChunk> = pool::global().map_init(
+            nchunks,
+            || (LabConverter::new(), vec![0f32; soa.l.len()]),
+            |(cv, dists), _, chunk| {
+                let start = chunk * CELL_CHUNK;
+                let end = (start + CELL_CHUNK).min(GRID_SIZE);
+                let mut refs = Vec::with_capacity(end - start);
+                let mut arena = Vec::with_capacity((end - start) * colors.len().min(8));
+                for key in start..end {
+                    let rb = (((key >> (2 * GRID_BITS)) & 63) as u8) << 2;
+                    let gb = (((key >> GRID_BITS) & 63) as u8) << 2;
+                    let bb = ((key & 63) as u8) << 2;
+                    let q = cv.srgb_to_oklab(rb + 2, gb + 2, bb + 2);
+                    // All 8 corners in SIMD lanes (slightly inflated to
+                    // stay an upper bound): candidate lists built from it
+                    // are supersets of the exact-rmax lists, so lookups
+                    // still return the true nearest.
+                    let mut lr = [0f32; 8];
+                    let mut lg = [0f32; 8];
+                    let mut lb = [0f32; 8];
+                    for corner in 0..8 {
+                        lr[corner] = cv.linear(rb + if corner & 1 != 0 { 3 } else { 0 });
+                        lg[corner] = cv.linear(gb + if corner & 2 != 0 { 3 } else { 0 });
+                        lb[corner] = cv.linear(bb + if corner & 4 != 0 { 3 } else { 0 });
                     }
-                    CellChunk { refs, arena }
-                },
-            )
-            .collect();
+                    let rmax2 = crate::simdops::corner_rmax2(level, &lr, &lg, &lb, q);
+                    let rmax = rmax2.sqrt();
+                    // one SIMD distance pass, buffered, shared by the dmin
+                    // scan and the candidate filter
+                    let dmin2 = crate::simdops::cell_distances(level, &soa, q, dists);
+                    let bound = dmin2.sqrt() + 2.0 * rmax + 1e-6;
+                    let bound2 = bound * bound;
+                    let off = arena.len();
+                    crate::simdops::cell_candidates(&dists[..pal_lab.len()], bound2, &mut arena);
+                    refs.push(CellRef {
+                        off: off as u32,
+                        len: (arena.len() - off) as u16,
+                    });
+                }
+                CellChunk { refs, arena }
+            },
+        );
 
         let pal_rgb: Vec<u32> = colors
             .iter()
