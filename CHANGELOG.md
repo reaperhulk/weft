@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.5.0
+
+weft no longer depends on rayon. Every parallel stage now runs on a
+work-sharing pool built for weft's own shape (`src/pool.rs`). **Output is
+byte-identical to 0.4.3** — verified on fourteen clips under four flag
+sets at nine worker counts — and no flag, default, palette, or
+compression threshold changed. (#51)
+
+- Every parallel region in weft is the same shape: *n* independent items,
+  run to completion before the caller continues. The pool is built to that
+  contract: one closure pointer published per region, an atomic cursor
+  that workers claim item ranges from, dense worker indices (so per-worker
+  scratch is an array lookup rather than a thread-local probe), and the
+  submitting thread doing a share of the work. There are no deques, no
+  per-region allocation, and no splitting.
+- Joining a region is optional. A worker that the OS descheduled, or that
+  is still waking from a park, misses the region instead of stalling it.
+  This is what keeps region overhead flat as the worker count grows: an
+  empty region costs ~3 µs at 22 and 44 workers.
+- Idle workers spin briefly, then poll with `yield_now`, then park; a
+  worker whose previous idle ended in a park skips the spin the next time
+  (adaptive spinning, after filament). When a slow decoder leaves the pool
+  idle between batches this is a 13% CPU reduction against rayon, and it
+  is neutral when input is fast.
+- `--threads N` now means N runnable threads, the submitting thread
+  included. Under rayon it was N worker threads plus a blocked main
+  thread, so the same N does the same amount of parallel work; `--threads
+  1` now runs entirely inline with no thread spawned and no
+  synchronization.
+- The palette's canonicalizing sort is a parallel radix pass with a
+  per-bucket comparison sort, preceded by a scan that skips the work when
+  the entries already arrive sorted (the exact-histogram case). The
+  result is exactly what `sort_unstable` produced.
+- The musl static build no longer links rayon or crossbeam; the only
+  remaining dependency is fearless_simd (plus mimalloc for musl).
+
+Measured on a 22-core Broadwell Xeon at `--lossy 30 --dither auto --hold
+12` over fourteen RGBA clips: geometric-mean throughput +3% at one
+worker, +2-4% at 4-8, +5% at 16, +6% at 22, and +9% at 44 workers, with
+5-20% less CPU time and 80-90% fewer context switches. See
+[the measurement log](bench/pool.md) for per-clip results, hardware
+counters, the region-latency microbenchmark, and validation.
+
+Regression coverage adds sixteen pool unit tests (ordering and
+one-run-per-item at every scheduling boundary, drop-exactly-once through
+the by-value forms, panics from items and from per-worker init on both
+the caller and worker paths, parked workers waking, publishes raced
+against parking, late joiners backing out, concurrent submitters,
+concurrent pools, and drop in every worker state), thread-invariance at 2
+and 3 workers, and a many-colour clip that exercises the coarse-binned
+histogram and the parallel sort across worker counts.
+
 ## 0.4.3
 
 Performance improvements for production encoding, including smaller worker
