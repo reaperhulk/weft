@@ -84,10 +84,10 @@ fn lab_from_cbrt_lms(l_: f32, m_: f32, s_: f32) -> [f32; 3] {
 /// where the OkLab *geometry* matters but correctly-rounded rounding does
 /// not (nearest-color argmins; candidate bounds carry an explicit margin).
 ///
-/// On x86_64 the hot path uses the packed `cbrt3_fast`; this scalar form
-/// is its reference (the test proves them bit-identical) and the path
-/// other architectures take.
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+/// On x86_64 and ARM64 the hot path uses the packed `cbrt3_fast`; this
+/// scalar form is its reference (the test proves them bit-identical) and
+/// the fallback for other architectures.
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 #[inline(always)]
 pub fn cbrt_fast(x: f32) -> f32 {
     let mut y = f32::from_bits(cbrt_seed_bits(x));
@@ -144,10 +144,33 @@ pub fn cbrt3_fast(l: f32, m: f32, s: f32) -> [f32; 3] {
         _mm_storeu_ps(out.as_mut_ptr(), y);
         [out[0], out[1], out[2]]
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        fearless_simd::dispatch!(fearless_simd::Level::new(), simd => cbrt3_simd(simd, l, m, s))
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         [cbrt_fast(l), cbrt_fast(m), cbrt_fast(s)]
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn cbrt3_simd<S: fearless_simd::Simd>(simd: S, l: f32, m: f32, s: f32) -> [f32; 3] {
+    use fearless_simd::{f32x4, prelude::*, u32x4};
+    // The padding lane stays normal, and division retains the scalar
+    // reference's rounding; do not replace it with reciprocal estimates.
+    let inputs = [l, m, s, 1.0];
+    let seeds = inputs.map(cbrt_seed_bits);
+    let x = f32x4::from_slice(simd, &inputs);
+    let mut y: f32x4<S> = u32x4::from_slice(simd, &seeds).bitcast();
+    let x2 = x + x;
+    for _ in 0..2 {
+        let y3 = y * y * y;
+        y *= (y3 + x2) / (y3 + y3 + x);
+    }
+    let out: [f32; 4] = y.into();
+    [out[0], out[1], out[2]]
 }
 
 pub fn oklab_to_srgb(lab: [f32; 3]) -> [u8; 3] {

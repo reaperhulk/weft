@@ -89,7 +89,12 @@ const SPIN_TIME: Duration = Duration::from_micros(10);
 /// tens of microseconds on a virtual machine, more than most of the
 /// serial gaps between weft's regions, so a worker that parks at 10 us
 /// would be asleep for exactly the gaps it should have covered.
+#[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
 const YIELD_TIME: Duration = Duration::from_micros(200);
+// On the M1 Max, parking after the initial spin beat repeated scheduler
+// yields in both the subset screen and the full RGBA corpus comparison.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+const YIELD_TIME: Duration = Duration::ZERO;
 /// A park shorter than this means the next region arrived faster than the
 /// park/unpark path can deliver it, so the worker should have stayed
 /// awake: it goes back to spinning. Longer parks are the pauses between

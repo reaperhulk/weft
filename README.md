@@ -433,6 +433,14 @@ Dependencies: fearless_simd; the musl static build adds mimalloc.
 
 ## Optimisation history
 
+Linux CI builds use [PGO trained on bundled videos decoded to RGBA](bench/pgo/README.md).
+Each target trains natively, checks held-out outputs, and reports build-stage
+timings; release builds make no Frinkiac requests.
+
+The [ARM64 RGBA hill climb](bench/arm64-hill-climb.md) records the M1 Max
+results on 20 Frinkiac clips, the retained `fearless_simd` kernels, and
+commands to fetch the corpus, benchmark changes, and build with PGO.
+
 [`docs/experiments.md`](docs/experiments.md) records optimisations that
 were implemented, measured and **rejected**, with the numbers that killed
 them — Wu's quantizer, several `--dither auto` gate reworks, half a dozen

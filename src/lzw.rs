@@ -5,6 +5,9 @@
 const MAX_CODE: u32 = 4096;
 /// GIF caps codes at 12 bits; the dictionary stops growing there.
 const MAX_WIDTH: u32 = 12;
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+const TABLE_BITS: u32 = 15;
+#[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
 const TABLE_BITS: u32 = 13;
 const TABLE_SIZE: usize = 1 << TABLE_BITS;
 
@@ -204,10 +207,12 @@ struct LossyBest {
 pub struct LzwEncoder {
     // entry: [key:20 | code:12] packed into u32 (key is 12-bit prefix code
     // + 8-bit appended byte). Codes handed out start at eoi+1 >= 3, so a
-    // zero code field marks an empty slot and a clear is one 32KB memset —
-    // the whole table stays L1-resident, where the previous generation-
-    // stamped u64 table (256KB) bounced through L2 on every probe.
-    table: Vec<u32>,
+    // zero code field marks an empty slot. Apple ARM64 uses 128 KiB;
+    // other targets retain the 32 KiB table. A fixed-size allocation lets
+    // the compiler prove that masked probe indices are always in bounds.
+    table: Box<[u32; TABLE_SIZE]>,
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    hash_shift: u32,
     gen: u16,
     scratch: Vec<u8>,
     // Lossy-only: per-prefix-code bitmap of which symbols continue it in
@@ -223,7 +228,9 @@ pub struct LzwEncoder {
 impl Default for LzwEncoder {
     fn default() -> Self {
         Self {
-            table: vec![0; TABLE_SIZE],
+            table: vec![0; TABLE_SIZE].into_boxed_slice().try_into().unwrap(),
+            #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+            hash_shift: TABLE_BITS - 8,
             gen: 0,
             scratch: Vec::new(),
             // The default encoder is lossless. Avoid allocating and
@@ -290,6 +297,12 @@ impl LzwEncoder {
     /// should be inserted.
     #[inline(always)]
     fn probe(&self, key: u32) -> Result<u32, usize> {
+        // Mix prefix and suffix without a multiply on Apple ARM64.
+        // Dictionary codes and insertion order do not depend on the hash.
+        #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+        let mut slot =
+            (((key >> 8) ^ ((key & 255) << self.hash_shift)) as usize) & (TABLE_SIZE - 1);
+        #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
         let mut slot = ((key.wrapping_mul(0x9E37_79B1)) >> (32 - TABLE_BITS)) as usize;
         loop {
             let e = self.table[slot];
@@ -319,6 +332,13 @@ impl LzwEncoder {
         scale: Option<&[u8]>,
         out: &mut Vec<u8>,
     ) {
+        #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+        {
+            // Spread even a small alphabet across the table. A fixed
+            // seven-bit shift clusters <=32 symbols into only 4096 home
+            // slots, where the nearly full dictionary probes heavily.
+            self.hash_shift = TABLE_BITS - min_code_size as u32;
+        }
         out.push(min_code_size);
         self.scratch.clear();
         let mut scratch = std::mem::take(&mut self.scratch);
@@ -853,6 +873,33 @@ pub mod tests {
             data.extend(std::iter::repeat_n((i % 7) as u8, 10_000));
         }
         roundtrip(&data);
+    }
+
+    #[test]
+    fn encoder_reuse_across_alphabet_widths() {
+        let mut enc = LzwEncoder::default();
+        let mut x = 0x1729_1234u32;
+        for bits in (2..=8u8).chain((2..=8).rev()) {
+            let mask = (1u32 << bits) - 1;
+            let data: Vec<u8> = (0..65_536)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    (x & mask) as u8
+                })
+                .collect();
+            let mut out = Vec::new();
+            enc.encode(bits, &data, None, None, &mut out);
+            let mut blocks = &out[1..];
+            let mut raw = Vec::new();
+            while blocks[0] != 0 {
+                let n = blocks[0] as usize;
+                raw.extend_from_slice(&blocks[1..=n]);
+                blocks = &blocks[n + 1..];
+            }
+            assert_eq!(lzw_decode(bits, &raw, data.len()), data);
+        }
     }
 
     #[test]
