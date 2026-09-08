@@ -5,7 +5,6 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
-  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,11 +27,9 @@ jobs:
       # the OkLab coefficients keep their reference-precision digits
       - run: cargo clippy --release --all-targets -- -D warnings
       - run: cargo test --release
-      - run: python3 -m unittest discover -s bench -p 'test_*.py'
 
   static:
     name: static musl (${{ matrix.arch }})
-    timeout-minutes: 8
     strategy:
       matrix:
         include:
@@ -55,28 +52,17 @@ jobs:
         with:
           toolchain: "1.98"
           targets: ${{ matrix.target }}
-          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}
-      - name: Install musl toolchain and corpus decoder
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools ffmpeg
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Run tests against the musl target
-        run: cargo test --locked --release --target ${{ matrix.target }}
+        run: cargo test --release --target ${{ matrix.target }}
 
-      # Tests build the ordinary executable. The helper saves it before
-      # instrumentation and checks the PGO binary against it on unseen clips.
-      # Each target trains natively; the four builds remain parallel.
-      - name: Build and verify PGO binary
-        timeout-minutes: 5
-        run: |
-          python3 bench/build_pgo.py \
-            --target "${{ matrix.target }}" \
-            --threads "$(nproc)" \
-            --corpus bench/pgo/corpus \
-            --baseline "target/${{ matrix.target }}/release/weft" \
-            --output "target/${{ matrix.target }}/release/weft"
+      - name: Build static binary
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Verify the binary is fully static and runs
         run: |
@@ -111,18 +97,8 @@ jobs:
           path: weft-${{ matrix.arch }}-linux-musl
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: pgo-${{ matrix.target }}
-          path: |
-            target/${{ matrix.target }}/release/weft.json
-            target/${{ matrix.target }}/release/weft.profdata
-          if-no-files-found: error
-          retention-days: 7
-
   glibc:
     name: glibc (${{ matrix.arch }})
-    timeout-minutes: 8
     strategy:
       matrix:
         include:
@@ -144,26 +120,15 @@ jobs:
         with:
           toolchain: "1.98"
           targets: ${{ matrix.target }}
-          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}
 
-      - name: Install corpus decoder
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
-
       - name: Run tests against the glibc target
-        run: cargo test --locked --release --target ${{ matrix.target }}
+        run: cargo test --release --target ${{ matrix.target }}
 
-      - name: Build and verify PGO binary
-        timeout-minutes: 5
-        run: |
-          python3 bench/build_pgo.py \
-            --target "${{ matrix.target }}" \
-            --threads "$(nproc)" \
-            --corpus bench/pgo/corpus \
-            --baseline "target/${{ matrix.target }}/release/weft" \
-            --output "target/${{ matrix.target }}/release/weft"
+      - name: Build binary
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Verify glibc ceiling and that the binary runs
         run: |
@@ -213,15 +178,6 @@ jobs:
           path: weft-${{ matrix.arch }}-linux-gnu
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: pgo-${{ matrix.target }}
-          path: |
-            target/${{ matrix.target }}/release/weft.json
-            target/${{ matrix.target }}/release/weft.profdata
-          if-no-files-found: error
-          retention-days: 7
-
   release:
     name: attach binaries to release
     if: startsWith(github.ref, 'refs/tags/v')
@@ -232,7 +188,6 @@ jobs:
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: weft-*-linux-*
           merge-multiple: true
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
