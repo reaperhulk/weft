@@ -139,8 +139,19 @@ impl QuantScratch {
     /// memo cache so the workers' tables share L3 rather than evict each
     /// other (see `palette::IDX_CACHE_BUDGET`).
     pub fn new(w: usize, nthreads: usize) -> Self {
+        Self::with_cache(w, crate::palette::IdxCache::for_threads(nthreads))
+    }
+
+    /// Shared RGB lookup replaces the per-worker memo. A minimal memo
+    /// keeps the common quantizer interface without allocating its usual
+    /// per-worker table; shared-map lookups never probe these slots.
+    pub fn new_shared(w: usize) -> Self {
+        Self::with_cache(w, crate::palette::IdxCache::with_slots(2))
+    }
+
+    fn with_cache(w: usize, cache: crate::palette::IdxCache) -> Self {
         QuantScratch {
-            cache: crate::palette::IdxCache::for_threads(nthreads),
+            cache,
             row: vec![0u8; w * 4],
             row2: vec![0u8; w * 4],
             keys: vec![0; w],

@@ -375,19 +375,18 @@ mostly idles, it costs 13% less CPU than rayon did (see
    emits the Lab average of its colors. Boxes that collapse to (or are
    ≥99% dominated by) one exact color emit that color byte-exactly.
    Sources with ≤255 distinct colors skip straight to a lossless palette.
-3. **Exact nearest-color lookup** via per-cell candidate lists over a
-   6-bit/channel RGB grid (locally sorted search): a triangle-inequality
-   bound makes the argmin over the cell's candidates the true OkLab
-   nearest for every color in the cell. Single-candidate cells answer from
-   one table load, but on real footage 90-98% of *pixels* land in
-   multi-candidate cells, so the hot path is really a probe of a
-   per-thread direct-mapped memo cache, with the grid touched only on a
-   miss. That cache is sized by dividing a fixed budget across the
-   workers rather than fixing a per-worker size: what decides whether a
-   probe is cheap is the sum of the workers' tables against the L3 they
-   share, and past that point a cache *hit* costs a DRAM round trip. The
-   build's 262k-cell × 256-color distance sweep runs on fearless_simd's
-   portable f32 lanes.
+3. **Exact nearest-color lookup** for quantized input uses one shared,
+   collision-free RGB-indexed cache (16 MiB) instead of per-worker hash
+   caches. Before quantization, classify the actual histogram colors, or
+   all 64 integer colors in each occupied folded-histogram cell. The latter
+   uses conservative candidate bounds and eight SIMD query lanes sharing
+   each candidate load. This avoids constructing the full-domain grid and
+   repeatedly resolving the same colors on different workers. Dither colors
+   outside the preclassified source region use an exact OkLab kd-tree
+   search and populate the shared cache on demand. Atomic byte entries
+   publish complete indices; concurrent misses compute the same result.
+   Sierra2 error diffusion and inputs whose colors already fit the palette
+   retain the existing grid-candidate lookup and per-worker memo path.
 
 Two hot paths are vectorized with fearless_simd behind runtime dispatch
 (SSE4.2/AVX2/AVX-512/NEON picked per machine, independent of the build's
@@ -401,7 +400,8 @@ slice `==` lowers to libc `memcmp`, which musl implements as a
 byte-at-a-time loop — that single call site made the static binary's
 histogram pass up to 6× slower. Verified not to help: sierra2 error diffusion (the
 carry→lookup→error chain is latency-bound, not throughput-bound), LZW (a
-serial hash walk), and palette lookups (gather-bound). Known follow-up: a
+serial hash walk), and earlier per-pixel palette lookups (gather-bound). The source-cell
+classifier instead vectorizes queries that share a candidate list. Known follow-up: a
 radix sort on the cut axis inside median cut (mandel's remaining
 hotspot).
 4. **Quantize + dither, parallel per frame.** Blue-noise ordered dither
@@ -450,6 +450,10 @@ from where the last attempt stopped rather than from zero. It also carries
 the measurement discipline this benchmark needs (interleave A/B runs; the
 `read+hist` noise floor is ~5%), which is worth reading before producing
 any number of your own.
+
+The [M5 source-color classification investigation](bench/m5-source-cache.md)
+records the general quantization change, fresh random Frinkiac holdout,
+concurrent batches, and the limits of the available architecture measurements.
 
 ## License
 

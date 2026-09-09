@@ -1109,10 +1109,92 @@ pub const MULTI: u8 = 0xFF;
 /// slow path, never a wrong one.
 const SCAN_ALL: u32 = (1 << 24) - 1;
 
-/// Per-grid-cell candidate lists. `lookup` returns the palette index whose
-/// OkLab distance to the query color is minimal; for most cells there is a
-/// single candidate and the search collapses to one load.
+/// Balanced palette search used for colors absent from the source cache.
+#[derive(Clone, Copy)]
+struct KdNode {
+    color: u8,
+    axis: usize,
+    left: usize,
+    right: usize,
+}
+
+fn kd_build(pal: &[[f32; 3]]) -> Vec<KdNode> {
+    fn build(pal: &[[f32; 3]], ids: &mut [usize], out: &mut Vec<KdNode>) -> usize {
+        if ids.is_empty() {
+            return usize::MAX;
+        }
+        let axis = (0..3)
+            .max_by(|&a, &b| {
+                let range = |axis| {
+                    let lo = ids
+                        .iter()
+                        .map(|&i| pal[i][axis])
+                        .fold(f32::INFINITY, f32::min);
+                    let hi = ids
+                        .iter()
+                        .map(|&i| pal[i][axis])
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    hi - lo
+                };
+                range(a).total_cmp(&range(b))
+            })
+            .unwrap();
+        ids.sort_unstable_by(|&a, &b| pal[a][axis].total_cmp(&pal[b][axis]).then(a.cmp(&b)));
+        let mid = ids.len() / 2;
+        let root = out.len();
+        out.push(KdNode {
+            color: ids[mid] as u8,
+            axis,
+            left: usize::MAX,
+            right: usize::MAX,
+        });
+        let (left, right) = ids.split_at_mut(mid);
+        out[root].left = build(pal, left, out);
+        out[root].right = build(pal, &mut right[1..], out);
+        root
+    }
+    let mut nodes = Vec::with_capacity(pal.len());
+    let mut ids: Vec<usize> = (0..pal.len()).collect();
+    build(pal, &mut ids, &mut nodes);
+    nodes
+}
+
+fn kd_nearest(nodes: &[KdNode], pal: &[[f32; 3]], q: [f32; 3]) -> u8 {
+    fn search(nodes: &[KdNode], pal: &[[f32; 3]], q: &[f32; 3], node: usize, best: &mut (f32, u8)) {
+        if node == usize::MAX {
+            return;
+        }
+        let n = nodes[node];
+        let color = &pal[n.color as usize];
+        let d = dist2(color, q);
+        if d < best.0 || (d == best.0 && n.color < best.1) {
+            *best = (d, n.color);
+        }
+        let delta = q[n.axis] - color[n.axis];
+        let (near, far) = if delta < 0.0 {
+            (n.left, n.right)
+        } else {
+            (n.right, n.left)
+        };
+        search(nodes, pal, q, near, best);
+        if delta * delta <= best.0 {
+            search(nodes, pal, q, far, best);
+        }
+    }
+    let mut best = (f32::MAX, 255);
+    search(nodes, pal, &q, 0, &mut best);
+    best.1
+}
+
+/// Exact nearest-color lookup. Quantized input uses a shared RGB-indexed
+/// cache; exact palettes retain the small-grid accelerator and local memo.
 pub struct NearestMap {
+    kd: Vec<KdNode>,
+    // Zero means unknown, otherwise palette index + 1 (indices stop at 254).
+    // Each entry publishes the complete result. Relaxed atomic access is
+    // sufficient: racing misses compute and store the same deterministic
+    // index, with no associated payload requiring acquire/release ordering.
+    shared: Vec<std::sync::atomic::AtomicU8>,
     /// Per-cell entry. Single-candidate cells (the fast path) pack
     /// `r<<24 | g<<16 | b<<8 | idx`, so the caller gets the palette color
     /// with the same load as the index (no dependent colors[] fetch).
@@ -1270,6 +1352,8 @@ impl NearestMap {
         }
         drop(interned);
         NearestMap {
+            kd: Vec::new(),
+            shared: Vec::new(),
             direct,
             cands,
             pal_rgb,
@@ -1281,6 +1365,39 @@ impl NearestMap {
         }
     }
 
+    /// Build the palette tree and a collision-free cache; source colors are
+    /// populated in parallel before quantization. Dither colors outside the
+    /// source's occupied cells are filled on demand through the tree.
+    pub fn build_source(colors: &[[u8; 3]]) -> Self {
+        let cv = LabConverter::new();
+        let pal_lab: Vec<[f32; 3]> = colors
+            .iter()
+            .map(|c| cv.srgb_to_oklab(c[0], c[1], c[2]))
+            .collect();
+        let mut pal_rgb = Box::new([0; 256]);
+        for (slot, c) in pal_rgb.iter_mut().zip(colors) {
+            *slot = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
+        }
+        Self {
+            kd: kd_build(&pal_lab),
+            shared: (0..1 << 24)
+                .map(|_| std::sync::atomic::AtomicU8::new(0))
+                .collect(),
+            direct: Vec::new(),
+            cands: Vec::new(),
+            pal_rgb,
+            #[cfg(target_arch = "aarch64")]
+            pal_lab4: pal_lab.iter().map(|p| [p[0], p[1], p[2], 0.0]).collect(),
+            pal_lab,
+            cv,
+            avg_cands: 0.0,
+        }
+    }
+
+    pub fn uses_shared_cache(&self) -> bool {
+        !self.shared.is_empty()
+    }
+
     /// Average candidates per cell — perf diagnostic.
     pub fn avg_candidates(&self) -> f32 {
         self.avg_cands
@@ -1290,6 +1407,9 @@ impl NearestMap {
     #[cfg_attr(not(test), allow(dead_code))]
     #[inline(always)]
     pub fn lookup(&self, r: u8, g: u8, b: u8) -> u8 {
+        if !self.kd.is_empty() {
+            return self.resolve_off(SCAN_ALL as usize, r, g, b);
+        }
         let key = grid_key(r, g, b);
         let d = self.direct[key];
         if (d & 0xFF) != MULTI as u32 {
@@ -1305,6 +1425,9 @@ impl NearestMap {
     /// the index keeps the caller's error math off a dependent load.
     #[inline(always)]
     pub fn lookup_packed(&self, cache: &mut IdxCache, r: u8, g: u8, b: u8) -> PackedNearest {
+        if !self.shared.is_empty() {
+            return self.lookup_shared(r, g, b);
+        }
         let key = grid_key(r, g, b);
         let d = self.direct[key];
         if (d & 0xFF) != MULTI as u32 {
@@ -1318,7 +1441,7 @@ impl NearestMap {
     /// the single-candidate `direct[]` fast path almost never hits — 90-98 %
     /// of pixels land in multi-candidate cells on measured clips — so
     /// probing the memo cache first turns the common case into one probe
-    /// of a per-thread table; the 1 MB `direct[]` table is only touched on
+    /// of a per-thread table; the 1 MiB `direct[]` table is only touched on
     /// a memo miss, where it either answers outright (single-candidate
     /// cell) or supplies the candidate-list offset for the resolve. Same
     /// result as `lookup_packed`: a memo entry is only ever a resolve
@@ -1332,6 +1455,9 @@ impl NearestMap {
         g: u8,
         b: u8,
     ) -> PackedNearest {
+        if !self.shared.is_empty() {
+            return self.lookup_shared(r, g, b);
+        }
         let (slot, color) = cache.slot(r, g, b);
         let e = cache.slots[slot];
         // the e != MAX guard keeps the empty sentinel (whose tag bits read
@@ -1360,6 +1486,92 @@ impl NearestMap {
             cache.slots[slot] = ((color as u64) << 40) | packed as u64;
         }
         packed
+    }
+
+    #[inline(always)]
+    fn lookup_shared(&self, r: u8, g: u8, b: u8) -> PackedNearest {
+        let color = ((r as usize) << 16) | ((g as usize) << 8) | b as usize;
+        let cached = self.shared[color].load(std::sync::atomic::Ordering::Relaxed);
+        if cached != 0 {
+            return self.packed(cached - 1);
+        }
+        let idx = self.lookup(r, g, b);
+        self.shared[color].store(idx + 1, std::sync::atomic::Ordering::Relaxed);
+        self.packed(idx)
+    }
+
+    /// Unfolded histograms list actual colors. Folded histograms identify
+    /// occupied 4x4x4 cells, so classify all 64 colors in those cells with
+    /// shared candidate lists and eight independent SIMD query lanes.
+    pub fn prewarm(&self, entries: &[(u32, u32)], coarse: bool) {
+        if self.shared.is_empty() {
+            return;
+        }
+        if !coarse {
+            pool::global().map(entries.len().div_ceil(256), |_, chunk| {
+                for &(c, _) in &entries[chunk * 256..((chunk + 1) * 256).min(entries.len())] {
+                    let idx = self.lookup((c >> 16) as u8, (c >> 8) as u8, c as u8);
+                    self.shared[c as usize].store(idx + 1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+            return;
+        }
+        let mut keys: Vec<usize> = entries
+            .iter()
+            .map(|&(c, _)| grid_key((c >> 16) as u8, (c >> 8) as u8, c as u8))
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let soa = crate::simdops::PalSoa::new(&self.pal_lab);
+        pool::global().map_init(
+            keys.len().div_ceil(64),
+            || (vec![0.0; soa.l.len()], Vec::new()),
+            |(dists, candidates), _, chunk| {
+                for &key in &keys[chunk * 64..((chunk + 1) * 64).min(keys.len())] {
+                    let rb = ((key >> 12) as u8) << 2;
+                    let gb = ((key >> 6) as u8 & 63) << 2;
+                    let bb = (key as u8 & 63) << 2;
+                    let indices = {
+                        let lr = std::array::from_fn(|i| {
+                            self.cv.linear(rb + if i & 1 != 0 { 3 } else { 0 })
+                        });
+                        let lg = std::array::from_fn(|i| {
+                            self.cv.linear(gb + if i & 2 != 0 { 3 } else { 0 })
+                        });
+                        let lb = std::array::from_fn(|i| {
+                            self.cv.linear(bb + if i & 4 != 0 { 3 } else { 0 })
+                        });
+                        let level = crate::simdops::level();
+                        let (q, rmax2) = crate::simdops::cell_geometry(level, &lr, &lg, &lb);
+                        let dmin2 = crate::simdops::cell_distances(level, &soa, q, dists);
+                        let bound = dmin2.sqrt() + 2.0 * rmax2.sqrt() + 1e-6;
+                        candidates.clear();
+                        crate::simdops::cell_candidates(
+                            &dists[..self.pal_lab.len()],
+                            bound * bound,
+                            candidates,
+                        );
+                        if candidates.len() == 1 {
+                            [candidates[0]; 64]
+                        } else {
+                            crate::simdops::classify_cell(
+                                &self.cv,
+                                &self.pal_lab,
+                                candidates,
+                                [rb, gb, bb],
+                            )
+                        }
+                    };
+                    for (i, idx) in indices.into_iter().enumerate() {
+                        let r = rb + (i >> 4) as u8;
+                        let g = gb + ((i >> 2) & 3) as u8;
+                        let b = bb + (i & 3) as u8;
+                        self.shared[((r as usize) << 16) | ((g as usize) << 8) | b as usize]
+                            .store(idx + 1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            },
+        );
     }
 
     /// Packed `rgb<<8 | idx` for a palette index (for callers that stored
@@ -1417,17 +1629,31 @@ impl NearestMap {
     /// hash-slot load, and the slot address needs only the color bytes.
     #[inline(always)]
     pub fn prefetch_cache_slot(&self, cache: &IdxCache, r: u8, g: u8, b: u8) {
-        prefetch_index(&cache.slots, cache.slot(r, g, b).0);
+        if !self.shared.is_empty() {
+            prefetch_index(
+                &self.shared,
+                ((r as usize) << 16) | ((g as usize) << 8) | b as usize,
+            );
+        } else {
+            prefetch_index(&cache.slots, cache.slot(r, g, b).0);
+        }
     }
 
     /// Prefetch the fast-path cell for a color a few pixels ahead of the
-    /// current one: the direct[] table is 1MB, and on colorful content
+    /// current one: the direct[] table is 1 MiB, and on colorful content
     /// the dependent load is what stalls the quantize loops. The raw
     /// (pre-dither) color is close enough to the adjusted one to land on
     /// the right cache line almost always.
     #[inline(always)]
     pub fn prefetch(&self, r: u8, g: u8, b: u8) {
-        prefetch_index(&self.direct, grid_key(r, g, b));
+        if !self.shared.is_empty() {
+            prefetch_index(
+                &self.shared,
+                ((r as usize) << 16) | ((g as usize) << 8) | b as usize,
+            );
+        } else {
+            prefetch_index(&self.direct, grid_key(r, g, b));
+        }
     }
 
     /// Scan the 0xFF-terminated candidate list at `off` for the OkLab
@@ -1435,6 +1661,9 @@ impl NearestMap {
     #[inline(never)]
     fn resolve_off(&self, off: usize, r: u8, g: u8, b: u8) -> u8 {
         let q = self.cv.srgb_to_oklab_fast(r, g, b);
+        if !self.kd.is_empty() {
+            return kd_nearest(&self.kd, &self.pal_lab, q);
+        }
         let mut best = 0u8;
         let mut best_d = f32::MAX;
         if off == SCAN_ALL as usize {
@@ -1610,6 +1839,100 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn source_cache_and_tree_match_reference_with_cold_warm_and_coarse_queries() {
+        fn next(s: &mut u32) -> u32 {
+            *s ^= *s << 13;
+            *s ^= *s >> 17;
+            *s ^= *s << 5;
+            *s
+        }
+        let mut state = 731u32;
+        for count in [1, 2, 18, 255] {
+            let mut colors: Vec<[u8; 3]> = (0..count)
+                .map(|_| {
+                    let c = next(&mut state);
+                    [c as u8, (c >> 8) as u8, (c >> 16) as u8]
+                })
+                .collect();
+            if count > 2 {
+                colors[count - 2] = colors[0];
+            }
+            colors[count - 1] = [255; 3];
+            let reference = NearestMap::build(&colors);
+            let source = NearestMap::build_source(&colors);
+            let entries: Vec<(u32, u32)> =
+                (0..256).map(|_| (next(&mut state) & 0xffffff, 1)).collect();
+            source.prewarm(&entries, false);
+            let mut memo = IdxCache::with_slots(2);
+            let mut check = |r, g, b| {
+                let expected = reference.packed(reference.lookup(r, g, b));
+                assert_eq!(source.lookup(r, g, b), expected as u8);
+                assert_eq!(source.lookup_packed(&mut memo, r, g, b), expected);
+                assert_eq!(
+                    source.lookup_cache_first(&mut memo, grid_key(r, g, b) as u32, r, g, b),
+                    expected
+                );
+            };
+            for c in &colors {
+                check(c[0], c[1], c[2]);
+            }
+            for _ in 0..20_000 {
+                let c = next(&mut state);
+                check(c as u8, (c >> 8) as u8, (c >> 16) as u8);
+            }
+            source.prewarm(&entries, true);
+            for &(c, _) in &entries {
+                let rb = (c >> 16) as u8 & 252;
+                let gb = (c >> 8) as u8 & 252;
+                let bb = c as u8 & 252;
+                for r in rb..=rb + 3 {
+                    for g in gb..=gb + 3 {
+                        for b in bb..=bb + 3 {
+                            check(r, g, b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_cache_racing_misses_publish_complete_indices() {
+        let colors: Vec<[u8; 3]> = (0..255u32)
+            .map(|i| [(i * 17) as u8, (i * 31) as u8, (i * 53) as u8])
+            .collect();
+        let reference = NearestMap::build(&colors);
+        let source = NearestMap::build_source(&colors);
+        let queries: Vec<([u8; 3], u32)> = (0..4096u32)
+            .map(|i| {
+                let c = [(i * 37) as u8, (i >> 4) as u8, (i * 73) as u8];
+                (c, reference.packed(reference.lookup(c[0], c[1], c[2])))
+            })
+            .collect();
+        let barrier = std::sync::Barrier::new(6);
+        std::thread::scope(|scope| {
+            for _ in 0..6 {
+                scope.spawn(|| {
+                    let mut cache = IdxCache::with_slots(2);
+                    barrier.wait();
+                    for &(c, expected) in &queries {
+                        assert_eq!(
+                            source.lookup_cache_first(
+                                &mut cache,
+                                grid_key(c[0], c[1], c[2]) as u32,
+                                c[0],
+                                c[1],
+                                c[2]
+                            ),
+                            expected
+                        );
+                    }
+                });
+            }
+        });
     }
 
     #[test]
