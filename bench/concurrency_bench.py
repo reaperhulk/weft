@@ -9,6 +9,7 @@ from pathlib import Path
 import platform
 import random
 import resource
+import shlex
 import statistics
 import subprocess
 import time
@@ -21,6 +22,7 @@ p.add_argument('--threads', type=int, default=18)
 p.add_argument('--concurrency', default='1,10')
 p.add_argument('--jobs', type=int, default=24)
 p.add_argument('--runs', type=int, default=5)
+p.add_argument('--args', default='', help='additional weft arguments, shell-quoted')
 a = p.parse_args()
 limits = [int(c) for c in a.concurrency.split(',')]
 if min([a.threads, a.jobs, a.runs, *limits]) < 1:
@@ -43,7 +45,7 @@ def batch(label, concurrency, iteration):
         with (a.manifest.parent / (c['name'] + '.rgba')).open('rb') as src, dst.open('wb') as out:
             result = subprocess.run([binaries[label], '--format', 'rgba', '--size',
                                      f"{c['width']}x{c['height']}", '--fps', str(Fraction(c['fps'])),
-                                     '--threads', str(a.threads), '--stats'], stdin=src, stdout=out,
+                                     '--threads', str(a.threads), '--stats', *shlex.split(a.args)], stdin=src, stdout=out,
                                     stderr=subprocess.PIPE, check=True)
         return c['name'], dst, result.stderr.decode()
 
@@ -80,7 +82,7 @@ for concurrency, iteration in order:
 a.output.write_text(json.dumps(dict(platform=platform.platform(), binaries=binaries,
                                     binary_sha256={l: hashlib.sha256(Path(b).read_bytes()).hexdigest()
                                                    for l, b in binaries.items()},
-                                    clips=clips, threads=a.threads, jobs=a.jobs, runs=a.runs,
+                                    clips=clips, threads=a.threads, jobs=a.jobs, runs=a.runs, args=a.args,
                                     records=records), indent=2) + '\n')
 for concurrency in limits:
     medians = {l: statistics.median(r['ms_per_encode'] for r in records

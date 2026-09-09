@@ -1262,6 +1262,10 @@ fn hold_rgba_mean_impl<S: Simd>(
     t: u32,
     tmax: u32,
 ) {
+    // Consecutive pixels often share a noise bin. Four independent
+    // accumulators avoid serial load/add/store dependencies on that bin;
+    // their exact integer counts are combined once after the vector loop.
+    let mut banks = [[0u32; 256]; 4];
     let n = cur.len() / 4;
     let tv = i32x16::splat(simd, t as i32);
     let tmv = i32x16::splat(simd, tmax as i32);
@@ -1274,8 +1278,8 @@ fn hold_rgba_mean_impl<S: Simd>(
             let r = px16(simd, &raw_prev[i * 4..]);
             let d = sad4(simd, a, r).min(cap);
             let arr: [i32; 16] = d.into();
-            for x in arr {
-                hist[x as usize] += 1;
+            for (j, x) in arr.into_iter().enumerate() {
+                banks[j % 4][x as usize] += 1;
             }
         }
         a.bitcast::<u8x64<S>>()
@@ -1298,6 +1302,9 @@ fn hold_rgba_mean_impl<S: Simd>(
         mean_step(c_hi, m_hi, k_hi).store_slice(&mut mean[i * 4 + 32..i * 4 + 64]);
         i += 16;
         v += 1;
+    }
+    for (b, out) in hist.iter_mut().enumerate() {
+        *out += banks[0][b] + banks[1][b] + banks[2][b] + banks[3][b];
     }
     let tail = i * 4;
     // tail pixels: sampled into the histogram only if the stride lands
@@ -1491,6 +1498,64 @@ mod hold_mean_smooth_tests {
             want_h[d.min(255) as usize] += 1;
         }
         assert_eq!(hist, want_h);
+    }
+
+    #[test]
+    fn hold_histogram_banks_match_scalar_across_frames_and_tails() {
+        for n in [
+            0, 1, 15, 16, 17, 63, 64, 65, 79, 80, 81, 127, 128, 129, 256, 1025,
+        ] {
+            let base = noise(n * 4, 9);
+            let mut prev = base.clone();
+            let mut mean: Vec<i16> = base
+                .iter()
+                .map(|&v| (v as i16) << hold::MEAN_SHIFT)
+                .collect();
+            let mut raw_prev = base.clone();
+            for (frame, t) in [0, 1, 4, 12, 64, 765].into_iter().enumerate() {
+                // Include completely unchanged frames (all samples share a
+                // histogram bin), noisy frames, and changing alpha bytes.
+                let raw = if frame % 3 == 0 {
+                    base.clone()
+                } else {
+                    jitter(&base, frame as u32 + 1, 4)
+                };
+                let mut expected = raw.clone();
+                let mut expected_mean = mean.clone();
+                hold::rgba_mean(
+                    &mut expected,
+                    &prev,
+                    &mut expected_mean,
+                    t,
+                    hold::max_deviation(t),
+                );
+                let initial = std::array::from_fn(|i| (i % 3) as u32);
+                let mut expected_hist = initial;
+                for p in (0..n).filter(|p| p / 16 % HOLD_HIST_STRIDE == 0) {
+                    let d: u32 = (0..4)
+                        .map(|k| raw[p * 4 + k].abs_diff(raw_prev[p * 4 + k]) as u32)
+                        .sum();
+                    expected_hist[d.min(255) as usize] += 1;
+                }
+                let mut actual = raw.clone();
+                let mut hist = initial;
+                hold_rgba_mean(
+                    level(),
+                    &mut actual,
+                    &mut prev,
+                    &mut mean,
+                    &mut raw_prev,
+                    &mut hist,
+                    t,
+                    hold::max_deviation(t),
+                );
+                assert_eq!(actual, expected, "n={n}, frame={frame}");
+                assert_eq!(prev, expected);
+                assert_eq!(mean, expected_mean);
+                assert_eq!(raw_prev, raw);
+                assert_eq!(hist, expected_hist, "n={n}, frame={frame}");
+            }
+        }
     }
 
     #[test]
