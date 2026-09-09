@@ -1899,11 +1899,11 @@ mod cell_classification_tests {
                         let blues = std::array::from_fn::<_, 8, _>(|i| cv.linear((b + i) as u8));
                         let lab = lab8_exact(simd, lr, lg, f32x8::from_slice(simd, &blues));
                         let lab: [[f32; 8]; 3] = lab.map(Into::into);
-                        for i in 0..8 {
+                        for (i, _) in lab[0].iter().enumerate() {
                             let expected = cv.srgb_to_oklab_fast(r, g, (b + i) as u8);
-                            for channel in 0..3 {
+                            for (channel, values) in lab.iter().enumerate() {
                                 assert_eq!(
-                                    lab[channel][i].to_bits(),
+                                    values[i].to_bits(),
                                     expected[channel].to_bits(),
                                     "{r},{g},{} channel {channel}",
                                     b + i

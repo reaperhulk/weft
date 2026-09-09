@@ -74,14 +74,17 @@ pool benchmark is ignored. New tests compare cold, warm and coarse-cell queries,
 small/full palettes, duplicate ties, the maximum opaque palette index, and racing
 cache misses. SIMD conversion is checked bit-for-bit against the existing query
 conversion for all 16,777,216 RGB colors on the active M5 backend.
-`cargo clippy --release -- -D warnings` and formatting checks pass.
+`cargo clippy --release --all-targets -- -D warnings` and formatting checks pass.
+Native x86-64 and ARM64 Linux glibc/musl test and build jobs also pass.
+A 48-frame real-video excerpt through YUV420, YUV422 and YUV444 input at
+18, 64 and 256 requested colors produced identical GIF bytes in all nine cases.
 
 The lookup cache occupies 16 MiB per encode. It replaces the grid and per-worker
 memo allocations for this strategy, but process peak memory still increased on
 most clips. Three measurements per clip, taking each binary's median child peak
 RSS, showed changes from −1.8 to +17.2 MiB. This needs particular attention under
-server concurrency. Native x86 correctness, instruction counts, CPU time and
-concurrent throughput remain unmeasured for this proposal; keep the PR in draft
+server concurrency. Native x86 performance, including instruction counts, CPU
+time and concurrent throughput, remains unmeasured; keep the PR in draft
 until those are checked. Portable SIMD availability alone is not evidence of an
 x86 speedup, and the contributions of SIMD versus caching have not been isolated
 in a final-binary ablation.
