@@ -1,0 +1,146 @@
+[
+  {
+    "name": "S01E01-2000",
+    "width": 480,
+    "height": 360,
+    "fps": "24.0",
+    "frames": 48,
+    "sha256": "09b0c54ccea27b615951819d4419fa5b86554f8350cd1f525ec71b31940ee155",
+    "random_holdout": false,
+    "request": {
+      "episode": "S01E01",
+      "start": 300000,
+      "end": 302000,
+      "overlays": []
+    },
+    "mp4_sha256": "d90cf47ed4763229d2626b0745fde72b34e5df5bb019c52c2c173e75de7d4e1d"
+  },
+  {
+    "name": "S08E14-5500",
+    "width": 480,
+    "height": 360,
+    "fps": "24.0",
+    "frames": 132,
+    "sha256": "56d2a04d88b737bde53fcaee09c069c3e1e7370f4c94bf9727db9ba3af34767e",
+    "random_holdout": false,
+    "request": {
+      "episode": "S08E14",
+      "start": 650000,
+      "end": 655500,
+      "overlays": []
+    },
+    "mp4_sha256": "fa1b0823f811d1979a5194b00bce4811fc92ca9f05b1c3b1758bb66d12595c59"
+  },
+  {
+    "name": "S18E10-9000",
+    "width": 480,
+    "height": 360,
+    "fps": "24.0",
+    "frames": 216,
+    "sha256": "79d33d75b40c414afe468578ff819d5acbe1254700e7560d85fa34423dec0aa5",
+    "random_holdout": false,
+    "request": {
+      "episode": "S18E10",
+      "start": 1000000,
+      "end": 1009000,
+      "overlays": []
+    },
+    "mp4_sha256": "7e8bd734d3e6173bbdcdba23fd75137b4dd2200ba16aa7b9e3eb7693a83e05c7"
+  },
+  {
+    "name": "S35E15-9800",
+    "width": 480,
+    "height": 270,
+    "fps": "24.0",
+    "frames": 235,
+    "sha256": "12dbcfc7e3495191750bf925cb08879587720cc638aff25d1f62bcdc3a05a019",
+    "random_holdout": false,
+    "request": {
+      "episode": "S35E15",
+      "start": 1025000,
+      "end": 1034800,
+      "overlays": []
+    },
+    "mp4_sha256": "473e306f60ab0c1537606aee15de88fe25cf0886a76c6e10f900852eee458edd"
+  },
+  {
+    "name": "01-S14E15-1030699",
+    "width": 480,
+    "height": 360,
+    "fps": "24.0",
+    "frames": 144,
+    "request": {
+      "episode": "S14E15",
+      "start": 1030699,
+      "end": 1036699,
+      "overlays": []
+    },
+    "mp4_sha256": "265858a88c4a91a56698cf9860fd5e2402af013c32c438488d5cb5571645e595",
+    "sha256": "20ede72f49640bdcd4488217e5aaa2f58d354f57d38685e28aa4d260b5ae63b0",
+    "random_holdout": true
+  },
+  {
+    "name": "02-S06E08-1064692",
+    "width": 480,
+    "height": 360,
+    "fps": "24.0",
+    "frames": 144,
+    "request": {
+      "episode": "S06E08",
+      "start": 1064692,
+      "end": 1070692,
+      "overlays": []
+    },
+    "mp4_sha256": "1042d720029faf404e3148bd1601441b49bbac50d8cb79acb5495ea710927945",
+    "sha256": "c804e704f2edd097d9e24cffe053a5a4ab2e9852e3c32b0f8173ad5a9ce5b6c0",
+    "random_holdout": true
+  },
+  {
+    "name": "03-S20E10-984820",
+    "width": 480,
+    "height": 270,
+    "fps": "24.0",
+    "frames": 144,
+    "request": {
+      "episode": "S20E10",
+      "start": 984820,
+      "end": 990820,
+      "overlays": []
+    },
+    "mp4_sha256": "fc8eeb20af6937bc91f7bc66b1444d994adabc204061e35892bb82890ae01145",
+    "sha256": "5330aa640b5e60bd2535a36e86c8ff720b62ee12856e255da93719efd30828aa",
+    "random_holdout": true
+  },
+  {
+    "name": "04-S21E09-433436",
+    "width": 480,
+    "height": 270,
+    "fps": "24.0",
+    "frames": 144,
+    "request": {
+      "episode": "S21E09",
+      "start": 433436,
+      "end": 439436,
+      "overlays": []
+    },
+    "mp4_sha256": "6632f941a7107e96270edb72ca50be8de41da7ed2426fb065e0e5324e989207b",
+    "sha256": "eb17209abe3eb729a0c874a77c112d833d15105f4fc401e129e986cbeddf8218",
+    "random_holdout": true
+  },
+  {
+    "name": "05-S19E13-1001504",
+    "width": 480,
+    "height": 360,
+    "fps": "24.0",
+    "frames": 144,
+    "request": {
+      "episode": "S19E13",
+      "start": 1001504,
+      "end": 1007504,
+      "overlays": []
+    },
+    "mp4_sha256": "3842d7bbfad25d2f412f005298b1bd1fb045e7c8f6fba05b909656db068a65de",
+    "sha256": "6e17b4ca5b1844f4b2ccab554de5460f6adfe278c4a6d40ca930e7aaed19ee76",
+    "random_holdout": true
+  }
+]

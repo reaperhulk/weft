@@ -1805,3 +1805,115 @@ mod band_tests {
         );
     }
 }
+/// Classify all 64 integer colors in a six-bit RGB cell. Each SIMD lane
+/// holds a query, so a candidate's Lab value is broadcast once to eight
+/// queries instead of loading and horizontally reducing it per query.
+pub fn classify_cell(
+    cv: &crate::oklab::LabConverter,
+    pal: &[[f32; 3]],
+    candidates: &[u8],
+    base: [u8; 3],
+) -> [u8; 64] {
+    fearless_simd::dispatch!(level(), simd => classify_cell_impl(simd, cv, pal, candidates, base))
+}
+
+#[inline(always)]
+fn lab8_exact<S: Simd>(simd: S, lr: f32x8<S>, lg: f32x8<S>, lb: f32x8<S>) -> [f32x8<S>; 3] {
+    let l = lr * 0.4122214708 + lg * 0.5363325363 + lb * 0.0514459929;
+    let m = lr * 0.2119034982 + lg * 0.6806995451 + lb * 0.1073969566;
+    let s = lr * 0.0883024619 + lg * 0.2817188376 + lb * 0.6299787005;
+    let root = |x: f32x8<S>| {
+        let bits: [u32; 8] = x.bitcast::<u32x8<S>>().into();
+        let seeds = bits.map(|b| b / 3 + 709_921_077);
+        let mut y: f32x8<S> = u32x8::from_slice(simd, &seeds).bitcast();
+        let x2 = x + x;
+        for _ in 0..2 {
+            let y3 = y * y * y;
+            y *= (y3 + x2) / (y3 + y3 + x);
+        }
+        y
+    };
+    let l = root(l);
+    let m = root(m);
+    let s = root(s);
+    [
+        l * 0.2104542553 + m * 0.7936177850 + s * -0.0040720468,
+        l * 1.9779984951 + m * -2.4285922050 + s * 0.4505937099,
+        l * 0.0259040371 + m * 0.7827717662 + s * -0.8086757660,
+    ]
+}
+
+#[inline(always)]
+fn classify_cell_impl<S: Simd>(
+    simd: S,
+    cv: &crate::oklab::LabConverter,
+    pal: &[[f32; 3]],
+    candidates: &[u8],
+    base: [u8; 3],
+) -> [u8; 64] {
+    let mut out = [0; 64];
+    let bl = std::array::from_fn::<_, 8, _>(|i| cv.linear(base[2] + (i & 3) as u8));
+    let lb = f32x8::from_slice(simd, &bl);
+    for start in (0..64).step_by(8) {
+        let lr = f32x8::splat(simd, cv.linear(base[0] + (start >> 4) as u8));
+        let gl =
+            std::array::from_fn::<_, 8, _>(|i| cv.linear(base[1] + (((start + i) >> 2) & 3) as u8));
+        let [ql, qa, qb] = lab8_exact(simd, lr, f32x8::from_slice(simd, &gl), lb);
+        let mut best = f32x8::splat(simd, f32::MAX);
+        let mut indices = u32x8::splat(simd, 0);
+        for &idx in candidates {
+            if idx == 255 {
+                break;
+            }
+            let p = pal[idx as usize];
+            let dl = f32x8::splat(simd, p[0]) - ql;
+            let da = f32x8::splat(simd, p[1]) - qa;
+            let db = f32x8::splat(simd, p[2]) - qb;
+            let d = dl * dl + da * da + db * db;
+            indices = d
+                .simd_lt(best)
+                .select(u32x8::splat(simd, idx as u32), indices);
+            best = best.min(d);
+        }
+        let indices: [u32; 8] = indices.into();
+        for (o, i) in out[start..start + 8].iter_mut().zip(indices) {
+            *o = i as u8;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod cell_classification_tests {
+    use super::*;
+
+    #[test]
+    fn batched_lab_matches_scalar_for_every_rgb_color() {
+        fn check<S: Simd>(simd: S) {
+            let cv = crate::oklab::LabConverter::new();
+            for r in 0..=255u8 {
+                let lr = f32x8::splat(simd, cv.linear(r));
+                for g in 0..=255u8 {
+                    let lg = f32x8::splat(simd, cv.linear(g));
+                    for b in (0..256).step_by(8) {
+                        let blues = std::array::from_fn::<_, 8, _>(|i| cv.linear((b + i) as u8));
+                        let lab = lab8_exact(simd, lr, lg, f32x8::from_slice(simd, &blues));
+                        let lab: [[f32; 8]; 3] = lab.map(Into::into);
+                        for i in 0..8 {
+                            let expected = cv.srgb_to_oklab_fast(r, g, (b + i) as u8);
+                            for channel in 0..3 {
+                                assert_eq!(
+                                    lab[channel][i].to_bits(),
+                                    expected[channel].to_bits(),
+                                    "{r},{g},{} channel {channel}",
+                                    b + i
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fearless_simd::dispatch!(level(), simd => check(simd));
+    }
+}

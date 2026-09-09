@@ -5,6 +5,7 @@ Example: python3 bench/arm64.py --binary before=bench/out/arm64/baseline \
     --binary after=target/release/weft --runs 7 --output bench/out/arm64/results.json
 """
 import argparse
+from fractions import Fraction
 import hashlib
 import json
 import math
@@ -27,13 +28,14 @@ def main():
     parser.add_argument("--clips", default="", help="comma-separated clip numbers (default all)")
     parser.add_argument("--args", default="", help="additional weft arguments, shell-quoted")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path, default=ROOT / "data/frinkiac/manifest.json")
     args = parser.parse_args()
     if args.runs < 1:
         parser.error("--runs must be positive")
     import shlex
     binaries = {label: str(Path(path).resolve()) for label, path in
                 (b.split("=", 1) for b in args.binary)}
-    clips = json.loads((ROOT / "data/frinkiac/manifest.json").read_text())
+    clips = json.loads(args.manifest.read_text())
     if args.clips:
         selected = {int(v) for v in args.clips.split(",")}
         clips = [c for i, c in enumerate(clips, 1) if i in selected]
@@ -46,10 +48,10 @@ def main():
 
     def run(clip, workers, label, iteration):
         command = [binaries[label], "--format", "rgba", "--size",
-                   f"{clip['width']}x{clip['height']}", "--fps", clip["fps"],
+                   f"{clip['width']}x{clip['height']}", "--fps", str(Fraction(clip["fps"])),
                    "--threads", str(workers), "--stats", *shlex.split(args.args)]
         output = args.output.parent / f"{label}.gif"
-        with (ROOT / "data/frinkiac" / (clip["name"] + ".rgba")).open("rb") as src, output.open("wb") as dst:
+        with (args.manifest.parent / (clip["name"] + ".rgba")).open("rb") as src, output.open("wb") as dst:
             before = resource.getrusage(resource.RUSAGE_CHILDREN)
             start = time.perf_counter()
             proc = subprocess.run(command, stdin=src, stdout=dst, stderr=subprocess.PIPE, check=True)

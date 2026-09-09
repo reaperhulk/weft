@@ -907,7 +907,14 @@ fn run(args: &Args) -> io::Result<()> {
     let gct_bits = (usize::BITS - (slots - 1).leading_zeros()).max(1) as u8;
     let min_code_size = gct_bits.max(2);
     let t_lut_start = Instant::now();
-    let nearest = palette::NearestMap::build(&colors);
+    // Error diffusion queries many colors outside the source region; its
+    // serial dependency chain favors the existing local memo/grid lookup.
+    let nearest = if n_entries < args.colors || args.dither == Dither::Sierra2_4a {
+        palette::NearestMap::build(&colors)
+    } else {
+        palette::NearestMap::build_source(&colors)
+    };
+    nearest.prewarm(&entries, coarse_binned || n_folded != n_entries);
     let t_lut = t_lut_start.elapsed();
     let t_pal = t2.elapsed();
     if args.stats {
@@ -918,12 +925,20 @@ fn run(args: &Args) -> io::Result<()> {
         } else {
             String::new()
         };
+        let lookup_stats = if nearest.uses_shared_cache() {
+            "source-color cache + kd-tree fallback".to_string()
+        } else {
+            format!(
+                "nearest-map avg candidates/cell {:.2}",
+                nearest.avg_candidates()
+            )
+        };
         eprintln!(
-            "  palette: {} colors from {} entries{}, nearest-map avg candidates/cell {:.2}, median_cut {:?}, lloyd {:?}, nearest-map {:?}",
+            "  palette: {} colors from {} entries{}, {}, median_cut {:?}, lloyd {:?}, nearest-map {:?}",
             colors.len(),
             n_entries,
             folded,
-            nearest.avg_candidates(),
+            lookup_stats,
             t_cut,
             t_lloyd,
             t_lut
@@ -1049,7 +1064,13 @@ fn run(args: &Args) -> io::Result<()> {
             pool.for_each_into(jobs, |wi, _, (f, idx, scale)| {
                 let mut scratch = worker_ctx[wi]
                     .quant
-                    .get_or_init(|| Mutex::new(dither::QuantScratch::new(w, nthreads)))
+                    .get_or_init(|| {
+                        Mutex::new(if nearest.uses_shared_cache() {
+                            dither::QuantScratch::new_shared(w)
+                        } else {
+                            dither::QuantScratch::new(w, nthreads)
+                        })
+                    })
                     .lock()
                     .unwrap();
                 let src = color::RowSource::new(&f, w, h, meta.chroma);
