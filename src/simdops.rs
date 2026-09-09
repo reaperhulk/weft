@@ -641,11 +641,18 @@ fn bn_probe_impl<S: Simd>(
 /// carry into one another).
 #[inline(always)]
 fn sad3<S: Simd>(simd: S, a: u32x16<S>, b: u32x16<S>) -> i32x16<S> {
-    let ab = a.bitcast::<u8x64<S>>();
-    let bb = b.bitcast::<u8x64<S>>();
-    let d = (ab.max(bb) - ab.min(bb)).bitcast::<u32x16<S>>();
-    let ff = u32x16::splat(simd, 0xFF);
-    ((d & ff) + ((d >> 8u32) & ff) + ((d >> 16u32) & ff)).bitcast()
+    #[cfg(target_arch = "aarch64")]
+    {
+        sad_neon::<S, false>(simd, a, b)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let ab = a.bitcast::<u8x64<S>>();
+        let bb = b.bitcast::<u8x64<S>>();
+        let d = (ab.max(bb) - ab.min(bb)).bitcast::<u32x16<S>>();
+        let ff = u32x16::splat(simd, 0xFF);
+        ((d & ff) + ((d >> 8u32) & ff) + ((d >> 16u32) & ff)).bitcast()
+    }
 }
 
 /// Summed absolute difference over all four bytes of two packed pixels
@@ -655,12 +662,45 @@ fn sad3<S: Simd>(simd: S, a: u32x16<S>, b: u32x16<S>) -> i32x16<S> {
 /// "the same" pixel) and saves the separate alpha compare.
 #[inline(always)]
 fn sad4<S: Simd>(simd: S, a: u32x16<S>, b: u32x16<S>) -> i32x16<S> {
-    let ab = a.bitcast::<u8x64<S>>();
-    let bb = b.bitcast::<u8x64<S>>();
-    let d = (ab.max(bb) - ab.min(bb)).bitcast::<u32x16<S>>();
-    let m = u32x16::splat(simd, 0x00FF_00FF);
-    let pairs = (d & m) + ((d >> 8u32) & m); // r+g in low 16, b+a in high 16
-    ((pairs & u32x16::splat(simd, 0xFFFF)) + (pairs >> 16u32)).bitcast()
+    #[cfg(target_arch = "aarch64")]
+    {
+        sad_neon::<S, true>(simd, a, b)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let ab = a.bitcast::<u8x64<S>>();
+        let bb = b.bitcast::<u8x64<S>>();
+        let d = (ab.max(bb) - ab.min(bb)).bitcast::<u32x16<S>>();
+        let m = u32x16::splat(simd, 0x00FF_00FF);
+        let pairs = (d & m) + ((d >> 8u32) & m); // r+g in low 16, b+a in high 16
+        ((pairs & u32x16::splat(simd, 0xFFFF)) + (pairs >> 16u32)).bitcast()
+    }
+}
+
+/// NEON's pairwise widening sums reduce four byte differences directly
+/// to a pixel distance. Each four-channel sum is at most 1020.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn sad_neon<S: Simd, const ALPHA: bool>(simd: S, a: u32x16<S>, b: u32x16<S>) -> i32x16<S> {
+    use std::arch::aarch64::*;
+    let aa: [u32; 16] = a.into();
+    let bb: [u32; 16] = b.into();
+    let mut out = [0i32; 16];
+    // SAFETY: NEON is baseline on aarch64. Each load/store covers four
+    // of the sixteen array elements; NEON permits unaligned addresses.
+    unsafe {
+        for i in (0..16).step_by(4) {
+            let x = vld1q_u8(aa.as_ptr().add(i).cast());
+            let y = vld1q_u8(bb.as_ptr().add(i).cast());
+            let mut diff = vabdq_u8(x, y);
+            if !ALPHA {
+                diff = vandq_u8(diff, vreinterpretq_u8_u32(vdupq_n_u32(0x00ffffff)));
+            }
+            let sum = vpaddlq_u16(vpaddlq_u8(diff));
+            vst1q_u32(out.as_mut_ptr().add(i).cast(), sum);
+        }
+    }
+    i32x16::from_slice(simd, &out)
 }
 
 /// Scalar `bn_activity` for one pixel (vector-loop edges and tails; also
