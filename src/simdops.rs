@@ -440,6 +440,44 @@ fn grid_key_scalar(r: u8, g: u8, b: u8) -> u32 {
     (((r as u32) >> 2) << 12) | (((g as u32) >> 2) << 6) | ((b as u32) >> 2)
 }
 
+/// Tiled source-cache address, computed once for lookup and prefetch.
+#[inline(always)]
+fn source_key16<S: Simd>(simd: S, r: u32x16<S>, g: u32x16<S>, b: u32x16<S>) -> u32x16<S> {
+    let hi = u32x16::splat(simd, 252);
+    let lo = u32x16::splat(simd, 3);
+    ((r & hi) << 16u32)
+        | ((g & hi) << 10u32)
+        | ((b & hi) << 4u32)
+        | ((r & lo) << 4u32)
+        | ((g & lo) << 2u32)
+        | (b & lo)
+}
+
+fn source_key(r: u8, g: u8, b: u8) -> u32 {
+    (((r as u32) & 252) << 16)
+        | (((g as u32) & 252) << 10)
+        | (((b as u32) & 252) << 4)
+        | (((r as u32) & 3) << 4)
+        | (((g as u32) & 3) << 2)
+        | ((b as u32) & 3)
+}
+
+pub fn source_keys_rgba(level: Level, rgba: &[u8], keys: &mut [u32]) {
+    fearless_simd::dispatch!(level, simd => source_keys_rgba_impl(simd, rgba, keys))
+}
+#[inline(always)]
+fn source_keys_rgba_impl<S: Simd>(simd: S, rgba: &[u8], keys: &mut [u32]) {
+    assert_eq!(rgba.len(), keys.len() * 4);
+    let n = keys.len() / 16 * 16;
+    for i in (0..n).step_by(16) {
+        let p = px16(simd, &rgba[i * 4..]);
+        source_key16(simd, p, p >> 8u32, p >> 16u32).store_slice(&mut keys[i..i + 16]);
+    }
+    for i in n..keys.len() {
+        keys[i] = source_key(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]);
+    }
+}
+
 /// Stage 1: grid key per pixel; returns true if any alpha byte < 128.
 pub fn bn_keys(level: Level, rgba: &[u8], keys: &mut [u32]) -> bool {
     fearless_simd::dispatch!(level, simd => bn_keys_impl(simd, rgba, keys))
@@ -576,11 +614,24 @@ pub fn bn_probe(
     c2c: &mut [u32],
     keys2: &mut [u32],
 ) -> bool {
-    fearless_simd::dispatch!(level, simd => bn_probe_impl(simd, rgba, pk1, ors, c2c, keys2))
+    fearless_simd::dispatch!(level, simd => bn_probe_impl::<_, false>(simd, rgba, pk1, ors, c2c, keys2))
+}
+
+/// Generate the same dither candidates with final tiled addresses, avoiding
+/// a separate key conversion pass before the sparse lookup loop.
+pub fn bn_probe_source(
+    level: Level,
+    rgba: &[u8],
+    pk1: &[u32],
+    ors: &mut [u32],
+    c2c: &mut [u32],
+    keys2: &mut [u32],
+) -> bool {
+    fearless_simd::dispatch!(level, simd => bn_probe_impl::<_, true>(simd, rgba, pk1, ors, c2c, keys2))
 }
 
 #[inline(always)]
-fn bn_probe_impl<S: Simd>(
+fn bn_probe_impl<S: Simd, const SOURCE: bool>(
     simd: S,
     rgba: &[u8],
     pk1: &[u32],
@@ -610,8 +661,12 @@ fn bn_probe_impl<S: Simd>(
         let g2 = (g + eg + eg).max(zero).min(hi).bitcast::<u32x16<S>>();
         let b2 = (b + eb + eb).max(zero).min(hi).bitcast::<u32x16<S>>();
         ((r2 << 16u32) | (g2 << 8u32) | b2).store_slice(&mut c2c[i..i + 16]);
-        (((r2 >> 2u32) << 12u32) | ((g2 >> 2u32) << 6u32) | (b2 >> 2u32))
-            .store_slice(&mut keys2[i..i + 16]);
+        let key = if SOURCE {
+            source_key16(simd, r2, g2, b2)
+        } else {
+            ((r2 >> 2u32) << 12u32) | ((g2 >> 2u32) << 6u32) | (b2 >> 2u32)
+        };
+        key.store_slice(&mut keys2[i..i + 16]);
         i += 16;
     }
     let arr: [u32; 16] = oacc.into();
@@ -628,7 +683,11 @@ fn bn_probe_impl<S: Simd>(
         let g2 = (p[1] as i32 + 2 * eg).clamp(0, 255) as u32;
         let b2 = (p[2] as i32 + 2 * eb).clamp(0, 255) as u32;
         c2c[i] = (r2 << 16) | (g2 << 8) | b2;
-        keys2[i] = grid_key_scalar(r2 as u8, g2 as u8, b2 as u8);
+        keys2[i] = if SOURCE {
+            source_key(r2 as u8, g2 as u8, b2 as u8)
+        } else {
+            grid_key_scalar(r2 as u8, g2 as u8, b2 as u8)
+        };
         i += 1;
     }
     any_err
@@ -1955,5 +2014,72 @@ mod cell_classification_tests {
             }
         }
         fearless_simd::dispatch!(level(), simd => check(simd));
+    }
+}
+
+#[cfg(test)]
+mod source_key_tests {
+    use super::*;
+
+    #[test]
+    fn source_probe_preserves_candidates_and_errors() {
+        for len in 0..=65 {
+            let rgba: Vec<u8> = (0..len)
+                .flat_map(|i| [(i * 37) as u8, (i * 73) as u8, (i * 131) as u8, 255])
+                .collect();
+            let pk: Vec<u32> = (0..len)
+                .map(|i| (i as u32).wrapping_mul(0x91735113))
+                .collect();
+            let mut ors = vec![0; len];
+            let mut colors = vec![0; len];
+            let mut keys = vec![0; len];
+            let mut expected_ors = vec![0; len];
+            let mut expected_colors = vec![0; len];
+            let mut grid_keys = vec![0; len];
+            let expected = bn_probe(
+                level(),
+                &rgba,
+                &pk,
+                &mut expected_ors,
+                &mut expected_colors,
+                &mut grid_keys,
+            );
+            assert_eq!(
+                bn_probe_source(level(), &rgba, &pk, &mut ors, &mut colors, &mut keys),
+                expected
+            );
+            assert_eq!(ors, expected_ors);
+            assert_eq!(colors, expected_colors);
+            for i in 0..len {
+                let c = colors[i];
+                assert_eq!(
+                    keys[i],
+                    grid_keys[i] * 64 + ((c >> 16 & 3) * 16) + ((c >> 8 & 3) * 4) + (c & 3)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tiled_addresses_match_cell_layout_with_unaligned_rows_and_tails() {
+        for len in 0..=65 {
+            let mut rgba = vec![7u8];
+            let mut expected = Vec::new();
+            for i in 0..len {
+                let [r, g, b, a] = [
+                    (i * 37) as u8,
+                    (i * 73) as u8,
+                    (i * 131) as u8,
+                    (i * 19) as u8,
+                ];
+                rgba.extend_from_slice(&[r, g, b, a]);
+                let cell = grid_key_scalar(r, g, b);
+                let offset = ((r as u32 % 4) * 16) + ((g as u32 % 4) * 4) + b as u32 % 4;
+                expected.push(cell * 64 + offset);
+            }
+            let mut keys = vec![0; len];
+            source_keys_rgba(level(), &rgba[1..], &mut keys);
+            assert_eq!(keys, expected);
+        }
     }
 }
