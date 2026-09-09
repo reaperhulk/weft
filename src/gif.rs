@@ -364,8 +364,10 @@ mod tests {
                     let y0 = changed.iter().map(|i| i / w).min().unwrap();
                     let y1 = changed.iter().map(|i| i / w).max().unwrap();
                     let got: Vec<usize> = f.body[1..9]
-                        .chunks_exact(2)
-                        .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|&b| u16::from_le_bytes(b) as usize)
                         .collect();
                     assert_eq!(
                         got,
