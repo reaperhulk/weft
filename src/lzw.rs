@@ -544,19 +544,27 @@ impl LzwEncoder {
     ) -> bool {
         loop {
             let data = ctx.data;
-            // Longest match wins; equal length prefers lower total error.
-            if pos > ctx.best.end || (pos == ctx.best.end && accum < ctx.best.diff) {
-                ctx.best = LossyBest {
-                    code: node_code,
-                    end: pos,
-                    diff: accum,
-                };
-                if pos >= data.len() && accum == 0 {
-                    return true;
+            // The deferred stores regressed measured x86 encodes. Preserve
+            // the original traversal bookkeeping outside Apple ARM64.
+            #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+            {
+                // Longest match wins; equal length prefers lower total error.
+                if pos > ctx.best.end || (pos == ctx.best.end && accum < ctx.best.diff) {
+                    ctx.best = LossyBest {
+                        code: node_code,
+                        end: pos,
+                        diff: accum,
+                    };
+                    if pos >= data.len() && accum == 0 {
+                        return true;
+                    }
                 }
             }
             if pos >= data.len() || ctx.visits == 0 {
+                #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
                 return false;
+                #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+                break;
             }
             ctx.visits -= 1;
             // Leaf cut and bitmap gate: skipping a symbol the node has no
@@ -564,7 +572,10 @@ impl LzwEncoder {
             // the probe (and, for candidates, minus the diff computation).
             let p = node_code as usize;
             if self.child_gen[p] != ctx.gen {
+                #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
                 return false;
+                #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+                break;
             }
             let cb = &self.child_bits[p * 4..p * 4 + 4];
             let b = data[pos];
@@ -583,8 +594,11 @@ impl LzwEncoder {
                     let nd = map.next_dither(b, b, &dither);
                     if hits == [0; 4] {
                         // No alternatives remain after the exact branch, so
-                        // continue without a recursive call. The loop still
-                        // updates the best match and visit budget at each node.
+                        // continue without a recursive call. Each extension
+                        // has the same error and is strictly longer. Apple
+                        // ARM64 updates the best match only at the endpoint;
+                        // other targets retain per-node updates. All targets
+                        // keep charging the visit budget at every node.
                         pos += 1;
                         node_code = code;
                         dither = nd;
@@ -633,6 +647,9 @@ impl LzwEncoder {
                         // Distance-sorted: the first entry over the limit means
                         // every entry after it is too.
                         if (packed >> 8) > limit {
+                            #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+                            return false;
+                            #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
                             break;
                         }
                         let b2 = packed as u8;
@@ -652,7 +669,29 @@ impl LzwEncoder {
                     }
                 }
             }
+            #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
             return false;
+            #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+            break;
+        }
+        #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+        {
+            // Every visited descendant is strictly longer than this node.
+            // Updating after its children preserves ties and traversal order,
+            // and avoids repeatedly storing intermediate exact-chain matches.
+            // Longest match wins; equal length prefers lower total error.
+            if pos > ctx.best.end || (pos == ctx.best.end && accum < ctx.best.diff) {
+                ctx.best = LossyBest {
+                    code: node_code,
+                    end: pos,
+                    diff: accum,
+                };
+                if pos >= ctx.data.len() && accum == 0 {
+                    return true;
+                }
+            }
+
+            false
         }
     }
 }
@@ -660,6 +699,142 @@ impl LzwEncoder {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_matches_agree_with_recursive_reference() {
+        // A plain pre-order traversal updates at every node, without the
+        // exact-chain loop or deferred stores used by the production DFS.
+        fn reference(
+            enc: &LzwEncoder,
+            ctx: &mut DfsCtx,
+            pos: usize,
+            code: u32,
+            dither: [i32; 3],
+            error: u64,
+        ) -> bool {
+            if pos > ctx.best.end || (pos == ctx.best.end && error < ctx.best.diff) {
+                ctx.best = LossyBest {
+                    code,
+                    end: pos,
+                    diff: error,
+                };
+                if pos == ctx.data.len() && error == 0 {
+                    return true;
+                }
+            }
+            if pos == ctx.data.len() || ctx.visits == 0 {
+                return false;
+            }
+            ctx.visits -= 1;
+            let want = ctx.data[pos];
+            if let Ok(child) = enc.probe((code << 8) | want as u32) {
+                if reference(
+                    enc,
+                    ctx,
+                    pos + 1,
+                    child,
+                    ctx.map.next_dither(want, want, &dither),
+                    error,
+                ) {
+                    return true;
+                }
+            }
+            if want != ctx.map.trans_idx {
+                let cap = ctx.scale.map_or(ctx.map.max_diff, |s| {
+                    (ctx.map.max_diff * s[pos] as u32) >> 8
+                });
+                for &candidate in ctx.map.candidates(want) {
+                    let got = candidate as u8;
+                    if let Ok(child) = enc.probe((code << 8) | got as u32) {
+                        let d = ctx.map.diff(want, got, &dither);
+                        if d <= cap
+                            && reference(
+                                enc,
+                                ctx,
+                                pos + 1,
+                                child,
+                                ctx.map.next_dither(want, got, &dither),
+                                error + d as u64,
+                            )
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        let colors: Vec<_> = (0..8u8)
+            .map(|i| [100 + i * 3, 110 + (i % 3) * 4, 120 - i])
+            .collect();
+        let map = LossyMap::build(&colors, 8, 30);
+        let mut seed = 39873u32;
+        let mut rng = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let mut enc = LzwEncoder::default();
+        enc.ensure_lossy_scratch();
+        for _ in 0..40 {
+            enc.bump_gen();
+            let mut nodes: Vec<u32> = (0..9).collect();
+            for code in 18..400 {
+                let parent = nodes[rng() as usize % nodes.len()];
+                let symbol = rng() % 9;
+                let key = (parent << 8) | symbol;
+                if let Err(slot) = enc.probe(key) {
+                    enc.table[slot] = (key << 12) | code;
+                    let p = parent as usize;
+                    if enc.child_gen[p] != enc.gen {
+                        enc.child_gen[p] = enc.gen;
+                        enc.child_bits[p * 4..p * 4 + 4].fill(0);
+                    }
+                    enc.child_bits[p * 4 + (symbol >> 6) as usize] |= 1u64 << (symbol & 63);
+                    nodes.push(code);
+                }
+            }
+            for trial in 0..80 {
+                let data: Vec<u8> = (0..1 + rng() % 24).map(|_| (rng() % 9) as u8).collect();
+                let scale: Vec<u8> = data.iter().map(|_| rng() as u8).collect();
+                let dither = std::array::from_fn(|_| (rng() % 13) as i32 - 6);
+                let budget = rng() % 32;
+                let error = (rng() % 8) as u64;
+                let context = || DfsCtx {
+                    gen: enc.gen,
+                    data: &data,
+                    map: &map,
+                    scale: (trial % 2 == 0).then_some(scale.as_slice()),
+                    visits: budget,
+                    best: LossyBest {
+                        code: data[0] as u32,
+                        end: 1,
+                        diff: error,
+                    },
+                };
+                let (mut actual, mut expected) = (context(), context());
+                let a = enc.lossy_dfs(&mut actual, 1, data[0] as u32, dither, error);
+                let b = reference(&enc, &mut expected, 1, data[0] as u32, dither, error);
+                assert_eq!(
+                    (
+                        a,
+                        actual.best.code,
+                        actual.best.end,
+                        actual.best.diff,
+                        actual.visits
+                    ),
+                    (
+                        b,
+                        expected.best.code,
+                        expected.best.end,
+                        expected.best.diff,
+                        expected.visits
+                    )
+                );
+            }
+        }
+    }
 
     #[test]
     fn exact_chains_preserve_lossy_search_order_and_budget() {

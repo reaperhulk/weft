@@ -1190,6 +1190,9 @@ fn kd_nearest(nodes: &[KdNode], pal: &[[f32; 3]], q: [f32; 3]) -> u8 {
 /// cache; exact palettes retain the small-grid accelerator and local memo.
 pub struct NearestMap {
     kd: Vec<KdNode>,
+    // Apple ARM64 caches each 4x4x4 RGB cell in 64 consecutive bytes.
+    // Other targets retain RGB-major indexing: the tiled layout regressed
+    // measured x86 quantization despite speeding up prewarming.
     // Zero means unknown, otherwise palette index + 1 (indices stop at 254).
     // Each entry publishes the complete result. Relaxed atomic access is
     // sufficient: racing misses compute and store the same deterministic
@@ -1456,7 +1459,18 @@ impl NearestMap {
         b: u8,
     ) -> PackedNearest {
         if !self.shared.is_empty() {
-            return self.lookup_shared(r, g, b);
+            #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+            {
+                return self.lookup_shared(r, g, b);
+            }
+            #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+            {
+                let color = ((key as usize) << 6)
+                    | (((r as usize) & 3) << 4)
+                    | (((g as usize) & 3) << 2)
+                    | ((b as usize) & 3);
+                return self.lookup_shared_at(color, r, g, b);
+            }
         }
         let (slot, color) = cache.slot(r, g, b);
         let e = cache.slots[slot];
@@ -1489,8 +1503,39 @@ impl NearestMap {
     }
 
     #[inline(always)]
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    fn shared_key(r: u8, g: u8, b: u8) -> usize {
+        // High six bits select the cell; low two bits select its RGB voxel.
+        (((r as usize) & 252) << 16)
+            | (((g as usize) & 252) << 10)
+            | (((b as usize) & 252) << 4)
+            | (((r as usize) & 3) << 4)
+            | (((g as usize) & 3) << 2)
+            | ((b as usize) & 3)
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+    #[inline(always)]
     fn lookup_shared(&self, r: u8, g: u8, b: u8) -> PackedNearest {
         let color = ((r as usize) << 16) | ((g as usize) << 8) | b as usize;
+        let cached = self.shared[color].load(std::sync::atomic::Ordering::Relaxed);
+        if cached != 0 {
+            return self.packed(cached - 1);
+        }
+        let idx = self.lookup(r, g, b);
+        self.shared[color].store(idx + 1, std::sync::atomic::Ordering::Relaxed);
+        self.packed(idx)
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    #[inline(always)]
+    fn lookup_shared(&self, r: u8, g: u8, b: u8) -> PackedNearest {
+        self.lookup_shared_at(Self::shared_key(r, g, b), r, g, b)
+    }
+
+    #[inline(always)]
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    fn lookup_shared_at(&self, color: usize, r: u8, g: u8, b: u8) -> PackedNearest {
         let cached = self.shared[color].load(std::sync::atomic::Ordering::Relaxed);
         if cached != 0 {
             return self.packed(cached - 1);
@@ -1511,6 +1556,10 @@ impl NearestMap {
             pool::global().map(entries.len().div_ceil(256), |_, chunk| {
                 for &(c, _) in &entries[chunk * 256..((chunk + 1) * 256).min(entries.len())] {
                     let idx = self.lookup((c >> 16) as u8, (c >> 8) as u8, c as u8);
+                    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+                    self.shared[Self::shared_key((c >> 16) as u8, (c >> 8) as u8, c as u8)]
+                        .store(idx + 1, std::sync::atomic::Ordering::Relaxed);
+                    #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
                     self.shared[c as usize].store(idx + 1, std::sync::atomic::Ordering::Relaxed);
                 }
             });
@@ -1562,6 +1611,11 @@ impl NearestMap {
                             )
                         }
                     };
+                    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+                    for (slot, idx) in self.shared[key * 64..key * 64 + 64].iter().zip(indices) {
+                        slot.store(idx + 1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
                     for (i, idx) in indices.into_iter().enumerate() {
                         let r = rb + (i >> 4) as u8;
                         let g = gb + ((i >> 2) & 3) as u8;
@@ -1630,6 +1684,9 @@ impl NearestMap {
     #[inline(always)]
     pub fn prefetch_cache_slot(&self, cache: &IdxCache, r: u8, g: u8, b: u8) {
         if !self.shared.is_empty() {
+            #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+            prefetch_index(&self.shared, Self::shared_key(r, g, b));
+            #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
             prefetch_index(
                 &self.shared,
                 ((r as usize) << 16) | ((g as usize) << 8) | b as usize,
@@ -1647,6 +1704,9 @@ impl NearestMap {
     #[inline(always)]
     pub fn prefetch(&self, r: u8, g: u8, b: u8) {
         if !self.shared.is_empty() {
+            #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+            prefetch_index(&self.shared, Self::shared_key(r, g, b));
+            #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
             prefetch_index(
                 &self.shared,
                 ((r as usize) << 16) | ((g as usize) << 8) | b as usize,
