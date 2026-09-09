@@ -907,7 +907,11 @@ fn run(args: &Args) -> io::Result<()> {
     let gct_bits = (usize::BITS - (slots - 1).leading_zeros()).max(1) as u8;
     let min_code_size = gct_bits.max(2);
     let t_lut_start = Instant::now();
-    let nearest = palette::NearestMap::build(&colors);
+    let nearest = if n_entries < args.colors {
+        palette::NearestMap::build_compact(&colors)
+    } else {
+        palette::NearestMap::build(&colors)
+    };
     let t_lut = t_lut_start.elapsed();
     let t_pal = t2.elapsed();
     if args.stats {

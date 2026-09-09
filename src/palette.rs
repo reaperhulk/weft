@@ -1143,8 +1143,47 @@ pub struct NearestMap {
 /// A packed lookup result: `r<<24 | g<<16 | b<<8 | idx`.
 pub type PackedNearest = u32;
 
+// Histogram precision remains six bits per channel. The nearest-color
+// accelerator can use larger cells for exact palettes to reduce setup work; candidate
+// lists still bound every integer color in each cell, and resolution still
+// uses the original OkLab metric and palette-order tie breaking.
+const MAP_BITS: u32 = 5;
+const MAP_MASK: usize = (1 << MAP_BITS) - 1;
+#[cfg(test)]
+const MAP_SHIFT: u32 = 8 - MAP_BITS;
+#[cfg(test)]
+const MAP_EDGE: u8 = (1 << MAP_SHIFT) - 1;
+#[cfg(test)]
+const MAP_SIZE: usize = 1 << (3 * MAP_BITS);
+
+#[inline(always)]
+fn map_key(key: usize) -> usize {
+    // Callers already compute six-bit histogram keys, including the SIMD
+    // row kernels. Drop each channel's low bit without changing that API.
+    const DROP: u32 = GRID_BITS - MAP_BITS;
+    ((key >> (3 * DROP)) & (MAP_MASK << (2 * MAP_BITS)))
+        | ((key >> (2 * DROP)) & (MAP_MASK << MAP_BITS))
+        | ((key >> DROP) & MAP_MASK)
+}
+
 impl NearestMap {
     pub fn build(colors: &[[u8; 3]]) -> Self {
+        Self::build_grid::<GRID_BITS>(colors)
+    }
+
+    /// Fewer geometry/distance evaluations for exact-palette input, whose
+    /// small set of source colors makes repeated resolutions cheap. Broader
+    /// candidate lists remain exact for arbitrary queries too. Expand the
+    /// directory so pixel lookups retain the original six-bit key and cost.
+    pub fn build_compact(colors: &[[u8; 3]]) -> Self {
+        Self::build_grid::<MAP_BITS>(colors)
+    }
+
+    fn build_grid<const BITS: u32>(colors: &[[u8; 3]]) -> Self {
+        let map_size = 1usize << (3 * BITS);
+        let map_mask = (1usize << BITS) - 1;
+        let map_shift = 8 - BITS;
+        let map_edge = (1u8 << map_shift) - 1;
         let cv = LabConverter::new();
         let pal_lab: Vec<[f32; 3]> = colors
             .iter()
@@ -1160,7 +1199,7 @@ impl NearestMap {
         let soa = crate::simdops::PalSoa::new(&pal_lab);
         let level = fearless_simd::Level::new();
         // Build candidate lists into one arena per parallel chunk instead
-        // of allocating a Vec for every one of the 262,144 cells. Cell
+        // of allocating a Vec for every cell. Cell
         // metadata retains grid order, so the later interning pass is
         // deterministic regardless of worker scheduling.
         const CELL_CHUNK: usize = 1024;
@@ -1173,19 +1212,19 @@ impl NearestMap {
             refs: Vec<CellRef>,
             arena: Vec<u8>,
         }
-        let nchunks = GRID_SIZE.div_ceil(CELL_CHUNK);
+        let nchunks = map_size.div_ceil(CELL_CHUNK);
         let cell_chunks: Vec<CellChunk> = pool::global().map_init(
             nchunks,
             || (LabConverter::new(), vec![0f32; soa.l.len()]),
             |(cv, dists), _, chunk| {
                 let start = chunk * CELL_CHUNK;
-                let end = (start + CELL_CHUNK).min(GRID_SIZE);
+                let end = (start + CELL_CHUNK).min(map_size);
                 let mut refs = Vec::with_capacity(end - start);
                 let mut arena = Vec::with_capacity((end - start) * colors.len().min(8));
                 for key in start..end {
-                    let rb = (((key >> (2 * GRID_BITS)) & 63) as u8) << 2;
-                    let gb = (((key >> GRID_BITS) & 63) as u8) << 2;
-                    let bb = ((key & 63) as u8) << 2;
+                    let rb = (((key >> (2 * BITS)) & map_mask) as u8) << map_shift;
+                    let gb = (((key >> BITS) & map_mask) as u8) << map_shift;
+                    let bb = ((key & map_mask) as u8) << map_shift;
                     // All 8 corners in SIMD lanes (slightly inflated to
                     // stay an upper bound): candidate lists built from it
                     // are supersets of the exact-rmax lists, so lookups
@@ -1194,9 +1233,9 @@ impl NearestMap {
                     let mut lg = [0f32; 8];
                     let mut lb = [0f32; 8];
                     for corner in 0..8 {
-                        lr[corner] = cv.linear(rb + if corner & 1 != 0 { 3 } else { 0 });
-                        lg[corner] = cv.linear(gb + if corner & 2 != 0 { 3 } else { 0 });
-                        lb[corner] = cv.linear(bb + if corner & 4 != 0 { 3 } else { 0 });
+                        lr[corner] = cv.linear(rb + if corner & 1 != 0 { map_edge } else { 0 });
+                        lg[corner] = cv.linear(gb + if corner & 2 != 0 { map_edge } else { 0 });
+                        lb[corner] = cv.linear(bb + if corner & 4 != 0 { map_edge } else { 0 });
                     }
                     let (q, rmax2) = crate::simdops::cell_geometry(level, &lr, &lg, &lb);
                     let rmax = rmax2.sqrt();
@@ -1220,7 +1259,7 @@ impl NearestMap {
         for (slot, c) in pal_rgb.iter_mut().zip(colors) {
             *slot = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
         }
-        let mut direct = Vec::with_capacity(GRID_SIZE);
+        let mut direct = Vec::with_capacity(map_size);
         let mut cands = Vec::new();
         // Cells whose lists are long are almost always sharing one list
         // with a lot of other cells: a palette confined to a small region
@@ -1269,6 +1308,11 @@ impl NearestMap {
             }
         }
         drop(interned);
+        let direct = if BITS == GRID_BITS {
+            direct
+        } else {
+            (0..GRID_SIZE).map(|key| direct[map_key(key)]).collect()
+        };
         NearestMap {
             direct,
             cands,
@@ -1277,7 +1321,7 @@ impl NearestMap {
             pal_lab4: pal_lab.iter().map(|p| [p[0], p[1], p[2], 0.0]).collect(),
             pal_lab,
             cv,
-            avg_cands: total as f32 / GRID_SIZE as f32,
+            avg_cands: total as f32 / map_size as f32,
         }
     }
 
@@ -1318,7 +1362,7 @@ impl NearestMap {
     /// the single-candidate `direct[]` fast path almost never hits — 90-98 %
     /// of pixels land in multi-candidate cells on measured clips — so
     /// probing the memo cache first turns the common case into one probe
-    /// of a per-thread table; the 1 MB `direct[]` table is only touched on
+    /// of a per-thread table; the 1 MiB `direct[]` table is only touched on
     /// a memo miss, where it either answers outright (single-candidate
     /// cell) or supplies the candidate-list offset for the resolve. Same
     /// result as `lookup_packed`: a memo entry is only ever a resolve
@@ -1421,7 +1465,7 @@ impl NearestMap {
     }
 
     /// Prefetch the fast-path cell for a color a few pixels ahead of the
-    /// current one: the direct[] table is 1MB, and on colorful content
+    /// current one: the direct[] table is 1 MiB, and on colorful content
     /// the dependent load is what stalls the quantize loops. The raw
     /// (pre-dither) color is close enough to the adjusted one to land on
     /// the right cache line almost always.
@@ -1587,18 +1631,19 @@ mod tests {
         // a NaN black corner would poison the midpoint.
         let cv = LabConverter::new();
         let level = fearless_simd::Level::new();
-        for key in 0..GRID_SIZE {
-            let rb = (((key >> 12) & 63) as u8) << 2;
-            let gb = (((key >> 6) & 63) as u8) << 2;
-            let bb = ((key & 63) as u8) << 2;
-            let lr = std::array::from_fn(|c| cv.linear(rb + if c & 1 != 0 { 3 } else { 0 }));
-            let lg = std::array::from_fn(|c| cv.linear(gb + if c & 2 != 0 { 3 } else { 0 }));
-            let lb = std::array::from_fn(|c| cv.linear(bb + if c & 4 != 0 { 3 } else { 0 }));
+        for key in 0..MAP_SIZE {
+            let rb = (((key >> (2 * MAP_BITS)) & MAP_MASK) as u8) << MAP_SHIFT;
+            let gb = (((key >> MAP_BITS) & MAP_MASK) as u8) << MAP_SHIFT;
+            let bb = ((key & MAP_MASK) as u8) << MAP_SHIFT;
+            let lr = std::array::from_fn(|c| cv.linear(rb + if c & 1 != 0 { MAP_EDGE } else { 0 }));
+            let lg = std::array::from_fn(|c| cv.linear(gb + if c & 2 != 0 { MAP_EDGE } else { 0 }));
+            let lb = std::array::from_fn(|c| cv.linear(bb + if c & 4 != 0 { MAP_EDGE } else { 0 }));
             let (q, rmax2) = crate::simdops::cell_geometry(level, &lr, &lg, &lb);
             let bound = (rmax2.sqrt() + 0.5e-6).powi(2);
-            for r in (0..4).map(|d| rb + d) {
-                for g in (0..4).map(|d| gb + d) {
-                    for b in (0..4).map(|d| bb + d) {
+            for r in (0..=MAP_EDGE).map(|d| rb + d) {
+                for g in (0..=MAP_EDGE).map(|d| gb + d) {
+                    for b in (0..=MAP_EDGE).map(|d| bb + d) {
+                        assert_eq!(map_key(grid_key(r, g, b)), key);
                         for p in [cv.srgb_to_oklab_fast(r, g, b), cv.srgb_to_oklab(r, g, b)] {
                             assert!(
                                 dist2(&p, &q) <= bound,
@@ -1608,6 +1653,43 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_map_matches_full_map_including_ties_and_cache_paths() {
+        let mut state = 0x9e3779b9u32;
+        let mut random = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for count in [2, 18, 255] {
+            let mut colors: Vec<[u8; 3]> = (0..count)
+                .map(|_| {
+                    let c = random();
+                    [c as u8, (c >> 8) as u8, (c >> 16) as u8]
+                })
+                .collect();
+            // Equal-distance entries must retain the earliest index.
+            colors[count - 1] = colors[0];
+            let full = NearestMap::build(&colors);
+            let compact = NearestMap::build_compact(&colors);
+            let mut cache = IdxCache::with_slots(32);
+            let queries = colors.iter().copied().chain((0..50_000).map(|_| {
+                let c = random();
+                [c as u8, (c >> 8) as u8, (c >> 16) as u8]
+            }));
+            for [r, g, b] in queries {
+                let expected = full.packed(full.lookup(r, g, b));
+                assert_eq!(compact.lookup(r, g, b), expected as u8);
+                assert_eq!(compact.lookup_packed(&mut cache, r, g, b), expected);
+                assert_eq!(
+                    compact.lookup_cache_first(&mut cache, grid_key(r, g, b) as u32, r, g, b),
+                    expected
+                );
             }
         }
     }
