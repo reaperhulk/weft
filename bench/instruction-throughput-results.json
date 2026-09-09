@@ -307,5 +307,55 @@
     "main": "e5969caefb7a8b582d8296074a2b1b78d20d653b95d3c2cadbd514ca4b0c1922",
     "candidate": "f6915a08df1c23202e4d12067a6805dd7ef3cdb57e200adee005179b0c1234e6"
   },
-  "base": "d09af78c70a346aa1cb825fed115f5b3259e69b2"
+  "base": "d09af78c70a346aa1cb825fed115f5b3259e69b2",
+  "measured_revision": "1ecafcd4781180a88fea147ef025f8796e6f18c0",
+  "external_x86_feedback": {
+    "source": "User-supplied production measurements; not independently reproduced on this machine",
+    "clips": 12,
+    "threads20": {
+      "reps": 21,
+      "wall_ratio": 1.021,
+      "cpu_ratio": 1.032,
+      "instructions_ratio": 1.043
+    },
+    "threads8": {
+      "reps": 11,
+      "wall_ratio": 1.013,
+      "cpu_ratio": 1.022,
+      "instructions_ratio": 1.046
+    },
+    "revised_scope": "Tiled source cache and deferred LZW updates are Apple ARM64-only; x86 baseline paths restored; revised x86 timing unmeasured"
+  },
+  "apple_restricted_validation": {
+    "runs": 11,
+    "clips": 14,
+    "threads": 18,
+    "binary_sha256": {
+      "main": "e5969caefb7a8b582d8296074a2b1b78d20d653b95d3c2cadbd514ca4b0c1922",
+      "revised": "316e547e8059a52ccb9e882d55fc6817978f773991b58d2e0223bba0c1d29b21"
+    },
+    "values": {
+      "main": {
+        "wall": 0.040706392447450224,
+        "cpu": 0.45091542677583296,
+        "instructions": 6064640722.79745,
+        "cycles": 1905064015.4550762,
+        "ipc": 3.183753570429394
+      },
+      "revised": {
+        "wall": 0.039320894949729526,
+        "cpu": 0.42995859497730504,
+        "instructions": 5917501741.395607,
+        "cycles": 1818675352.8115888,
+        "ipc": 3.253237214171931
+      }
+    },
+    "ratios": {
+      "wall": 0.9659636382784522,
+      "cpu": 0.953523808337242,
+      "instructions": 0.9757382196032263,
+      "cycles": 0.9546531444913933,
+      "ipc": 1.0218244415610236
+    }
+  }
 }

@@ -1,5 +1,35 @@
 # Instruction throughput on production GIF encodes
 
+## Revision after x86-64 production testing
+
+The original cross-platform revision `1ecafcd` regressed x86-64. External
+production testing supplied by the user found the following candidate/main
+ratios on 12 clips (21 paired reps at 20 threads, 11 at 8 threads):
+
+| Threads | Wall | CPU | Instructions | Clips with instruction regressions |
+|---|---:|---:|---:|---:|
+| 20 | 1.021× | 1.032× | 1.043× | 12/12 |
+| 8 | 1.013× | 1.022× | 1.046× | 12/12 |
+
+Quantization grew 11.1% and LZW 2.6%, despite a 21.5% nearest-map improvement.
+The NEON kernel is not compiled on x86; its fallback is the original distance
+kernel. The cache permutation changes both lookup and prefetch address
+calculations, so the map-build win cannot be separated from the quantization
+regression merely by removing NEON. Exact component attribution still needs
+x86 ablation; the stage timings alone do not establish it.
+
+The revised PR enables tiled cache addressing and deferred LZW stores only
+on Apple ARM64. Other targets retain baseline RGB-major addressing,
+prewarming, prefetch addresses and LZW bookkeeping. The NEON distance kernel
+remains ARM64-only. No x86 performance improvement is claimed. A server
+retest is still needed to verify the revised binary has no regression.
+
+A follow-up M5 run of the restricted implementation (14 clips, 11 paired
+reps, 18 threads) retained the gains: wall −3.4%, instructions −2.4%,
+cycles −4.5%, IPC +2.2%. Every GIF was byte-identical to main.
+
+The results below describe the original M5 measurements, not x86 gains.
+
 Against main `d09af78`, using `--lossy 30 --hold 12 --dither auto`.
 Apple M5 Max, 18 cores (6 Super + 12 Performance), macOS 26.6.2;
 Rust 1.96.0 / LLVM 22.1.2, unchanged release profile. No compiler tuning or PGO.
@@ -21,7 +51,8 @@ The full process uses **2.4% fewer instructions, 4.3% fewer cycles and
   absolute differences and pairwise widening sums, replacing channel
   shifts and masks. Other architectures retain their existing kernels.
 
-The first two changes are portable. An 11-pair ablation on all 14 clips
+The first two changes were originally applied across architectures; they are
+now enabled only on Apple ARM64. An 11-pair M5 ablation on all 14 clips
 measured 1.7% less wall time with just these changes; adding NEON brought
 that run to 3.3% less wall time. This is an M5 measurement of portable
 code, **not evidence of an x86 speedup**.

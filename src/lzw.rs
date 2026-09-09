@@ -544,7 +544,26 @@ impl LzwEncoder {
     ) -> bool {
         loop {
             let data = ctx.data;
+            // The deferred stores regressed measured x86 encodes. Preserve
+            // the original traversal bookkeeping outside Apple ARM64.
+            #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+            {
+                // Longest match wins; equal length prefers lower total error.
+                if pos > ctx.best.end || (pos == ctx.best.end && accum < ctx.best.diff) {
+                    ctx.best = LossyBest {
+                        code: node_code,
+                        end: pos,
+                        diff: accum,
+                    };
+                    if pos >= data.len() && accum == 0 {
+                        return true;
+                    }
+                }
+            }
             if pos >= data.len() || ctx.visits == 0 {
+                #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+                return false;
+                #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
                 break;
             }
             ctx.visits -= 1;
@@ -553,6 +572,9 @@ impl LzwEncoder {
             // the probe (and, for candidates, minus the diff computation).
             let p = node_code as usize;
             if self.child_gen[p] != ctx.gen {
+                #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+                return false;
+                #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
                 break;
             }
             let cb = &self.child_bits[p * 4..p * 4 + 4];
@@ -573,9 +595,10 @@ impl LzwEncoder {
                     if hits == [0; 4] {
                         // No alternatives remain after the exact branch, so
                         // continue without a recursive call. Each extension
-                        // has the same error and is strictly longer, so only
-                        // the chain endpoint needs to update the best match.
-                        // Keep charging the visit budget at every node.
+                        // has the same error and is strictly longer. Apple
+                        // ARM64 updates the best match only at the endpoint;
+                        // other targets retain per-node updates. All targets
+                        // keep charging the visit budget at every node.
                         pos += 1;
                         node_code = code;
                         dither = nd;
@@ -624,6 +647,9 @@ impl LzwEncoder {
                         // Distance-sorted: the first entry over the limit means
                         // every entry after it is too.
                         if (packed >> 8) > limit {
+                            #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+                            return false;
+                            #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
                             break;
                         }
                         let b2 = packed as u8;
@@ -643,24 +669,30 @@ impl LzwEncoder {
                     }
                 }
             }
+            #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+            return false;
+            #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
             break;
         }
-        // Every visited descendant is strictly longer than this node.
-        // Updating after its children preserves ties and traversal order,
-        // and avoids repeatedly storing intermediate exact-chain matches.
-        // Longest match wins; equal length prefers lower total error.
-        if pos > ctx.best.end || (pos == ctx.best.end && accum < ctx.best.diff) {
-            ctx.best = LossyBest {
-                code: node_code,
-                end: pos,
-                diff: accum,
-            };
-            if pos >= ctx.data.len() && accum == 0 {
-                return true;
+        #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+        {
+            // Every visited descendant is strictly longer than this node.
+            // Updating after its children preserves ties and traversal order,
+            // and avoids repeatedly storing intermediate exact-chain matches.
+            // Longest match wins; equal length prefers lower total error.
+            if pos > ctx.best.end || (pos == ctx.best.end && accum < ctx.best.diff) {
+                ctx.best = LossyBest {
+                    code: node_code,
+                    end: pos,
+                    diff: accum,
+                };
+                if pos >= ctx.data.len() && accum == 0 {
+                    return true;
+                }
             }
-        }
 
-        false
+            false
+        }
     }
 }
 
