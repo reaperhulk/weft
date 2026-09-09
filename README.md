@@ -437,6 +437,10 @@ The [ARM64 RGBA hill climb](bench/arm64-hill-climb.md) records the M1 Max
 results on 20 Frinkiac clips, the retained `fearless_simd` kernels, and
 commands to fetch the corpus and benchmark changes.
 
+The follow-up [portable RGBA hill climb](bench/portable-hill-climb.md)
+records improvements to nearest-color cell geometry and GIF delta bounds,
+with another 2.9% throughput gain and correctness checks on both architectures.
+
 [`docs/experiments.md`](docs/experiments.md) records optimisations that
 were implemented, measured and **rejected**, with the numbers that killed
 them — Wu's quantizer, several `--dither auto` gate reworks, half a dozen

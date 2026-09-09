@@ -360,28 +360,30 @@ fn cbrt_x8<S: Simd>(simd: S, x: f32x8<S>) -> f32x8<S> {
     let two = f32x8::splat(simd, 2.0);
     for _ in 0..2 {
         let y3 = y * y * y;
-        y = y * (y3 + two * x) / (two * y3 + x);
+        // Divide before multiplying by y: for x == 0, y * y3
+        // underflows to zero and the next iteration would divide 0/0.
+        y *= (y3 + two * x) / (two * y3 + x);
     }
     y
 }
 
-/// Max squared OkLab distance from 8 cell corners (given as linearized
-/// sRGB channel values per corner) to the reference point `q`. All eight
-/// corners are evaluated in lanes with the vectorized cube root; the
-/// result is inflated slightly so bounds built from it remain valid upper
-/// bounds despite the cbrt approximation.
-pub fn corner_rmax2(level: Level, lr: &[f32; 8], lg: &[f32; 8], lb: &[f32; 8], q: [f32; 3]) -> f32 {
-    fearless_simd::dispatch!(level, simd => corner_rmax2_impl(simd, lr, lg, lb, q))
+/// Cell reference point and maximum squared OkLab distance to its eight
+/// corners, supplied as linearized sRGB channels. Corners 0 and 7 must
+/// be the all-low and all-high corners. Their midpoint in OkLab centers
+/// the bounding sphere more closely than the integer sRGB point base+2,
+/// giving shorter candidate lists without another color conversion.
+/// The radius is inflated to cover cube-root approximation error.
+pub fn cell_geometry(level: Level, lr: &[f32; 8], lg: &[f32; 8], lb: &[f32; 8]) -> ([f32; 3], f32) {
+    fearless_simd::dispatch!(level, simd => cell_geometry_impl(simd, lr, lg, lb))
 }
 
 #[inline(always)]
-fn corner_rmax2_impl<S: Simd>(
+fn cell_geometry_impl<S: Simd>(
     simd: S,
     lr: &[f32; 8],
     lg: &[f32; 8],
     lb: &[f32; 8],
-    q: [f32; 3],
-) -> f32 {
+) -> ([f32; 3], f32) {
     let lrv = f32x8::from_slice(simd, lr);
     let lgv = f32x8::from_slice(simd, lg);
     let lbv = f32x8::from_slice(simd, lb);
@@ -391,12 +393,23 @@ fn corner_rmax2_impl<S: Simd>(
     let l_ = cbrt_x8(simd, l);
     let m_ = cbrt_x8(simd, m);
     let s_ = cbrt_x8(simd, s);
-    let dl = l_ * 0.2104542553 + m_ * 0.7936177850 + s_ * -0.0040720468 - f32x8::splat(simd, q[0]);
-    let da = l_ * 1.9779984951 + m_ * -2.4285922050 + s_ * 0.4505937099 - f32x8::splat(simd, q[1]);
-    let db = l_ * 0.0259040371 + m_ * 0.7827717662 + s_ * -0.8086757660 - f32x8::splat(simd, q[2]);
+    let cl = l_ * 0.2104542553 + m_ * 0.7936177850 + s_ * -0.0040720468;
+    let ca = l_ * 1.9779984951 + m_ * -2.4285922050 + s_ * 0.4505937099;
+    let cb = l_ * 0.0259040371 + m_ * 0.7827717662 + s_ * -0.8086757660;
+    let al: [f32; 8] = cl.into();
+    let aa: [f32; 8] = ca.into();
+    let ab: [f32; 8] = cb.into();
+    let q = [
+        (al[0] + al[7]) * 0.5,
+        (aa[0] + aa[7]) * 0.5,
+        (ab[0] + ab[7]) * 0.5,
+    ];
+    let dl = cl - f32x8::splat(simd, q[0]);
+    let da = ca - f32x8::splat(simd, q[1]);
+    let db = cb - f32x8::splat(simd, q[2]);
     let d = dl * dl + da * da + db * db;
     let arr: [f32; 8] = d.into();
-    arr.iter().fold(0f32, |m, &v| m.max(v)) * 1.0002
+    (q, arr.iter().fold(0f32, |m, &v| m.max(v)) * 1.0002)
 }
 
 // ---------------------------------------------------------------------------

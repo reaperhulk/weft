@@ -53,18 +53,10 @@ pub fn encode_frame(
     let (x0, y0, x1, y1, sub) = match prev {
         None => (0, 0, w - 1, h - 1, None),
         Some(prev) => {
-            // Row-level diff first (fast memcmp path), then column bounds.
-            let mut y0 = None;
-            let mut y1 = 0usize;
-            for y in 0..h {
-                if idx[y * w..(y + 1) * w] != prev[y * w..(y + 1) * w] {
-                    if y0.is_none() {
-                        y0 = Some(y);
-                    }
-                    y1 = y;
-                }
-            }
-            let Some(y0) = y0 else {
+            // Locate the first and last changed rows from opposite ends.
+            // Interior rows cannot expand the vertical bounds.
+            let mut rows = idx.chunks_exact(w).zip(prev.chunks_exact(w));
+            let Some(y0) = rows.position(|(a, b)| a != b) else {
                 // identical frame: fold into predecessor at mux time
                 return EncodedFrame {
                     delay_cs,
@@ -72,21 +64,25 @@ pub fn encode_frame(
                     disposal,
                 };
             };
+            let y1 = y0 + rows.rposition(|(a, b)| a != b).map_or(0, |dy| dy + 1);
             let mut x0 = w;
             let mut x1 = 0usize;
             for y in y0..=y1 {
                 let a = &idx[y * w..(y + 1) * w];
                 let b = &prev[y * w..(y + 1) * w];
-                if let Some(first) = a.iter().zip(b).position(|(p, q)| p != q) {
-                    x0 = x0.min(first);
-                    let last = w
-                        - 1
-                        - a.iter()
-                            .zip(b.iter())
-                            .rev()
-                            .position(|(p, q)| p != q)
-                            .unwrap();
-                    x1 = x1.max(last);
+                // Only pixels outside the current bounds can enlarge them.
+                if let Some(first) = a[..x0].iter().zip(&b[..x0]).position(|(p, q)| p != q) {
+                    x0 = first;
+                }
+                if let Some(last) = a[x1 + 1..]
+                    .iter()
+                    .zip(&b[x1 + 1..])
+                    .rposition(|(p, q)| p != q)
+                {
+                    x1 += last + 1;
+                }
+                if x0 == 0 && x1 == w - 1 {
+                    break;
                 }
             }
             (x0, y0, x1, y1, Some(prev))
@@ -313,5 +309,71 @@ mod tests {
         assert_eq!(u16::from_le_bytes([f.body[3], f.body[4]]), 3);
         assert_eq!(u16::from_le_bytes([f.body[5], f.body[6]]), 1);
         assert_eq!(u16::from_le_bytes([f.body[7], f.body[8]]), 1);
+    }
+
+    #[test]
+    fn bbox_matches_changed_pixels() {
+        let mut ctx = EncodeCtx::default();
+        let mut seed = 0x1379_abdfu32;
+        for w in [1, 2, 7, 8, 9, 31, 32, 33, 65] {
+            for h in [1, 2, 3, 17] {
+                let prev = vec![0u8; w * h];
+                for case in 0..24 {
+                    let mut cur = prev.clone();
+                    for (i, p) in cur.iter_mut().enumerate() {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        let changed = match case {
+                            0 => false,
+                            1 => i == 0,
+                            2 => i == w * h - 1,
+                            3 => i / w == h / 2,
+                            4 => i % w == w / 2,
+                            5 => i == w - 1 || i == (h - 1) * w,
+                            _ => seed.is_multiple_of(case + 1),
+                        };
+                        *p = u8::from(changed);
+                    }
+                    let f = encode_frame(
+                        &cur,
+                        Some(&prev),
+                        w,
+                        h,
+                        3,
+                        2,
+                        7,
+                        DISPOSAL_NONE,
+                        None,
+                        None,
+                        &mut ctx,
+                    );
+                    let changed: Vec<usize> = cur
+                        .iter()
+                        .zip(&prev)
+                        .enumerate()
+                        .filter_map(|(i, (a, b))| (a != b).then_some(i))
+                        .collect();
+                    assert_eq!(f.delay_cs, 7);
+                    if changed.is_empty() {
+                        assert!(f.body.is_empty());
+                        continue;
+                    }
+                    let x0 = changed.iter().map(|i| i % w).min().unwrap();
+                    let x1 = changed.iter().map(|i| i % w).max().unwrap();
+                    let y0 = changed.iter().map(|i| i / w).min().unwrap();
+                    let y1 = changed.iter().map(|i| i / w).max().unwrap();
+                    let got: Vec<usize> = f.body[1..9]
+                        .chunks_exact(2)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+                        .collect();
+                    assert_eq!(
+                        got,
+                        [x0, y0, x1 - x0 + 1, y1 - y0 + 1],
+                        "{w}x{h}, case {case}"
+                    );
+                }
+            }
+        }
     }
 }

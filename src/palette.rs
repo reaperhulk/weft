@@ -1151,8 +1151,8 @@ impl NearestMap {
             .map(|c| cv.srgb_to_oklab(c[0], c[1], c[2]))
             .collect();
 
-        // For each cell: reference point q = the cell's integer center
-        // (base+2). Any integer color p in the cell satisfies
+        // For each cell: q is the OkLab midpoint of opposite corners.
+        // Any integer color p in the cell satisfies
         // dist(p, q) <= rmax (max over the 8 integer corners). The true
         // nearest for p then satisfies dist(c, q) <= dmin(q) + 2*rmax, so
         // collecting all palette colors within that bound makes the argmin
@@ -1161,8 +1161,8 @@ impl NearestMap {
         let level = fearless_simd::Level::new();
         // Build candidate lists into one arena per parallel chunk instead
         // of allocating a Vec for every one of the 262,144 cells. Cell
-        // metadata retains grid order, so the later interning pass emits
-        // byte-for-byte the same `direct` and `cands` tables.
+        // metadata retains grid order, so the later interning pass is
+        // deterministic regardless of worker scheduling.
         const CELL_CHUNK: usize = 1024;
         #[derive(Clone, Copy)]
         struct CellRef {
@@ -1186,7 +1186,6 @@ impl NearestMap {
                     let rb = (((key >> (2 * GRID_BITS)) & 63) as u8) << 2;
                     let gb = (((key >> GRID_BITS) & 63) as u8) << 2;
                     let bb = ((key & 63) as u8) << 2;
-                    let q = cv.srgb_to_oklab(rb + 2, gb + 2, bb + 2);
                     // All 8 corners in SIMD lanes (slightly inflated to
                     // stay an upper bound): candidate lists built from it
                     // are supersets of the exact-rmax lists, so lookups
@@ -1199,7 +1198,7 @@ impl NearestMap {
                         lg[corner] = cv.linear(gb + if corner & 2 != 0 { 3 } else { 0 });
                         lb[corner] = cv.linear(bb + if corner & 4 != 0 { 3 } else { 0 });
                     }
-                    let rmax2 = crate::simdops::corner_rmax2(level, &lr, &lg, &lb, q);
+                    let (q, rmax2) = crate::simdops::cell_geometry(level, &lr, &lg, &lb);
                     let rmax = rmax2.sqrt();
                     // one SIMD distance pass, buffered, shared by the dmin
                     // scan and the candidate filter
@@ -1578,6 +1577,40 @@ fn dist2(a: &[f32; 3], b: &[f32; 3]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cell_radius_covers_every_integer_color() {
+        // The lookup's triangle bound has 1e-6 of slack, equivalent to
+        // adding 0.5e-6 to rmax before doubling it. Check the sphere over
+        // every integer color, including cell interiors and black: a
+        // corner-only check would miss nonlinear interior extrema, and
+        // a NaN black corner would poison the midpoint.
+        let cv = LabConverter::new();
+        let level = fearless_simd::Level::new();
+        for key in 0..GRID_SIZE {
+            let rb = (((key >> 12) & 63) as u8) << 2;
+            let gb = (((key >> 6) & 63) as u8) << 2;
+            let bb = ((key & 63) as u8) << 2;
+            let lr = std::array::from_fn(|c| cv.linear(rb + if c & 1 != 0 { 3 } else { 0 }));
+            let lg = std::array::from_fn(|c| cv.linear(gb + if c & 2 != 0 { 3 } else { 0 }));
+            let lb = std::array::from_fn(|c| cv.linear(bb + if c & 4 != 0 { 3 } else { 0 }));
+            let (q, rmax2) = crate::simdops::cell_geometry(level, &lr, &lg, &lb);
+            let bound = (rmax2.sqrt() + 0.5e-6).powi(2);
+            for r in (0..4).map(|d| rb + d) {
+                for g in (0..4).map(|d| gb + d) {
+                    for b in (0..4).map(|d| bb + d) {
+                        for p in [cv.srgb_to_oklab_fast(r, g, b), cv.srgb_to_oklab(r, g, b)] {
+                            assert!(
+                                dist2(&p, &q) <= bound,
+                                "{r},{g},{b}: {} > {bound}",
+                                dist2(&p, &q)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn memo_hits_misses_and_collisions_preserve_packed_colors() {
