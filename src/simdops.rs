@@ -8,15 +8,83 @@ use fearless_simd::{
     f32x16, f32x8, i16x32, i32x16, i32x8, mask16x32, mask32x16, u16x32, u32x16, u32x8, u8x16,
     u8x64, Level, Simd,
 };
+#[cfg(not(target_arch = "aarch64"))]
 use std::sync::OnceLock;
 
 #[cfg(target_arch = "x86_64")]
 mod x86;
 
-/// Runtime-detected SIMD level, cached (feature detection once).
+/// Cache runtime detection on x86; ARM64's baseline NEON needs no cache.
 pub fn level() -> Level {
-    static LEVEL: OnceLock<Level> = OnceLock::new();
-    *LEVEL.get_or_init(Level::new)
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is baseline: Level::new() is constant on this target.
+        // A OnceLock would add an atomic load and branch to every row.
+        Level::new()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        static LEVEL: OnceLock<Level> = OnceLock::new();
+        *LEVEL.get_or_init(Level::new)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+/// Length in pixels of the initial run equal to `pixel`, including the
+/// partial vector at the end. No alignment or alpha assumptions needed.
+pub fn rgba_run_prefix(rgba: &[u8], pixel: [u8; 4]) -> usize {
+    fearless_simd::dispatch!(level(), simd => rgba_run_prefix_impl(simd, rgba, pixel))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn rgba_run_prefix_impl<S: Simd>(simd: S, rgba: &[u8], pixel: [u8; 4]) -> usize {
+    let pattern = u32x8::splat(simd, u32::from_ne_bytes(pixel));
+    let mut i = 0;
+    while i + 32 <= rgba.len() {
+        let words: u32x8<S> = fearless_simd::u8x32::from_slice(simd, &rgba[i..i + 32]).bitcast();
+        let n = words.simd_eq(pattern).to_bitmask().trailing_ones() as usize;
+        i += n * 4;
+        if n < 8 {
+            return i / 4;
+        }
+    }
+    for px in rgba[i..].as_chunks::<4>().0 {
+        if *px != pixel {
+            break;
+        }
+        i += 4;
+    }
+    i / 4
+}
+
+#[cfg(target_arch = "aarch64")]
+/// Palette colors are padded to four lanes to load all three components
+/// together. The fourth lane is zero and is excluded from the distance.
+pub fn resolve_candidates(pal: &[[f32; 4]], cands: &[u8], q: [f32; 3]) -> u8 {
+    fearless_simd::dispatch!(level(), simd => resolve_candidates_impl(simd, pal, cands, q))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn resolve_candidates_impl<S: Simd>(simd: S, pal: &[[f32; 4]], cands: &[u8], q: [f32; 3]) -> u8 {
+    use fearless_simd::f32x4;
+    let q = f32x4::from_slice(simd, &[q[0], q[1], q[2], 0.0]);
+    let mut best = 0;
+    let mut best_d = f32::MAX;
+    for &i in cands {
+        if i == 255 {
+            break;
+        }
+        let delta = f32x4::from_slice(simd, &pal[i as usize]) - q;
+        let squared: [f32; 4] = (delta * delta).into();
+        let d = squared[0] + squared[1] + squared[2];
+        if d < best_d {
+            best = i;
+            best_d = d;
+        }
+    }
+    best
 }
 
 // BT.601 limited-range coefficients, 16.16 fixed point (same constants as
@@ -830,12 +898,17 @@ pub fn cell_distances(level: Level, pal: &PalSoa, q: [f32; 3], dists: &mut [f32]
 
 /// Append palette indices within the candidate bound, in palette order.
 pub fn cell_candidates(dists: &[f32], bound2: f32, arena: &mut Vec<u8>) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        fearless_simd::dispatch!(level(), simd => cell_candidates_impl(simd, dists, bound2, arena));
+    }
     #[cfg(target_arch = "x86_64")]
     if dists.len() >= x86::MIN_PALETTE_LEN && x86::has_avx512() {
         // SAFETY: The kernel's target features were detected.
         unsafe { x86::cell_candidates(dists, bound2, arena) };
         return;
     }
+    #[cfg(not(target_arch = "aarch64"))]
     for (i, &d) in dists.iter().enumerate() {
         if d <= bound2 {
             arena.push(i as u8);
@@ -843,9 +916,31 @@ pub fn cell_candidates(dists: &[f32], bound2: f32, arena: &mut Vec<u8>) {
     }
 }
 
+#[cfg(any(target_arch = "aarch64", test))]
+#[inline(always)]
+fn cell_candidates_impl<S: Simd>(simd: S, dists: &[f32], bound2: f32, arena: &mut Vec<u8>) {
+    let bound = f32x16::splat(simd, bound2);
+    let end = dists.len() / 16 * 16;
+    for i in (0..end).step_by(16) {
+        let d = f32x16::from_slice(simd, &dists[i..i + 16]);
+        // Skip rejected groups without branching on each palette entry.
+        // Walking low bits first retains palette order, including ties.
+        let mut mask = d.simd_le(bound).to_bitmask();
+        while mask != 0 {
+            arena.push((i + mask.trailing_zeros() as usize) as u8);
+            mask &= mask - 1;
+        }
+    }
+    for (i, &d) in dists.iter().enumerate().skip(end) {
+        if d <= bound2 {
+            arena.push(i as u8);
+        }
+    }
+}
+
 /// Nearest palette color, breaking equal-distance ties by palette index.
-/// Generic backends reuse `dists` as scratch; AVX-512 keeps the argmin in
-/// registers and avoids storing and rescanning the distance buffer.
+/// ARM64 and AVX-512 keep the argmin in registers, avoiding a distance
+/// buffer write and rescan. Other backends reuse `dists` as scratch.
 pub fn nearest_color(
     level: Level,
     pal: &PalSoa,
@@ -853,13 +948,56 @@ pub fn nearest_color(
     dists: &mut [f32],
     n: usize,
 ) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = (dists, n);
+        fearless_simd::dispatch!(level, simd => nearest_color_impl(simd, pal, q))
+    }
     #[cfg(target_arch = "x86_64")]
     if pal.l.len() >= x86::MIN_PALETTE_LEN && x86::has_avx512() {
         // SAFETY: The kernel's target features were detected.
         return unsafe { x86::nearest_color(pal, q) };
     }
-    let min = cell_distances(level, pal, q, dists);
-    dists[..n].iter().position(|&d| d == min).unwrap_or(0)
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let min = cell_distances(level, pal, q, dists);
+        dists[..n].iter().position(|&d| d == min).unwrap_or(0)
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", test))]
+#[inline(always)]
+fn nearest_color_impl<S: Simd>(simd: S, pal: &PalSoa, q: [f32; 3]) -> usize {
+    // Two NEON vectors balance loop overhead against register pressure.
+    let ql = f32x8::splat(simd, q[0]);
+    let qa = f32x8::splat(simd, q[1]);
+    let qb = f32x8::splat(simd, q[2]);
+    let mut minv = f32x8::splat(simd, f32::MAX);
+    let mut indices = u32x8::splat(simd, u32::MAX);
+    let mut current = u32x8::from_slice(simd, &[0, 1, 2, 3, 4, 5, 6, 7]);
+    for i in (0..pal.l.len()).step_by(8) {
+        let dl = f32x8::from_slice(simd, &pal.l[i..i + 8]) - ql;
+        let da = f32x8::from_slice(simd, &pal.a[i..i + 8]) - qa;
+        let db = f32x8::from_slice(simd, &pal.b[i..i + 8]) - qb;
+        let d = dl * dl + da * da + db * db;
+        // Strict improvement retains the first index within each lane.
+        indices = d.simd_lt(minv).select(current, indices);
+        minv = minv.min(d);
+        current += u32x8::splat(simd, 8);
+    }
+    let distances: [f32; 8] = minv.into();
+    let min = distances.iter().copied().fold(f32::MAX, f32::min);
+    // Different lanes can tie too: choose the lowest palette index.
+    let winners: [u32; 8] = minv
+        .simd_eq(f32x8::splat(simd, min))
+        .select(indices, u32x8::splat(simd, u32::MAX))
+        .into();
+    let index = winners.iter().copied().min().unwrap();
+    if index == u32::MAX {
+        0
+    } else {
+        index as usize
+    }
 }
 
 #[inline(always)]
@@ -886,6 +1024,95 @@ fn cell_distances_impl<S: Simd>(simd: S, pal: &PalSoa, q: [f32; 3], dists: &mut 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn rgba_run_prefix_matches_scalar_at_every_boundary() {
+        for pixel in [[0; 4], [255; 4], [41, 99, 203, 128]] {
+            for len in 0..=65 {
+                for end in 0..=len {
+                    for channel in 0..4 {
+                        // Offset the row and include an incomplete trailing pixel.
+                        let mut buf = vec![19];
+                        for _ in 0..len {
+                            buf.extend_from_slice(&pixel);
+                        }
+                        buf.extend_from_slice(&[7, 8, 9]);
+                        if end < len {
+                            buf[1 + end * 4 + channel] ^= 1;
+                        }
+                        let row = &buf[1..];
+                        let expected = row
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .take_while(|p| **p == pixel)
+                            .count();
+                        assert_eq!(rgba_run_prefix(row, pixel), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn candidates_preserve_order_boundaries_and_prefix() {
+        for n in 0..=255 {
+            let dists: Vec<f32> = (0..n)
+                .map(|i| [0.0, -0.0, 1.0, 2.0, f32::INFINITY, f32::NAN, f32::MAX][i % 7])
+                .collect();
+            for bound in [-1.0, 0.0, 1.0, 2.0, f32::MAX, f32::INFINITY, f32::NAN] {
+                let mut expected = vec![31, 23];
+                expected.extend(
+                    dists
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, d)| **d <= bound)
+                        .map(|(i, _)| i as u8),
+                );
+                let mut got = vec![31, 23];
+                fearless_simd::dispatch!(level(), simd => cell_candidates_impl(simd, &dists, bound, &mut got));
+                assert_eq!(got, expected, "n={n}, bound={bound}");
+            }
+        }
+    }
+
+    #[test]
+    fn register_argmin_matches_buffered_distances() {
+        let mut seed = 91u32;
+        let mut random = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as f32 / 255.0
+        };
+        for n in [0, 1, 3, 4, 7, 8, 15, 16, 17, 31, 127, 254, 255] {
+            let labs: Vec<[f32; 3]> = (0..n)
+                .map(|_| [random(), random() - 0.5, random() - 0.5])
+                .collect();
+            let pal = PalSoa::new(&labs);
+            for _ in 0..100 {
+                let q = [random(), random() - 0.5, random() - 0.5];
+                let mut dists = vec![0.0; pal.l.len()];
+                let min = fearless_simd::dispatch!(level(), simd => cell_distances_impl(simd, &pal, q, &mut dists));
+                let expected = dists[..n].iter().position(|&d| d == min).unwrap_or(0);
+                let got =
+                    fearless_simd::dispatch!(level(), simd => nearest_color_impl(simd, &pal, q));
+                assert_eq!(got, expected, "n={n}, q={q:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn register_argmin_breaks_ties_by_palette_index() {
+        for (first, second) in [(0, 8), (7, 8), (15, 16), (17, 32), (31, 240), (239, 254)] {
+            let mut labs = vec![[1.0; 3]; 255];
+            labs[first] = [0.0; 3];
+            labs[second] = [0.0; 3];
+            let pal = PalSoa::new(&labs);
+            let got =
+                fearless_simd::dispatch!(level(), simd => nearest_color_impl(simd, &pal, [0.0; 3]));
+            assert_eq!(got, first);
+        }
+    }
 
     #[test]
     fn fused_keys_att_lanes_match_scalar() {

@@ -421,22 +421,32 @@ fn scan_runs_with(rgba: &[u8], mut add: impl FnMut(u32, u32)) -> bool {
             run = 1;
         }
         i += 1;
-        // Bulk-extend the run in 8-pixel blocks (32-byte compares lower
-        // to SIMD memcmp). Guarded by one scalar pixel compare so noisy
-        // content doesn't pay the pattern-building cost per pixel; equal
-        // raw words share alpha, so every counted pixel is opaque.
+        // Extend repeated raw pixels after a scalar equality guard, so
+        // noisy content avoids building a vector pattern for every pixel.
+        // NEON also finds the first mismatch within the final block;
+        // other targets retain whole-block equality checks. Equal raw
+        // words share alpha, so every counted pixel is opaque.
         if i < n && pixels[i] == px {
-            let mut pattern = [0u8; 32];
-            for chunk in pattern.as_chunks_mut::<4>().0 {
-                *chunk = px;
+            #[cfg(target_arch = "aarch64")]
+            {
+                let extra = crate::simdops::rgba_run_prefix(&rgba[i * 4..], px);
+                run += extra as u32;
+                i += extra;
             }
-            let bytes = &rgba[i * 4..];
-            let mut off = 0usize;
-            while off + 32 <= bytes.len() && eq32(&bytes[off..off + 32], &pattern) {
-                off += 32;
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let mut pattern = [0u8; 32];
+                for chunk in pattern.as_chunks_mut::<4>().0 {
+                    *chunk = px;
+                }
+                let bytes = &rgba[i * 4..];
+                let mut off = 0usize;
+                while off + 32 <= bytes.len() && eq32(&bytes[off..off + 32], &pattern) {
+                    off += 32;
+                }
+                run += (off / 4) as u32;
+                i += off / 4;
             }
-            run += (off / 4) as u32;
-            i += off / 4;
         }
     }
     if run > 0 {
@@ -449,6 +459,7 @@ fn scan_runs_with(rgba: &[u8], mut add: impl FnMut(u32, u32)) -> bool {
 /// `memcmp`, which musl implements as a byte loop; this stays fast on
 /// every target.
 #[inline]
+#[cfg(not(target_arch = "aarch64"))]
 fn eq32(a: &[u8], b: &[u8; 32]) -> bool {
     debug_assert_eq!(a.len(), 32);
     let mut acc = 0u64;
@@ -1115,9 +1126,14 @@ pub struct NearestMap {
     /// Concatenated candidate lists for multi-candidate cells, each list
     /// terminated by 0xFF.
     cands: Vec<u8>,
-    /// packed 24-bit sRGB per palette entry, for re-packing resolve results
-    pal_rgb: Vec<u32>,
+    /// Packed sRGB, padded to cover every u8 index. This makes the palette
+    /// load in a compact-cache hit bounds-check-free; callers needing only
+    /// the index can eliminate that load entirely.
+    pal_rgb: Box<[u32; 256]>,
     pal_lab: Vec<[f32; 3]>,
+    // Four-lane loads avoid assembling a 12-byte color in the NEON scan.
+    #[cfg(target_arch = "aarch64")]
+    pal_lab4: Vec<[f32; 4]>,
     cv: LabConverter,
     /// Mean candidates per cell. Recorded at build time: `cands` no longer
     /// holds one copy per cell to count, since identical lists are shared.
@@ -1201,10 +1217,10 @@ impl NearestMap {
             },
         );
 
-        let pal_rgb: Vec<u32> = colors
-            .iter()
-            .map(|c| ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32)
-            .collect();
+        let mut pal_rgb = Box::new([0u32; 256]);
+        for (slot, c) in pal_rgb.iter_mut().zip(colors) {
+            *slot = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
+        }
         let mut direct = Vec::with_capacity(GRID_SIZE);
         let mut cands = Vec::new();
         // Cells whose lists are long are almost always sharing one list
@@ -1258,6 +1274,8 @@ impl NearestMap {
             direct,
             cands,
             pal_rgb,
+            #[cfg(target_arch = "aarch64")]
+            pal_lab4: pal_lab.iter().map(|p| [p[0], p[1], p[2], 0.0]).collect(),
             pal_lab,
             cv,
             avg_cands: total as f32 / GRID_SIZE as f32,
@@ -1320,6 +1338,11 @@ impl NearestMap {
         // the e != MAX guard keeps the empty sentinel (whose tag bits read
         // as 0xFFFFFF) from false-hitting on white; a real white entry has
         // an index byte below 0xFF and never equals MAX
+        #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+        if (e >> 8) == color && e != u32::MAX {
+            return self.packed(e as u8);
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
         if (e >> 40) == color as u64 && e != u64::MAX {
             return e as u32;
         }
@@ -1329,7 +1352,14 @@ impl NearestMap {
         }
         let idx = self.resolve_off((d >> 8) as usize, r, g, b);
         let packed = (self.pal_rgb[idx as usize] << 8) | idx as u32;
-        cache.slots[slot] = ((color as u64) << 40) | packed as u64;
+        #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+        {
+            cache.slots[slot] = (color << 8) | idx as u32;
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+        {
+            cache.slots[slot] = ((color as u64) << 40) | packed as u64;
+        }
         packed
     }
 
@@ -1362,12 +1392,24 @@ impl NearestMap {
     fn lookup_slow(&self, cache: &mut IdxCache, off: u32, r: u8, g: u8, b: u8) -> PackedNearest {
         let (slot, color) = cache.slot(r, g, b);
         let e = cache.slots[slot];
+        #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+        if (e >> 8) == color && e != u32::MAX {
+            return self.packed(e as u8);
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
         if (e >> 40) == color as u64 && e != u64::MAX {
             return e as u32;
         }
         let idx = self.resolve_off(off as usize, r, g, b);
         let packed = (self.pal_rgb[idx as usize] << 8) | idx as u32;
-        cache.slots[slot] = ((color as u64) << 40) | packed as u64;
+        #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+        {
+            cache.slots[slot] = (color << 8) | idx as u32;
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+        {
+            cache.slots[slot] = ((color as u64) << 40) | packed as u64;
+        }
         packed
     }
 
@@ -1406,6 +1448,11 @@ impl NearestMap {
             }
             return best;
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::simdops::resolve_candidates(&self.pal_lab4, &self.cands[off..], q)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
         for &i in self.cands[off..].iter() {
             if i == MULTI {
                 break;
@@ -1416,7 +1463,10 @@ impl NearestMap {
                 best = i;
             }
         }
-        best
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            best
+        }
     }
 }
 
@@ -1443,19 +1493,29 @@ impl NearestMap {
 /// whatever size keeps the total near this budget -- so divide it rather
 /// than fixing a per-worker size. The old fixed 1 MiB was tuned at a low
 /// thread count and cost 33% of the quantize phase at 40.
+#[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
 const IDX_CACHE_BUDGET: usize = 8 << 20;
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+// M1 Max RGBA hill climb: 16 MiB beat 4, 8 and 32 MiB total budgets.
+// Keep the per-worker ceiling at 1 MiB; other targets retain their tuning.
+const IDX_CACHE_BUDGET: usize = 16 << 20;
 /// Slot-count bounds: below the floor the hit rate collapses regardless of
 /// residency, above the ceiling a single worker's table is bigger than any
 /// L3 it might share.
-const IDX_CACHE_MIN_BITS: u32 = 13;
-const IDX_CACHE_MAX_BITS: u32 = 17;
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+type CacheWord = u32;
+#[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+type CacheWord = u64;
+// Preserve the 64 KiB floor and 1 MiB ceiling for either entry layout.
+const IDX_CACHE_MIN_BITS: u32 = 16 - std::mem::size_of::<CacheWord>().trailing_zeros();
+const IDX_CACHE_MAX_BITS: u32 = 20 - std::mem::size_of::<CacheWord>().trailing_zeros();
 
 /// Slot count for one worker's memo cache, given how many run at once.
 pub fn idx_cache_slots(nthreads: usize) -> usize {
     let per_worker = IDX_CACHE_BUDGET / nthreads.max(1);
-    let slots = (per_worker / std::mem::size_of::<u64>()).next_power_of_two();
+    let slots = (per_worker / std::mem::size_of::<CacheWord>()).next_power_of_two();
     // next_power_of_two rounds up; step back to stay inside the budget
-    let slots = if slots * std::mem::size_of::<u64>() > per_worker {
+    let slots = if slots * std::mem::size_of::<CacheWord>() > per_worker {
         slots / 2
     } else {
         slots
@@ -1464,12 +1524,13 @@ pub fn idx_cache_slots(nthreads: usize) -> usize {
 }
 
 /// Direct-mapped memo cache for multi-candidate nearest lookups, sized by
-/// `idx_cache_slots`. Each u64 packs `query_color<<40 | palette_rgb<<8 |
-/// idx`, so a probe touches one cache line and a hit returns the palette
-/// color along with the index. Empty slots are u64::MAX (see the sentinel
-/// guard in `lookup_packed`).
+/// `idx_cache_slots`. Apple ARM64 packs `query_color<<8 | idx` into u32:
+/// twice as many cached colors fit in the same byte budget, and the fixed
+/// palette table reconstructs RGB only when the caller needs it. Other
+/// targets retain u64 `query_color<<40 | palette_rgb<<8 | idx` entries.
+/// All-ones slots are empty; a real palette index is always below 255.
 pub struct IdxCache {
-    slots: Vec<u64>,
+    slots: Vec<CacheWord>,
     /// Right-shift that maps the multiplicative hash onto `slots.len()`.
     shift: u32,
 }
@@ -1485,7 +1546,7 @@ impl IdxCache {
     pub fn with_slots(slots: usize) -> Self {
         debug_assert!(slots.is_power_of_two());
         IdxCache {
-            slots: vec![u64::MAX; slots],
+            slots: vec![CacheWord::MAX; slots],
             shift: 32 - slots.trailing_zeros(),
         }
     }
@@ -1517,6 +1578,42 @@ fn dist2(a: &[f32; 3], b: &[f32; 3]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memo_hits_misses_and_collisions_preserve_packed_colors() {
+        let mut pal: Vec<[u8; 3]> = (0..254u32)
+            .map(|i| [(i * 7) as u8, (i * 29) as u8, (i * 53) as u8])
+            .collect();
+        pal.push([255; 3]);
+        let mut nm = NearestMap::build(&pal);
+        // Exercise memoization even for colors whose real cell has one
+        // candidate, especially white against the all-ones empty sentinel.
+        nm.direct.fill((SCAN_ALL << 8) | MULTI as u32);
+        let queries: Vec<[u8; 3]> = [[255; 3], [0; 3], [254; 3], [1, 2, 3]]
+            .into_iter()
+            .chain(pal.iter().copied())
+            .collect();
+        for slots in [2, 8, 1024] {
+            let mut cache = IdxCache::with_slots(slots);
+            for _ in 0..2 {
+                for &[r, g, b] in &queries {
+                    let idx = nm.lookup(r, g, b);
+                    let c = pal[idx as usize];
+                    let expected = ((c[0] as u32) << 24)
+                        | ((c[1] as u32) << 16)
+                        | ((c[2] as u32) << 8)
+                        | idx as u32;
+                    for _ in 0..2 {
+                        assert_eq!(nm.lookup_packed(&mut cache, r, g, b), expected);
+                        assert_eq!(
+                            nm.lookup_cache_first(&mut cache, grid_key(r, g, b) as u32, r, g, b),
+                            expected
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// Pass 1's color-partitioned path (runs scattered by red byte into
     /// per-bucket tables, then per-bucket sorted entries concatenated;

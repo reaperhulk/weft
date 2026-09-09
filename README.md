@@ -433,6 +433,10 @@ Dependencies: fearless_simd; the musl static build adds mimalloc.
 
 ## Optimisation history
 
+The [ARM64 RGBA hill climb](bench/arm64-hill-climb.md) records the M1 Max
+results on 20 Frinkiac clips, the retained `fearless_simd` kernels, and
+commands to fetch the corpus and benchmark changes.
+
 [`docs/experiments.md`](docs/experiments.md) records optimisations that
 were implemented, measured and **rejected**, with the numbers that killed
 them — Wu's quantizer, several `--dither auto` gate reworks, half a dozen
