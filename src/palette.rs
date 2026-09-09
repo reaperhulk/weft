@@ -1190,14 +1190,14 @@ fn kd_nearest(nodes: &[KdNode], pal: &[[f32; 3]], q: [f32; 3]) -> u8 {
 /// cache; exact palettes retain the small-grid accelerator and local memo.
 pub struct NearestMap {
     kd: Vec<KdNode>,
-    // Apple ARM64 caches each 4x4x4 RGB cell in 64 consecutive bytes.
-    // Other targets retain RGB-major indexing: the tiled layout regressed
-    // measured x86 quantization despite speeding up prewarming.
+    // Apple ARM64 and x86 auto dithering use 64-byte RGB cells. Staged lookups
+    // compute addresses once in SIMD and reuse them for prefetching.
     // Zero means unknown, otherwise palette index + 1 (indices stop at 254).
     // Each entry publishes the complete result. Relaxed atomic access is
     // sufficient: racing misses compute and store the same deterministic
     // index, with no associated payload requiring acquire/release ordering.
     shared: Vec<std::sync::atomic::AtomicU8>,
+    tiled: bool,
     /// Per-cell entry. Single-candidate cells (the fast path) pack
     /// `r<<24 | g<<16 | b<<8 | idx`, so the caller gets the palette color
     /// with the same load as the index (no dependent colors[] fetch).
@@ -1357,6 +1357,7 @@ impl NearestMap {
         NearestMap {
             kd: Vec::new(),
             shared: Vec::new(),
+            tiled: false,
             direct,
             cands,
             pal_rgb,
@@ -1383,6 +1384,7 @@ impl NearestMap {
         }
         Self {
             kd: kd_build(&pal_lab),
+            tiled: cfg!(all(target_arch = "aarch64", target_vendor = "apple")),
             shared: (0..1 << 24)
                 .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
@@ -1395,6 +1397,13 @@ impl NearestMap {
             cv,
             avg_cands: 0.0,
         }
+    }
+
+    /// Auto dithering stages the tiled addresses before its lookup loops.
+    pub fn build_source_auto(colors: &[[u8; 3]]) -> Self {
+        let mut map = Self::build_source(colors);
+        map.tiled |= cfg!(target_arch = "x86_64");
+        map
     }
 
     pub fn uses_shared_cache(&self) -> bool {
@@ -1459,18 +1468,14 @@ impl NearestMap {
         b: u8,
     ) -> PackedNearest {
         if !self.shared.is_empty() {
-            #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
-            {
-                return self.lookup_shared(r, g, b);
-            }
-            #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-            {
+            if self.tiled {
                 let color = ((key as usize) << 6)
                     | (((r as usize) & 3) << 4)
                     | (((g as usize) & 3) << 2)
                     | ((b as usize) & 3);
                 return self.lookup_shared_at(color, r, g, b);
             }
+            return self.lookup_shared(r, g, b);
         }
         let (slot, color) = cache.slot(r, g, b);
         let e = cache.slots[slot];
@@ -1503,38 +1508,26 @@ impl NearestMap {
     }
 
     #[inline(always)]
-    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-    fn shared_key(r: u8, g: u8, b: u8) -> usize {
-        // High six bits select the cell; low two bits select its RGB voxel.
-        (((r as usize) & 252) << 16)
-            | (((g as usize) & 252) << 10)
-            | (((b as usize) & 252) << 4)
-            | (((r as usize) & 3) << 4)
-            | (((g as usize) & 3) << 2)
-            | ((b as usize) & 3)
-    }
-
-    #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
-    #[inline(always)]
-    fn lookup_shared(&self, r: u8, g: u8, b: u8) -> PackedNearest {
-        let color = ((r as usize) << 16) | ((g as usize) << 8) | b as usize;
-        let cached = self.shared[color].load(std::sync::atomic::Ordering::Relaxed);
-        if cached != 0 {
-            return self.packed(cached - 1);
+    fn shared_key(&self, r: u8, g: u8, b: u8) -> usize {
+        if self.tiled {
+            // High six bits select the cell; low two bits select its voxel.
+            (((r as usize) & 252) << 16)
+                | (((g as usize) & 252) << 10)
+                | (((b as usize) & 252) << 4)
+                | (((r as usize) & 3) << 4)
+                | (((g as usize) & 3) << 2)
+                | ((b as usize) & 3)
+        } else {
+            ((r as usize) << 16) | ((g as usize) << 8) | b as usize
         }
-        let idx = self.lookup(r, g, b);
-        self.shared[color].store(idx + 1, std::sync::atomic::Ordering::Relaxed);
-        self.packed(idx)
     }
 
-    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
     #[inline(always)]
     fn lookup_shared(&self, r: u8, g: u8, b: u8) -> PackedNearest {
-        self.lookup_shared_at(Self::shared_key(r, g, b), r, g, b)
+        self.lookup_shared_at(self.shared_key(r, g, b), r, g, b)
     }
 
     #[inline(always)]
-    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
     fn lookup_shared_at(&self, color: usize, r: u8, g: u8, b: u8) -> PackedNearest {
         let cached = self.shared[color].load(std::sync::atomic::Ordering::Relaxed);
         if cached != 0 {
@@ -1556,11 +1549,8 @@ impl NearestMap {
             pool::global().map(entries.len().div_ceil(256), |_, chunk| {
                 for &(c, _) in &entries[chunk * 256..((chunk + 1) * 256).min(entries.len())] {
                     let idx = self.lookup((c >> 16) as u8, (c >> 8) as u8, c as u8);
-                    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-                    self.shared[Self::shared_key((c >> 16) as u8, (c >> 8) as u8, c as u8)]
+                    self.shared[self.shared_key((c >> 16) as u8, (c >> 8) as u8, c as u8)]
                         .store(idx + 1, std::sync::atomic::Ordering::Relaxed);
-                    #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
-                    self.shared[c as usize].store(idx + 1, std::sync::atomic::Ordering::Relaxed);
                 }
             });
             return;
@@ -1611,21 +1601,88 @@ impl NearestMap {
                             )
                         }
                     };
-                    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-                    for (slot, idx) in self.shared[key * 64..key * 64 + 64].iter().zip(indices) {
-                        slot.store(idx + 1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
-                    for (i, idx) in indices.into_iter().enumerate() {
-                        let r = rb + (i >> 4) as u8;
-                        let g = gb + ((i >> 2) & 3) as u8;
-                        let b = bb + (i & 3) as u8;
-                        self.shared[((r as usize) << 16) | ((g as usize) << 8) | b as usize]
-                            .store(idx + 1, std::sync::atomic::Ordering::Relaxed);
+                    if self.tiled {
+                        for (slot, idx) in self.shared[key * 64..key * 64 + 64].iter().zip(indices)
+                        {
+                            slot.store(idx + 1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    } else {
+                        for (i, idx) in indices.into_iter().enumerate() {
+                            let r = rb + (i >> 4) as u8;
+                            let g = gb + ((i >> 2) & 3) as u8;
+                            let b = bb + (i & 3) as u8;
+                            self.shared[((r as usize) << 16) | ((g as usize) << 8) | b as usize]
+                                .store(idx + 1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
             },
         );
+    }
+
+    pub fn uses_tiled_source_cache(&self) -> bool {
+        self.tiled && self.uses_shared_cache()
+    }
+
+    #[inline(always)]
+    fn source_index(&self, key: u32, color: impl FnOnce() -> [u8; 3]) -> u8 {
+        let slot = &self.shared[key as usize];
+        let cached = slot.load(std::sync::atomic::Ordering::Relaxed);
+        if cached != 0 {
+            return cached - 1;
+        }
+        let [r, g, b] = color();
+        let idx = self.lookup(r, g, b);
+        slot.store(idx + 1, std::sync::atomic::Ordering::Relaxed);
+        idx
+    }
+
+    /// Stage addresses once; cache hits need neither RGB decoding nor a palette load.
+    pub fn source_row(
+        &self,
+        level: fearless_simd::Level,
+        rgba: &[u8],
+        keys: &mut [u32],
+        out: &mut [u8],
+    ) {
+        crate::simdops::source_keys_rgba(level, rgba, keys);
+        assert_eq!(keys.len(), out.len());
+        assert_eq!(rgba.len(), out.len() * 4);
+        for (i, (&key, dest)) in keys.iter().zip(out).enumerate() {
+            if let Some(&next) = keys.get(i + 8) {
+                prefetch_index(&self.shared, next as usize);
+            }
+            *dest = self.source_index(key, || [rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]]);
+        }
+    }
+
+    /// Resolve active second candidates. Keys come from `bn_probe_source`;
+    /// inactive entries retain their previous scratch value and are ignored
+    /// by the following threshold stage.
+    pub fn source_probes(
+        &self,
+        colors: &[u32],
+        keys: &[u32],
+        ors: &[u32],
+        att: &[u32],
+        out: &mut [u32],
+    ) {
+        assert_eq!(colors.len(), keys.len());
+        assert_eq!(ors.len(), keys.len());
+        assert_eq!(att.len(), keys.len());
+        assert_eq!(out.len(), keys.len());
+        for (i, (&key, dest)) in keys.iter().zip(out).enumerate() {
+            if let Some(&next) = keys.get(i + 8) {
+                prefetch_index(&self.shared, next as usize);
+            }
+            if (ors[i] != 0) & (att[i] != 0) {
+                let idx = self.source_index(key, || {
+                    let c = colors[i];
+                    [(c >> 16) as u8, (c >> 8) as u8, c as u8]
+                });
+                *dest = self.packed(idx);
+            }
+        }
     }
 
     /// Packed `rgb<<8 | idx` for a palette index (for callers that stored
@@ -1684,13 +1741,7 @@ impl NearestMap {
     #[inline(always)]
     pub fn prefetch_cache_slot(&self, cache: &IdxCache, r: u8, g: u8, b: u8) {
         if !self.shared.is_empty() {
-            #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-            prefetch_index(&self.shared, Self::shared_key(r, g, b));
-            #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
-            prefetch_index(
-                &self.shared,
-                ((r as usize) << 16) | ((g as usize) << 8) | b as usize,
-            );
+            prefetch_index(&self.shared, self.shared_key(r, g, b));
         } else {
             prefetch_index(&cache.slots, cache.slot(r, g, b).0);
         }
@@ -1704,13 +1755,7 @@ impl NearestMap {
     #[inline(always)]
     pub fn prefetch(&self, r: u8, g: u8, b: u8) {
         if !self.shared.is_empty() {
-            #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-            prefetch_index(&self.shared, Self::shared_key(r, g, b));
-            #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
-            prefetch_index(
-                &self.shared,
-                ((r as usize) << 16) | ((g as usize) << 8) | b as usize,
-            );
+            prefetch_index(&self.shared, self.shared_key(r, g, b));
         } else {
             prefetch_index(&self.direct, grid_key(r, g, b));
         }
@@ -1868,6 +1913,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn staged_source_queries_match_reference_and_preserve_inactive_probes() {
+        let colors: Vec<[u8; 3]> = (0..255u32)
+            .map(|i| [(i * 17) as u8, (i * 31) as u8, (i * 53) as u8])
+            .collect();
+        let reference = NearestMap::build(&colors);
+        let source = NearestMap::build_source_auto(&colors);
+        if !source.uses_tiled_source_cache() {
+            return;
+        }
+        let level = fearless_simd::Level::new();
+        for len in [0, 1, 7, 8, 15, 16, 17, 31, 33, 65] {
+            let rgba: Vec<u8> = (0..len)
+                .flat_map(|i| {
+                    [
+                        (i * 37) as u8,
+                        (i * 19) as u8,
+                        (i * 73) as u8,
+                        (i * 11) as u8,
+                    ]
+                })
+                .collect();
+            let packed: Vec<u32> = rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32)
+                .collect();
+            let expected: Vec<u8> = rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| reference.lookup(c[0], c[1], c[2]))
+                .collect();
+            let mut keys = vec![0; len];
+            let mut row = vec![0; len];
+            let ors: Vec<u32> = (0..len).map(|i| (i % 3) as u32).collect();
+            let att: Vec<u32> = (0..len).map(|i| (i % 2 * 256) as u32).collect();
+            for _ in 0..2 {
+                let mut probes = vec![0xdeadbeef; len];
+                crate::simdops::source_keys_rgba(level, &rgba, &mut keys);
+                source.source_probes(&packed, &keys, &ors, &att, &mut probes);
+                for i in 0..len {
+                    assert_eq!(
+                        probes[i],
+                        if ors[i] != 0 && att[i] != 0 {
+                            reference.packed(expected[i])
+                        } else {
+                            0xdeadbeef
+                        }
+                    );
+                }
+                source.source_row(level, &rgba, &mut keys, &mut row);
+                assert_eq!(row, expected);
+            }
+        }
+    }
+
+    #[test]
     fn cell_radius_covers_every_integer_color() {
         // The lookup's triangle bound has 1e-6 of slack, equivalent to
         // adding 0.5e-6 to rmax before doubling it. Check the sphere over
@@ -1910,7 +2013,10 @@ mod tests {
             *s
         }
         let mut state = 731u32;
-        for count in [1, 2, 18, 255] {
+        for (count, auto) in [1, 2, 18, 255]
+            .into_iter()
+            .flat_map(|n| [(n, false), (n, true)])
+        {
             let mut colors: Vec<[u8; 3]> = (0..count)
                 .map(|_| {
                     let c = next(&mut state);
@@ -1922,7 +2028,11 @@ mod tests {
             }
             colors[count - 1] = [255; 3];
             let reference = NearestMap::build(&colors);
-            let source = NearestMap::build_source(&colors);
+            let source = if auto {
+                NearestMap::build_source_auto(&colors)
+            } else {
+                NearestMap::build_source(&colors)
+            };
             let entries: Vec<(u32, u32)> =
                 (0..256).map(|_| (next(&mut state) & 0xffffff, 1)).collect();
             source.prewarm(&entries, false);

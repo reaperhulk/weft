@@ -426,23 +426,30 @@ impl<'a> Quantizer<'a> {
 
         // ---- pass A: c1 per pixel, tile contour counts ----------------
         for y in 0..h {
-            let keys_ready = src.fill_row_with_grid_keys(y, &mut scratch.row, &mut scratch.keys);
-            if !keys_ready {
-                crate::simdops::bn_keys(level, &scratch.row, &mut scratch.keys);
-            }
-            let cache = &mut scratch.cache;
-            let row = &scratch.row[..];
             let (before, rest) = scratch.idx_frame.split_at_mut(y * w);
             let irow = &mut rest[..w];
-            for i in 0..w {
-                if let Some(p) = row.get((i + 8) * 4..(i + 8) * 4 + 4) {
-                    self.nearest.prefetch_cache_slot(cache, p[0], p[1], p[2]);
+            if self.nearest.uses_tiled_source_cache() {
+                src.fill_row(y, &mut scratch.row);
+                self.nearest
+                    .source_row(level, &scratch.row, &mut scratch.keys, irow);
+            } else {
+                let keys_ready =
+                    src.fill_row_with_grid_keys(y, &mut scratch.row, &mut scratch.keys);
+                if !keys_ready {
+                    crate::simdops::bn_keys(level, &scratch.row, &mut scratch.keys);
                 }
-                let p = &row[i * 4..i * 4 + 4];
-                irow[i] = self
-                    .nearest
-                    .lookup_cache_first(cache, scratch.keys[i], p[0], p[1], p[2])
-                    as u8;
+                let cache = &mut scratch.cache;
+                let row = &scratch.row[..];
+                for i in 0..w {
+                    if let Some(p) = row.get((i + 8) * 4..(i + 8) * 4 + 4) {
+                        self.nearest.prefetch_cache_slot(cache, p[0], p[1], p[2]);
+                    }
+                    let p = &row[i * 4..i * 4 + 4];
+                    irow[i] =
+                        self.nearest
+                            .lookup_cache_first(cache, scratch.keys[i], p[0], p[1], p[2])
+                            as u8;
+                }
             }
             // score: run flags + contour candidates (SIMD), then the sparse
             // colour-pair test on candidates, counted per tile
@@ -597,8 +604,13 @@ impl<'a> Quantizer<'a> {
                         scratch.pk1[i] = self.nearest.packed(irow[x0 + i]);
                     }
                 }
+                let probe = if self.nearest.uses_tiled_source_cache() {
+                    crate::simdops::bn_probe_source
+                } else {
+                    crate::simdops::bn_probe
+                };
                 let tile_live = tile_live
-                    && crate::simdops::bn_probe(
+                    && probe(
                         level,
                         row,
                         &scratch.pk1[..tw],
@@ -607,24 +619,34 @@ impl<'a> Quantizer<'a> {
                         &mut scratch.keys2[..tw],
                     );
                 if tile_live {
-                    for i in 0..tw {
-                        if let Some(&c) = scratch.c2c.get(i + 8) {
-                            self.nearest.prefetch_cache_slot(
-                                cache,
-                                (c >> 16) as u8,
-                                (c >> 8) as u8,
-                                c as u8,
-                            );
-                        }
-                        if (scratch.ors[i] != 0) & (att[i] != 0) {
-                            let c = scratch.c2c[i];
-                            scratch.pk2[i] = self.nearest.lookup_cache_first(
-                                cache,
-                                scratch.keys2[i],
-                                (c >> 16) as u8,
-                                (c >> 8) as u8,
-                                c as u8,
-                            );
+                    if self.nearest.uses_tiled_source_cache() {
+                        self.nearest.source_probes(
+                            &scratch.c2c[..tw],
+                            &scratch.keys2[..tw],
+                            &scratch.ors[..tw],
+                            att,
+                            &mut scratch.pk2[..tw],
+                        );
+                    } else {
+                        for i in 0..tw {
+                            if let Some(&c) = scratch.c2c.get(i + 8) {
+                                self.nearest.prefetch_cache_slot(
+                                    cache,
+                                    (c >> 16) as u8,
+                                    (c >> 8) as u8,
+                                    c as u8,
+                                );
+                            }
+                            if (scratch.ors[i] != 0) & (att[i] != 0) {
+                                let c = scratch.c2c[i];
+                                scratch.pk2[i] = self.nearest.lookup_cache_first(
+                                    cache,
+                                    scratch.keys2[i],
+                                    (c >> 16) as u8,
+                                    (c >> 8) as u8,
+                                    c as u8,
+                                );
+                            }
                         }
                     }
                     crate::simdops::bn_threshold(

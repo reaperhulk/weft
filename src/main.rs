@@ -911,6 +911,8 @@ fn run(args: &Args) -> io::Result<()> {
     // serial dependency chain favors the existing local memo/grid lookup.
     let nearest = if n_entries < args.colors || args.dither == Dither::Sierra2_4a {
         palette::NearestMap::build(&colors)
+    } else if args.dither == Dither::Auto {
+        palette::NearestMap::build_source_auto(&colors)
     } else {
         palette::NearestMap::build_source(&colors)
     };
