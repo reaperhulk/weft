@@ -408,8 +408,7 @@ fn cell_geometry_impl<S: Simd>(
     let da = ca - f32x8::splat(simd, q[1]);
     let db = cb - f32x8::splat(simd, q[2]);
     let d = dl * dl + da * da + db * db;
-    let arr: [f32; 8] = d.into();
-    (q, arr.iter().fold(0f32, |m, &v| m.max(v)) * 1.0002)
+    (q, d.reduce_max() * 1.0002)
 }
 
 // ---------------------------------------------------------------------------
@@ -566,8 +565,7 @@ fn bn_keys_att_impl<S: Simd>(
         a.bitcast::<u32x16<S>>().store_slice(&mut att[i..i + 16]);
         i += 16;
     }
-    let arr: [i32; 16] = amin.into();
-    any_alpha |= arr.iter().any(|&a| a < 128);
+    any_alpha |= amin.reduce_min() < 128;
     while i < w {
         let p = &cur[i * 4..i * 4 + 4];
         keys[i] = grid_key_scalar(p[0], p[1], p[2]);
@@ -590,8 +588,7 @@ fn bn_keys_impl<S: Simd>(simd: S, rgba: &[u8], keys: &mut [u32]) -> bool {
         amin = amin.min((px >> 24u32).bitcast::<i32x16<S>>());
         i += 16;
     }
-    let arr: [i32; 16] = amin.into();
-    let mut any_alpha = arr.iter().any(|&a| a < 128);
+    let mut any_alpha = amin.reduce_min() < 128;
     while i < w {
         let p = &rgba[i * 4..i * 4 + 4];
         keys[i] = grid_key_scalar(p[0], p[1], p[2]);
@@ -669,8 +666,7 @@ fn bn_probe_impl<S: Simd, const SOURCE: bool>(
         key.store_slice(&mut keys2[i..i + 16]);
         i += 16;
     }
-    let arr: [u32; 16] = oacc.into();
-    let mut any_err = arr.iter().any(|&o| o != 0);
+    let mut any_err = oacc.reduce_max() != 0;
     while i < w {
         let p = &rgba[i * 4..i * 4 + 4];
         let p1 = pk1[i];
@@ -1097,14 +1093,12 @@ fn nearest_color_impl<S: Simd>(simd: S, pal: &PalSoa, q: [f32; 3]) -> usize {
         minv = minv.min(d);
         current += u32x8::splat(simd, 8);
     }
-    let distances: [f32; 8] = minv.into();
-    let min = distances.iter().copied().fold(f32::MAX, f32::min);
+    let min = minv.reduce_min();
     // Different lanes can tie too: choose the lowest palette index.
-    let winners: [u32; 8] = minv
+    let index = minv
         .simd_eq(f32x8::splat(simd, min))
         .select(indices, u32x8::splat(simd, u32::MAX))
-        .into();
-    let index = winners.iter().copied().min().unwrap();
+        .reduce_min();
     if index == u32::MAX {
         0
     } else {
@@ -1129,8 +1123,7 @@ fn cell_distances_impl<S: Simd>(simd: S, pal: &PalSoa, q: [f32; 3], dists: &mut 
         minv = minv.min(d);
         i += 16;
     }
-    let arr: [f32; 16] = minv.into();
-    arr.iter().fold(f32::MAX, |m, &v| m.min(v))
+    minv.reduce_min()
 }
 
 #[cfg(test)]
