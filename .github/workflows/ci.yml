@@ -91,7 +91,7 @@ jobs:
           cp target/${{ matrix.target }}/release/weft weft-${{ matrix.arch }}-linux-musl
           strip weft-${{ matrix.arch }}-linux-musl
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: weft-${{ matrix.arch }}-linux-musl
           path: weft-${{ matrix.arch }}-linux-musl
@@ -172,7 +172,7 @@ jobs:
           cp target/${{ matrix.target }}/release/weft weft-${{ matrix.arch }}-linux-gnu
           strip weft-${{ matrix.arch }}-linux-gnu
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: weft-${{ matrix.arch }}-linux-gnu
           path: weft-${{ matrix.arch }}-linux-gnu
