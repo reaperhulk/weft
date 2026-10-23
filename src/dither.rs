@@ -65,8 +65,10 @@ impl BandGate {
     pub const DENSITY: u32 = 50; // 2%
     pub const DE_LO: f32 = 0.012;
     pub const DE_HI: f32 = 0.05;
-    /// Live-tile fraction above which the whole frame is dithered: 1/4.
-    pub const FULL_NUM: u64 = 1;
+    /// Live-tile fraction above which the whole frame is dithered: 3/4.
+    /// Mixed frames retain the tile decisions instead of spreading dither
+    /// into flat areas merely because a minority of tiles show banding.
+    pub const FULL_NUM: u64 = 3;
     pub const FULL_DENOM: u64 = 4;
 
     pub fn new(nearest: &crate::palette::NearestMap) -> Self {
@@ -1005,6 +1007,42 @@ mod tests {
         let mut scratch = QuantScratch::new(w, 1);
         q.quantize(&src, w, h, mode, &mut scratch, &mut out, None);
         out
+    }
+
+    #[test]
+    fn auto_keeps_flat_regions_plain_in_a_mixed_frame() {
+        let (w, h) = (128usize, 128usize);
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let v = if y < 32 { 60 + (x / 10) as u8 * 10 } else { 90 };
+                rgba.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let colors: Vec<[u8; 3]> = (0..16u8).map(|i| [i * 17; 3]).collect();
+        let nm = NearestMap::build(&colors);
+        let mut band = BandGate::new(&nm);
+        // Isolate the spatial policy from the colour-pair eligibility test.
+        band.pairs.fill(1);
+        let q = Quantizer {
+            nearest: &nm,
+            trans_idx: 16,
+            exact_palette: false,
+            gate: 16,
+            band: Some(&band),
+        };
+        let plain = quantize_rgba(&q, rgba.clone(), w, h, Dither::None);
+        let blue = quantize_rgba(&q, rgba.clone(), w, h, Dither::BlueNoise);
+        let auto = quantize_rgba(&q, rgba, w, h, Dither::Auto);
+        let flat = 96 * w..h * w;
+        // This fill lies between palette colours: unconditional dithering
+        // changes it, while auto should leave it at its nearest colour.
+        assert_ne!(blue[flat.clone()], plain[flat.clone()]);
+        assert_eq!(auto[flat.clone()], plain[flat]);
+        assert_ne!(auto[..32 * w], plain[..32 * w]);
+        let live = band.live_tiles.load(std::sync::atomic::Ordering::Relaxed);
+        let total = band.total_tiles.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(live * 4 > total && live * 4 <= total * 3);
     }
 
     #[test]
