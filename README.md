@@ -215,7 +215,9 @@ the nearest-colour map: a tile is dithered when enough of its pixels sit
 on a contour between two long same-colour runs whose colours differ by a
 visible-but-small OkLab step — the signature of posterization, which grain
 (short runs) and outlines (large steps) fail. A frame that bands in more
-than a quarter of its tiles is dithered whole. Tiles that do not band skip
+than three quarters of its tiles is dithered whole. Mixed frames retain
+the tile decisions so flat areas are not dithered just because other
+parts of the frame contain gradients. Tiles that do not band skip
 the far-candidate stages entirely, so `auto` costs about the same as
 `bluenoise` on gradient content and approaches `none` on flat content.
 Measured: cel animation dithers ~10% of tiles, live action 10-35%,
