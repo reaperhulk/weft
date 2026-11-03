@@ -163,7 +163,7 @@ fn cbrt3_simd<S: fearless_simd::Simd>(simd: S, l: f32, m: f32, s: f32) -> [f32; 
     let inputs = [l, m, s, 1.0];
     let seeds = inputs.map(cbrt_seed_bits);
     let x = f32x4::from_slice(simd, &inputs);
-    let mut y: f32x4<S> = u32x4::from_slice(simd, &seeds).bitcast();
+    let mut y = f32x4::from_bits(u32x4::from_slice(simd, &seeds));
     let x2 = x + x;
     for _ in 0..2 {
         let y3 = y * y * y;

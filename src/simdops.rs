@@ -322,7 +322,7 @@ fn convert_group_to_rgb_keys<S: Simd>(
 
 #[inline(always)]
 fn convert_channels<S: Simd>(
-    simd: S,
+    _simd: S,
     y16: fearless_simd::u16x8<S>,
     u16v: fearless_simd::u16x8<S>,
     v16v: fearless_simd::u16x8<S>,
@@ -337,11 +337,9 @@ fn convert_channels<S: Simd>(
     let c = (yi - 16) * CY;
     let d = ui - 128;
     let e = vi - 128;
-    let zero = i32x8::splat(simd, 0);
-    let hi = i32x8::splat(simd, 255);
-    let r = ((c + e * CRV + ROUND) >> 16u32).max(zero).min(hi);
-    let g = ((c + d * CGU + e * CGV + ROUND) >> 16u32).max(zero).min(hi);
-    let b = ((c + d * CBU + ROUND) >> 16u32).max(zero).min(hi);
+    let r = ((c + e * CRV + ROUND) >> 16u32).clamp(0, 255);
+    let g = ((c + d * CGU + e * CGV + ROUND) >> 16u32).clamp(0, 255);
+    let b = ((c + d * CBU + ROUND) >> 16u32).clamp(0, 255);
     (r, g, b)
 }
 
@@ -350,13 +348,13 @@ fn convert_channels<S: Simd>(
 /// Halley iterations — a few ULPs of accuracy, like `oklab::cbrt_fast`.
 #[inline(always)]
 fn cbrt_x8<S: Simd>(simd: S, x: f32x8<S>) -> f32x8<S> {
-    let bits: u32x8<S> = x.bitcast();
+    let bits = x.to_bits();
     // t = bits * (1/4 + 1/16) * (1 + 1/16) * (1 + 1/256) ~= bits / 3
     let t = (bits >> 2u32) + (bits >> 4u32);
     let t = t + (t >> 4u32);
     let t = t + (t >> 8u32);
     let seed = t + u32x8::splat(simd, 709_921_077);
-    let mut y: f32x8<S> = seed.bitcast();
+    let mut y = f32x8::from_bits(seed);
     let two = f32x8::splat(simd, 2.0);
     for _ in 0..2 {
         let y3 = y * y * y;
@@ -512,8 +510,6 @@ fn bn_activity_impl<S: Simd>(simd: S, cur: &[u8], prev: &[u8], gate: u32, att: &
     }
     let g64 = gate as i32 + 64;
     att[0] = att_scalar(cur, prev, 0, g64);
-    let zero = i32x16::splat(simd, 0);
-    let full = i32x16::splat(simd, 256);
     let g64v = i32x16::splat(simd, g64);
     let mut i = 1usize;
     while i + 16 <= w {
@@ -521,7 +517,7 @@ fn bn_activity_impl<S: Simd>(simd: S, cur: &[u8], prev: &[u8], gate: u32, att: &
         let pl = px16(simd, &cur[(i - 1) * 4..]);
         let pu = px16(simd, &prev[i * 4..]);
         let act = sad3(simd, px, pl) + sad3(simd, px, pu);
-        let a = ((g64v - act) << 2u32).max(zero).min(full);
+        let a = ((g64v - act) << 2u32).clamp(0, 256);
         a.bitcast::<u32x16<S>>().store_slice(&mut att[i..i + 16]);
         i += 16;
     }
@@ -549,8 +545,6 @@ fn bn_keys_att_impl<S: Simd>(
     att[0] = att_scalar(cur, prev, 0, g64);
     keys[0] = grid_key_scalar(cur[0], cur[1], cur[2]);
     let mut any_alpha = cur[3] < 128;
-    let zero = i32x16::splat(simd, 0);
-    let full = i32x16::splat(simd, 256);
     let g64v = i32x16::splat(simd, g64);
     let mut amin = i32x16::splat(simd, 255);
     let mut i = 1usize;
@@ -561,7 +555,7 @@ fn bn_keys_att_impl<S: Simd>(
         let pl = px16(simd, &cur[(i - 1) * 4..]);
         let pu = px16(simd, &prev[i * 4..]);
         let act = sad3(simd, px, pl) + sad3(simd, px, pu);
-        let a = ((g64v - act) << 2u32).max(zero).min(full);
+        let a = ((g64v - act) << 2u32).clamp(0, 256);
         a.bitcast::<u32x16<S>>().store_slice(&mut att[i..i + 16]);
         i += 16;
     }
@@ -638,8 +632,6 @@ fn bn_probe_impl<S: Simd, const SOURCE: bool>(
 ) -> bool {
     let w = pk1.len();
     let ff = u32x16::splat(simd, 0xFF);
-    let zero = i32x16::splat(simd, 0);
-    let hi = i32x16::splat(simd, 255);
     let mut oacc = u32x16::splat(simd, 0);
     let mut i = 0usize;
     while i + 16 <= w {
@@ -654,9 +646,9 @@ fn bn_probe_impl<S: Simd, const SOURCE: bool>(
         let o: u32x16<S> = (er | eg | eb).bitcast();
         o.store_slice(&mut ors[i..i + 16]);
         oacc |= o;
-        let r2 = (r + er + er).max(zero).min(hi).bitcast::<u32x16<S>>();
-        let g2 = (g + eg + eg).max(zero).min(hi).bitcast::<u32x16<S>>();
-        let b2 = (b + eb + eb).max(zero).min(hi).bitcast::<u32x16<S>>();
+        let r2 = (r + er + er).clamp(0, 255).bitcast::<u32x16<S>>();
+        let g2 = (g + eg + eg).clamp(0, 255).bitcast::<u32x16<S>>();
+        let b2 = (b + eb + eb).clamp(0, 255).bitcast::<u32x16<S>>();
         ((r2 << 16u32) | (g2 << 8u32) | b2).store_slice(&mut c2c[i..i + 16]);
         let key = if SOURCE {
             source_key16(simd, r2, g2, b2)
@@ -689,25 +681,23 @@ fn bn_probe_impl<S: Simd, const SOURCE: bool>(
     any_err
 }
 
+/// Per-byte absolute difference of two packed-RGBA vectors, summed over
+/// each pixel's four bytes. Byte-wise max - min gives every |channel diff|
+/// in one subtraction; two pairwise widening adds (u8 -> u16 -> u32) then
+/// reduce each pixel's bytes to one lane. Each sum is at most 1020.
+#[inline(always)]
+fn sad_bytes<S: Simd>(d: u8x64<S>) -> i32x16<S> {
+    d.pairwise_widening_add().pairwise_widening_add().bitcast()
+}
+
 /// Summed per-channel absolute difference of two packed-RGBA vectors
-/// (alpha excluded). Byte-wise max - min gives every |channel diff| in
-/// one subtraction; the alpha byte is masked off and the three remaining
-/// bytes of each lane summed (each <= 255, so the 32-bit sums can't
-/// carry into one another).
+/// (alpha excluded): the alpha byte is masked off before the reduction.
 #[inline(always)]
 fn sad3<S: Simd>(simd: S, a: u32x16<S>, b: u32x16<S>) -> i32x16<S> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        sad_neon::<S, false>(simd, a, b)
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let ab = a.bitcast::<u8x64<S>>();
-        let bb = b.bitcast::<u8x64<S>>();
-        let d = (ab.max(bb) - ab.min(bb)).bitcast::<u32x16<S>>();
-        let ff = u32x16::splat(simd, 0xFF);
-        ((d & ff) + ((d >> 8u32) & ff) + ((d >> 16u32) & ff)).bitcast()
-    }
+    let ab = a.bitcast::<u8x64<S>>();
+    let bb = b.bitcast::<u8x64<S>>();
+    let d = (ab.max(bb) - ab.min(bb)).bitcast::<u32x16<S>>() & u32x16::splat(simd, 0x00FF_FFFF);
+    sad_bytes(d.bitcast())
 }
 
 /// Summed absolute difference over all four bytes of two packed pixels
@@ -716,46 +706,10 @@ fn sad3<S: Simd>(simd: S, a: u32x16<S>, b: u32x16<S>) -> i32x16<S> {
 /// intended effect for the prefilters (a pixel whose alpha moved is not
 /// "the same" pixel) and saves the separate alpha compare.
 #[inline(always)]
-fn sad4<S: Simd>(simd: S, a: u32x16<S>, b: u32x16<S>) -> i32x16<S> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        sad_neon::<S, true>(simd, a, b)
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let ab = a.bitcast::<u8x64<S>>();
-        let bb = b.bitcast::<u8x64<S>>();
-        let d = (ab.max(bb) - ab.min(bb)).bitcast::<u32x16<S>>();
-        let m = u32x16::splat(simd, 0x00FF_00FF);
-        let pairs = (d & m) + ((d >> 8u32) & m); // r+g in low 16, b+a in high 16
-        ((pairs & u32x16::splat(simd, 0xFFFF)) + (pairs >> 16u32)).bitcast()
-    }
-}
-
-/// NEON's pairwise widening sums reduce four byte differences directly
-/// to a pixel distance. Each four-channel sum is at most 1020.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn sad_neon<S: Simd, const ALPHA: bool>(simd: S, a: u32x16<S>, b: u32x16<S>) -> i32x16<S> {
-    use std::arch::aarch64::*;
-    let aa: [u32; 16] = a.into();
-    let bb: [u32; 16] = b.into();
-    let mut out = [0i32; 16];
-    // SAFETY: NEON is baseline on aarch64. Each load/store covers four
-    // of the sixteen array elements; NEON permits unaligned addresses.
-    unsafe {
-        for i in (0..16).step_by(4) {
-            let x = vld1q_u8(aa.as_ptr().add(i).cast());
-            let y = vld1q_u8(bb.as_ptr().add(i).cast());
-            let mut diff = vabdq_u8(x, y);
-            if !ALPHA {
-                diff = vandq_u8(diff, vreinterpretq_u8_u32(vdupq_n_u32(0x00ffffff)));
-            }
-            let sum = vpaddlq_u16(vpaddlq_u8(diff));
-            vst1q_u32(out.as_mut_ptr().add(i).cast(), sum);
-        }
-    }
-    i32x16::from_slice(simd, &out)
+fn sad4<S: Simd>(_simd: S, a: u32x16<S>, b: u32x16<S>) -> i32x16<S> {
+    let ab = a.bitcast::<u8x64<S>>();
+    let bb = b.bitcast::<u8x64<S>>();
+    sad_bytes(ab.max(bb) - ab.min(bb))
 }
 
 /// Scalar `bn_activity` for one pixel (vector-loop edges and tails; also
@@ -1915,9 +1869,9 @@ fn lab8_exact<S: Simd>(simd: S, lr: f32x8<S>, lg: f32x8<S>, lb: f32x8<S>) -> [f3
     let m = lr * 0.2119034982 + lg * 0.6806995451 + lb * 0.1073969566;
     let s = lr * 0.0883024619 + lg * 0.2817188376 + lb * 0.6299787005;
     let root = |x: f32x8<S>| {
-        let bits: [u32; 8] = x.bitcast::<u32x8<S>>().into();
+        let bits: [u32; 8] = x.to_bits().into();
         let seeds = bits.map(|b| b / 3 + 709_921_077);
-        let mut y: f32x8<S> = u32x8::from_slice(simd, &seeds).bitcast();
+        let mut y = f32x8::from_bits(u32x8::from_slice(simd, &seeds));
         let x2 = x + x;
         for _ in 0..2 {
             let y3 = y * y * y;
