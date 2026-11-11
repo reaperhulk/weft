@@ -1,35 +1,112 @@
 # Changelog
 
-## Unreleased
+## 0.8.0
 
-Faster on every clip measured, with **byte-identical output**: 34% more
-throughput at `--lossy 30 --hold 12` and 35% at the defaults over the
-20-clip Frinkiac corpus (geometric mean, 4 threads), for 27-29% less CPU
-time. Verified identical across RGBA, y4m and alpha input, six flag sets
-and 1-13 threads (960 runs). No flag, default, palette or compression
-threshold changed. See [bench/change-counting.md](bench/change-counting.md).
+A third faster, with **byte-identical output**. No flag, default, palette,
+or compression threshold changed.
+([#75](https://github.com/reaperhulk/weft/pull/75))
 
-- The histogram pass counts pixels by change instead of by frame. A frame
-  is compared with its predecessor and only the pixels that differ emit a
-  run, for the colour that just ended, weighted by how many frames it
-  stood; the rest of the clip is counted once at the end. The sums are
-  the integers the per-frame scan produced. Row strips whose content
-  changes everywhere into long runs (fades, animated gradients) fall back
-  to the per-frame scan, with an exact hand-over in both directions. This
-  roughly halves the pass on video-sourced clips, for RGBA and y4m alike.
+Measured over the 20-clip Frinkiac corpus at four threads (geometric
+mean): 35% more throughput at `--lossy 30 --hold 12` and 33% at the
+defaults, for 28% less CPU time. Every clip improves, by 9% to 74%; the
+stillest gain most. y4m input gains 15-75% on the same clips. These
+figures are from a 4-vCPU machine, not the 20-40 cores earlier releases
+were measured on, where the read phase is paced by the reader rather than
+by CPU; expect the gain there to differ. See
+[bench/change-counting.md](bench/change-counting.md).
+
+- The histogram pass counts pixels by change instead of by frame. Each
+  frame is compared with its predecessor and only the pixels that differ
+  emit a run, for the colour that just ended, weighted by how many frames
+  it stood; what is still on screen is counted once at the end. The sums
+  are the integers the per-frame scan produced, so the palette is
+  unchanged. On cartoon clips 5-37% of pixels change per frame behind
+  `--hold 12` (10-62% without), and the pass roughly halves. RGBA and y4m
+  alike.
+- Row strips whose content changes everywhere into long runs (a fade
+  across flat fills, an animated gradient) are still scanned per frame,
+  which handles them better. A strip switches after two frames of
+  producing three times more changes than runs, and switches back when
+  that stops; both hand-overs are exact.
 - LZW starts a match that begins in a transparent run at the deepest
   all-transparent dictionary string the run reaches, instead of walking
   there one pixel and one hash probe at a time. Transparent runs are most
-  of a delta frame; 94% of their pixels were being walked. Applies to
-  lossless and `--lossy` encoding.
+  of a delta frame. `--lossy` and lossless encoding both benefit (about 8%
+  and 6% end to end).
 - Zero-initialised tables that are read before they are first written (the
   coarse histogram bins, the shared nearest-colour cache) no longer fault
   twice per page. The second fault had to interrupt every other core to
-  flush a mapping, which was 5% of all samples at four threads.
+  flush a mapping; that was 5% of all samples at four threads, and it
+  grows with the thread count.
 - On Linux, stdin's pipe buffer is raised to 1 MiB where the system allows
-  it: 5% less wall time when frames are piped in.
-- Peak memory is up 5-8 MiB at 480x360 (per-pixel state for the change
-  counter, and the two tables above now being fully resident).
+  it (the default is 64 KiB, a tenth of a 480x360 RGBA frame): 5% less
+  wall time when frames are piped in.
+
+Costs: peak memory is up 5-8 MiB at 480x360, for the change counter's
+per-pixel state and the two tables above now being fully resident. One
+case got slower: a mandelbrot zoom at `--threads 1`, by 2.6%.
+
+Verified identical to the build before it across RGBA, y4m and alpha
+input under six flag sets at 1-13 threads (960 runs, no mismatch), and on
+the static musl build. Also since 0.7.0: fearless_simd 1.2.0, whose
+helpers replace some hand-written kernel code
+([#73](https://github.com/reaperhulk/weft/pull/73)).
+
+## 0.7.0
+
+- Improved automatic dithering on mixed frames
+  ([#70](https://github.com/reaperhulk/weft/pull/70)). Weft now switches
+  to whole-frame dithering only when more than 75% of tiles need it, up
+  from 25%. This keeps flat regions cleaner while continuing to dither
+  gradients.
+- Reduced encoding time by approximately 3% and median GIF size by 6% on
+  nine Frinkiac clips using cghmc's production encoding settings. Average
+  PSNR and SSIM improved or remained unchanged on every tested clip.
+  Results were measured on a four-core VM; gains will vary by workload.
+- Added a regression test for mixed-frame dithering and a reproducible
+  [benchmark report](bench/auto_dither_threshold.md).
+
+Compatibility: the default `--dither auto` mode intentionally produces
+different output. Command-line options and other dithering modes are
+unchanged.
+
+## 0.6.0
+
+**Performance**
+
+- Faster ARM64 RGBA encoding: SIMD improvements to repeated-pixel
+  detection, nearest-color selection, candidate filtering, and OkLab
+  conversion. Apple ARM64 also gets tuned LZW hashing and worker parking.
+  Measured 17.8% higher throughput on an M1 Max.
+  ([#54](https://github.com/reaperhulk/weft/pull/54))
+- Faster palette lookup and GIF delta detection: tighter nearest-color
+  candidate bounds and smaller scans for changed-frame rectangles.
+  Measured 2.9% higher throughput on an M1 Max.
+  ([#55](https://github.com/reaperhulk/weft/pull/55))
+- Shared source-color cache: quantized input now uses a shared,
+  collision-free 16 MiB cache, preclassifying source colors and resolving
+  misses with an exact OkLab kd-tree. Sierra2 and sources already fitting
+  the palette retain their previous lookup paths. Measured 18.1% higher
+  throughput on an M5 Max, with peak memory increasing by up to about 17
+  MiB per encode in the tested corpus.
+  ([#57](https://github.com/reaperhulk/weft/pull/57))
+- Apple ARM64 cache and lossy-LZW improvements: reduced lookup traffic and
+  best-match bookkeeping, restricted to Apple ARM64 after broader changes
+  regressed x86 performance. Measured 3.4% lower wall time on an M5 Max.
+  ([#59](https://github.com/reaperhulk/weft/pull/59))
+- Faster auto dithering: SIMD stages cache addresses for reuse during
+  prefetch and lookup. Native Xeon measurements showed 3.5-6% lower wall
+  time and 12-12.5% fewer instructions; M5 measurements showed roughly
+  3.3% lower wall time.
+  ([#60](https://github.com/reaperhulk/weft/pull/60))
+
+**Fixes and maintenance**
+
+- Corrected cube-root underflow for black when calculating nearest-color
+  cell bounds. ([#55](https://github.com/reaperhulk/weft/pull/55))
+- Updated fearless_simd from 0.7 to 1.0, replacing manual vector
+  reductions with native lane reductions.
+  ([#62](https://github.com/reaperhulk/weft/pull/62))
 
 ## 0.5.0
 
