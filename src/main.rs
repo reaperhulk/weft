@@ -318,6 +318,14 @@ fn run(args: &Args) -> io::Result<()> {
     // buffer instead of being materialized per frame. Alpha presence is
     // detected here too: pass 2+3 needs it before the first frame is
     // quantized.
+    //
+    // That is the shape for planar (y4m) frames. RGBA frames feed the same
+    // phase B from a different phase A: rather than scan each frame, each
+    // is compared with its predecessor and only the pixels that changed
+    // produce a run, weighted by how long the colour they replace had
+    // stood (see "Temporal accumulation" in palette.rs). Most pixels of
+    // most frames do not change, so that is a fraction of the runs for
+    // the same histogram.
     let t1 = Instant::now();
     let pool = pool::global();
     let nthreads = pool.threads();
@@ -349,33 +357,33 @@ fn run(args: &Args) -> io::Result<()> {
         .map(|_| palette::ColorHist::with_capacity(1 << 10))
         .collect();
     let mut bins: Vec<Vec<[u64; 4]>> = Vec::new();
-    let fold_slabs = |hists: &[palette::ColorHist]| -> Vec<Vec<[u64; 4]>> {
-        pool.map(hists.len() / 4, |_, g| {
-            let mut b = vec![[0u64; 4]; palette::SLAB_BINS];
-            for h in &hists[4 * g..4 * g + 4] {
-                palette::accumulate_entries_coarse(&mut b, &h.entries());
-            }
-            b
-        })
-    };
+    let fold_slabs = |hists: &[palette::ColorHist]| fold_slabs(pool, hists);
     struct Routed {
         idx: usize,
         frame: Frame,
-        alpha: bool,
-        runs: Vec<palette::PackedRun>, // this frame's runs, bucket-sorted
-        offs: Vec<u32>,                // BUCKETS + 1 bucket boundaries into runs
+        sorted: Sorted,
     }
     /// One row strip's scan output, before the per-frame merge.
     struct StripOut {
         runs: Vec<palette::PackedRun>,
         counts: [u32; BUCKETS],
-        alpha: bool,
     }
     let mut coarse = false;
     // Per-frame run buffers are recycled between batches: a fresh ~MB
     // allocation per frame (an mmap plus a page fault per 4 KiB) costs
     // more than the hashing itself at low thread counts.
     let run_pool: Mutex<Vec<Vec<palette::PackedRun>>> = Mutex::new(Vec::new());
+    // Temporal accumulation state for RGBA input (see the section of that
+    // name in palette.rs): per pixel, the frame its current colour arrived
+    // in; the last frame seen, still as RGBA, for the next batch's first
+    // comparison and the closing flush; and how many frames that is.
+    let mut since: Vec<u32> = Vec::new();
+    let mut prev_raw: Option<Vec<u8>> = None;
+    let mut seen = 0usize;
+    // Rows per task. Tasks are spatial here -- each walks its rows through
+    // the whole batch in frame order -- so a short batch does not limit
+    // how many there are, and a few per thread balances well enough.
+    let temporal_rows = h.div_ceil(4 * nthreads).clamp(1, STRIP_ROWS);
     let (read_res, mut indexed_frames, any_alpha) = std::thread::scope(|scope| {
         let meta_ref = &meta;
         let hold = args.hold;
@@ -652,7 +660,7 @@ fn run(args: &Args) -> io::Result<()> {
         drop(tx);
         let mut frames: Vec<(usize, Frame)> = Vec::new();
         let mut any_alpha = false;
-        let (mut row1, mut keys1) = (vec![0u8; w * 4], vec![0u32; w]);
+        let mut keys1 = vec![0u32; w];
         let mut runs1: Vec<(u32, u32)> = Vec::new();
         loop {
             let mut batch: Vec<(usize, Frame)> = Vec::with_capacity(batch_cap);
@@ -665,6 +673,79 @@ fn run(args: &Args) -> io::Result<()> {
                     Ok(f) => batch.push(f),
                     Err(_) => break,
                 }
+            }
+            if matches!(batch[0].1, Frame::Rgba(_)) {
+                // RGBA input is counted by change rather than by frame.
+                // The channel delivers frames in order (the reader and the
+                // hold stage are both sequential), which this relies on.
+                debug_assert!(batch.iter().enumerate().all(|(k, (i, _))| *i == seen + k));
+                if since.is_empty() {
+                    since = vec![0u32; w * h];
+                }
+                let strip_px = temporal_rows * w;
+                let bufs: Vec<&[u8]> = batch
+                    .iter()
+                    .map(|(_, f)| match f {
+                        Frame::Rgba(b) => b.as_slice(),
+                        _ => unreachable!("input format changed mid-stream"),
+                    })
+                    .collect();
+                let prev0 = prev_raw.as_deref();
+                let first = seen as u32;
+                let strips: Vec<&mut [u32]> = since.chunks_mut(strip_px).collect();
+                let outs: Vec<(Sorted, Vec<bool>)> = pool.map_into(strips, |_, si, since| {
+                    let lo = si * strip_px * 4;
+                    let hi = lo + since.len() * 4;
+                    let mut sink = palette::RunSink::new();
+                    let mut alpha = vec![false; bufs.len()];
+                    for (k, buf) in bufs.iter().enumerate() {
+                        let cur = &buf[lo..hi];
+                        let prev = if k == 0 { prev0 } else { Some(bufs[k - 1]) };
+                        alpha[k] = match prev {
+                            Some(p) => palette::scan_changed_runs(
+                                cur,
+                                &p[lo..hi],
+                                since,
+                                first + k as u32,
+                                |c, n| sink.add(c, n),
+                            ),
+                            // the clip's first frame: nothing has ended yet
+                            None => palette::has_transparent(cur),
+                        };
+                    }
+                    let (runs, offs) = sink.finish();
+                    (Sorted { runs, offs }, alpha)
+                });
+                drop(bufs);
+                let frame_alpha: Vec<bool> = (0..batch.len())
+                    .map(|k| outs.iter().any(|(_, a)| a[k]))
+                    .collect();
+                seen += batch.len();
+                let last = batch.len() - 1;
+                // Pack the opaque frames down to RGB, as the per-frame path
+                // does, keeping the batch's last frame as RGBA too.
+                let packed: Vec<(usize, Frame, Option<Vec<u8>>)> =
+                    pool.map_into(batch, |_, k, (i, f)| match f {
+                        Frame::Rgba(rgba) if !frame_alpha[k] => {
+                            let rgb = Frame::Rgb(color::rgba_to_rgb(&rgba));
+                            (i, rgb, (k == last).then_some(rgba))
+                        }
+                        Frame::Rgba(rgba) => {
+                            let keep = (k == last).then(|| rgba.clone());
+                            (i, Frame::Rgba(rgba), keep)
+                        }
+                        _ => unreachable!(),
+                    });
+                for (i, f, keep) in packed {
+                    frames.push((i, f));
+                    if keep.is_some() {
+                        prev_raw = keep;
+                    }
+                }
+                any_alpha |= frame_alpha.iter().any(|&a| a);
+                let parts: Vec<&Sorted> = outs.iter().map(|(s, _)| s).collect();
+                accumulate_sorted(pool, &parts, &mut hists, &mut bins, &mut coarse);
+                continue;
             }
             if nthreads == 1 {
                 // Nothing to parallelize: skip materializing the runs and
@@ -697,29 +778,13 @@ fn run(args: &Args) -> io::Result<()> {
                     }
                 };
                 for (i, f) in batch {
-                    let mut alpha = false;
-                    {
-                        let src = color::RowSource::new(&f, w, h, meta_ref.chroma);
-                        if src.has_direct_rgb_keys() {
-                            for y in 0..h {
-                                src.fill_rgb_keys(y, &mut keys1);
-                                palette::scan_rgb_key_runs(&keys1, &mut runs1);
-                                add_runs(&mut hists, &mut bins, &runs1);
-                            }
-                        } else {
-                            for y in 0..h {
-                                let rgba = rgba_row(&src, y, &mut row1);
-                                alpha |= palette::scan_rgba_runs(rgba, &mut runs1);
-                                add_runs(&mut hists, &mut bins, &runs1);
-                            }
-                        }
+                    let src = color::RowSource::new(&f, w, h, meta_ref.chroma);
+                    for y in 0..h {
+                        src.fill_rgb_keys(y, &mut keys1);
+                        palette::scan_rgb_key_runs(&keys1, &mut runs1);
+                        add_runs(&mut hists, &mut bins, &runs1);
                     }
-                    let frame = match f {
-                        Frame::Rgba(rgba) if !alpha => Frame::Rgb(color::rgba_to_rgb(&rgba)),
-                        other => other,
-                    };
-                    any_alpha |= alpha;
-                    frames.push((i, frame));
+                    frames.push((i, f));
                 }
                 if !coarse {
                     let distinct: usize = hists.iter().map(|h| h.len()).sum();
@@ -743,8 +808,8 @@ fn run(args: &Args) -> io::Result<()> {
             let frames_in: Vec<&Frame> = batch.iter().map(|(_, f)| f).collect();
             let strip_out: Vec<StripOut> = pool.map_init(
                 frames_in.len() * nstrips,
-                || (vec![0u8; w * 4], vec![0u32; w]),
-                |(row, keys), _, t| {
+                || vec![0u32; w],
+                |keys, _, t| {
                     let (fi, si) = (t / nstrips, t % nstrips);
                     let y0 = si * STRIP_ROWS;
                     let y1 = ((si + 1) * STRIP_ROWS).min(h);
@@ -752,90 +817,58 @@ fn run(args: &Args) -> io::Result<()> {
                     // capacity is never exceeded and never regrown
                     let mut runs = Vec::with_capacity((y1 - y0) * w);
                     let mut counts = [0u32; BUCKETS];
-                    let mut alpha = false;
                     let src = color::RowSource::new(frames_in[fi], w, h, meta_ref.chroma);
-                    if src.has_direct_rgb_keys() {
-                        for y in y0..y1 {
-                            src.fill_rgb_keys(y, keys);
-                            palette::scan_rgb_key_runs_counted(keys, &mut runs, &mut counts);
-                        }
-                    } else {
-                        for y in y0..y1 {
-                            alpha |= palette::scan_rgba_runs_counted(
-                                rgba_row(&src, y, row),
-                                &mut runs,
-                                &mut counts,
-                            );
-                        }
+                    for y in y0..y1 {
+                        src.fill_rgb_keys(y, keys);
+                        palette::scan_rgb_key_runs_counted(keys, &mut runs, &mut counts);
                     }
-                    StripOut {
-                        runs,
-                        counts,
-                        alpha,
-                    }
+                    StripOut { runs, counts }
                 },
             );
             drop(frames_in);
-            let routed: Vec<Routed> = pool.map_into(batch, |_, fi, (i, f)| {
+            let routed: Vec<Routed> = pool.map_into(batch, |_, fi, (i, frame)| {
                 let strips = &strip_out[fi * nstrips..(fi + 1) * nstrips];
                 let mut counts = [0u32; BUCKETS];
-                let mut alpha = false;
                 for st in strips {
                     for (t, v) in counts.iter_mut().zip(st.counts.iter()) {
                         *t += v;
                     }
-                    alpha |= st.alpha;
                 }
                 let chunks: Vec<&[palette::PackedRun]> =
                     strips.iter().map(|st| st.runs.as_slice()).collect();
                 let mut runs = run_pool.lock().unwrap().pop().unwrap_or_default();
                 let offs = palette::bucket_runs_chunks(&chunks, &counts, &mut runs);
-                // The scan just told us whether this frame uses any
-                // transparency; when it doesn't, the alpha plane is
-                // a constant and the frame can be packed to RGB for
-                // the rest of its (clip-long) life. The RGBA buffer
-                // is freed immediately, so the extra resident bytes
-                // are one frame per busy worker, not one per clip.
-                let frame = match f {
-                    Frame::Rgba(rgba) if !alpha => Frame::Rgb(color::rgba_to_rgb(&rgba)),
-                    other => other,
-                };
                 Routed {
                     idx: i,
                     frame,
-                    alpha,
-                    runs,
-                    offs,
+                    sorted: Sorted { runs, offs },
                 }
             });
             // phase B: one task per bucket, all of the batch's runs for it
-            if coarse && bins.is_empty() {
-                bins = fold_slabs(&hists);
-                hists = Vec::new();
-            }
-            if coarse {
-                pool.for_each_mut(&mut bins, |_, g, slab| {
-                    for r in &routed {
-                        let s = &r.runs[r.offs[4 * g] as usize..r.offs[4 * g + 4] as usize];
-                        palette::accumulate_runs_coarse(slab, s);
-                    }
-                });
-            } else {
-                pool.for_each_mut(&mut hists, |_, b, hist| {
-                    for r in &routed {
-                        let s = &r.runs[r.offs[b] as usize..r.offs[b + 1] as usize];
-                        palette::accumulate_runs(hist, s);
-                    }
-                });
-                let distinct: usize = hists.iter().map(|h| h.len()).sum();
-                coarse = distinct > palette::FOLD_MAX;
-            }
+            let parts: Vec<&Sorted> = routed.iter().map(|r| &r.sorted).collect();
+            accumulate_sorted(pool, &parts, &mut hists, &mut bins, &mut coarse);
+            drop(parts);
             let mut recycle = run_pool.lock().unwrap();
             for r in routed {
-                any_alpha |= r.alpha;
                 frames.push((r.idx, r.frame));
-                recycle.push(r.runs);
+                recycle.push(r.sorted.runs);
             }
+        }
+        if let Some(last) = &prev_raw {
+            // Temporal accumulation: count what is still on screen.
+            let strip_px = temporal_rows * w;
+            let total = seen as u32;
+            let strips: Vec<&[u32]> = since.chunks(strip_px).collect();
+            let outs: Vec<Sorted> = pool.map_into(strips, |_, si, since| {
+                let lo = si * strip_px * 4;
+                let mut sink = palette::RunSink::new();
+                let rows = &last[lo..lo + since.len() * 4];
+                palette::scan_final_runs(rows, since, total, |c, n| sink.add(c, n));
+                let (runs, offs) = sink.finish();
+                Sorted { runs, offs }
+            });
+            let parts: Vec<&Sorted> = outs.iter().collect();
+            accumulate_sorted(pool, &parts, &mut hists, &mut bins, &mut coarse);
         }
         let read_res = reader_handle.join().expect("reader thread panicked");
         let (t_hold, hold_t_sum, hold_frames) = hold_handle
@@ -1197,18 +1230,56 @@ fn run(args: &Args) -> io::Result<()> {
     Ok(())
 }
 
-/// Row `y` of `src` as RGBA: borrowed straight from the frame when it is
-/// already stored that way, otherwise converted into `scratch` (len w*4).
-/// RGBA input is by far the hot case, and copying every source byte into a
-/// scratch row just to read it back is pure overhead.
-#[inline]
-fn rgba_row<'r>(src: &color::RowSource<'r>, y: usize, scratch: &'r mut [u8]) -> &'r [u8] {
-    match src.rgba_row(y) {
-        Some(borrowed) => borrowed,
-        None => {
-            src.fill_row(y, scratch);
-            scratch
+/// Pass-1 runs bucket-sorted by red byte: phase A's output, phase B's
+/// input.
+struct Sorted {
+    runs: Vec<palette::PackedRun>,
+    /// 257 bucket boundaries into `runs`.
+    offs: Vec<u32>,
+}
+
+/// Fold the exact per-red-byte tables into coarse bins, one array per red
+/// slab (four adjacent buckets).
+fn fold_slabs(pool: &Pool, hists: &[palette::ColorHist]) -> Vec<Vec<[u64; 4]>> {
+    pool.map(hists.len() / 4, |_, g| {
+        let mut b = vec![[0u64; 4]; palette::SLAB_BINS];
+        for h in &hists[4 * g..4 * g + 4] {
+            palette::accumulate_entries_coarse(&mut b, &h.entries());
         }
+        b
+    })
+}
+
+/// Pass 1 phase B: add bucket-sorted runs to the histogram, one task per
+/// bucket (or per slab once the histogram has gone coarse), then decide
+/// whether it has outgrown the exact tables.
+fn accumulate_sorted(
+    pool: &Pool,
+    parts: &[&Sorted],
+    hists: &mut Vec<palette::ColorHist>,
+    bins: &mut Vec<Vec<[u64; 4]>>,
+    coarse: &mut bool,
+) {
+    if *coarse && bins.is_empty() {
+        *bins = fold_slabs(pool, hists);
+        *hists = Vec::new();
+    }
+    if *coarse {
+        pool.for_each_mut(bins, |_, g, slab| {
+            for r in parts {
+                let s = &r.runs[r.offs[4 * g] as usize..r.offs[4 * g + 4] as usize];
+                palette::accumulate_runs_coarse(slab, s);
+            }
+        });
+    } else {
+        pool.for_each_mut(hists, |_, b, hist| {
+            for r in parts {
+                let s = &r.runs[r.offs[b] as usize..r.offs[b + 1] as usize];
+                palette::accumulate_runs(hist, s);
+            }
+        });
+        let distinct: usize = hists.iter().map(|h| h.len()).sum();
+        *coarse = distinct > palette::FOLD_MAX;
     }
 }
 

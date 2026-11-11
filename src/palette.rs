@@ -218,7 +218,7 @@ pub fn scan_rgb_key_runs(keys: &[u32], runs: &mut Vec<(u32, u32)>) {
 /// < 128 are skipped; returns true when any were, so the pipeline knows
 /// the disposal mode (and thus whether delta encoding is possible) before
 /// quantization starts.
-#[inline(always)]
+#[cfg(test)]
 pub fn scan_rgba_runs(rgba: &[u8], runs: &mut Vec<(u32, u32)>) -> bool {
     runs.clear();
     scan_runs_with(rgba, |c, n| runs.push((c, n)))
@@ -305,13 +305,213 @@ pub fn scan_rgb_key_runs_counted(keys: &[u32], all: &mut Vec<PackedRun>, counts:
 
 /// `scan_rgba_runs`, appending packed runs to `all` and counting per red
 /// byte; returns whether any pixel was transparent.
-#[inline(always)]
+#[cfg(test)]
 pub fn scan_rgba_runs_counted(
     rgba: &[u8],
     all: &mut Vec<PackedRun>,
     counts: &mut [u32; 256],
 ) -> bool {
     scan_runs_with(rgba, |c, n| push_packed_runs(all, counts, c, n))
+}
+
+// ---------------------------------------------------------------------------
+// Temporal accumulation (pass 1, RGBA input)
+//
+// Scanning every frame counts every pixel once per frame. But most pixels
+// of most frames are the pixel that was there a frame ago — more so behind
+// `--hold`, which exists to make that true — and a colour that sits at one
+// position for k frames can be counted once, with weight k, when it is
+// finally replaced. So instead of scanning frames, compare each frame with
+// its predecessor and emit one weighted entry per *changed* pixel, for the
+// colour that just ended; `since` remembers, per pixel, the frame its
+// current colour arrived in. Whatever is still standing when the clip ends
+// is emitted by `scan_final_runs`. The sums are the same integers the
+// per-frame scan produces, so the histogram — and everything downstream of
+// it — is identical.
+
+/// Collects weighted colours into packed runs, merging consecutive
+/// entries of one colour (the sums are all a consumer sees, so entries
+/// need not be neighbours on screen to merge).
+pub struct RunSink {
+    runs: Vec<PackedRun>,
+    counts: [u32; 256],
+    last: u32,
+    n: u32,
+}
+
+impl RunSink {
+    pub fn new() -> Self {
+        RunSink {
+            runs: Vec::new(),
+            counts: [0; 256],
+            last: 0,
+            n: 0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn add(&mut self, c: u32, n: u32) {
+        if c == self.last {
+            if let Some(sum) = self.n.checked_add(n) {
+                self.n = sum;
+                return;
+            }
+        }
+        self.flush();
+        self.last = c;
+        self.n = n;
+    }
+
+    #[inline(always)]
+    fn flush(&mut self) {
+        if self.n > 0 {
+            push_packed_runs(&mut self.runs, &mut self.counts, self.last, self.n);
+        }
+    }
+
+    /// The runs, bucket-sorted by red byte, and the 257 bucket boundaries.
+    pub fn finish(mut self) -> (Vec<PackedRun>, Vec<u32>) {
+        self.flush();
+        let mut sorted = Vec::new();
+        let offs = bucket_runs_chunks(&[&self.runs], &self.counts, &mut sorted);
+        (sorted, offs)
+    }
+}
+
+/// Canonical `0xRRGGBB` key of a pixel loaded as a little-endian word.
+#[inline(always)]
+fn le_pixel_key(px: u32) -> u32 {
+    px.swap_bytes() >> 8
+}
+
+/// Whether a pixel loaded as a little-endian word counts as opaque
+/// (alpha >= 128), the test every pass-1 scan applies.
+#[inline(always)]
+fn le_pixel_opaque(px: u32) -> bool {
+    px >> 31 != 0
+}
+
+/// Pixel `i` of an RGBA byte block, as a little-endian word.
+#[inline(always)]
+fn le_pixel(block: &[u8; CHANGE_BLOCK * 4], i: usize) -> u32 {
+    u32::from_le_bytes([
+        block[4 * i],
+        block[4 * i + 1],
+        block[4 * i + 2],
+        block[4 * i + 3],
+    ])
+}
+
+/// Pixels per block of the changed-pixel scan: one 64-byte compare decides
+/// whether any of them needs looking at.
+const CHANGE_BLOCK: usize = 16;
+
+/// Compare RGBA rows `cur` (frame number `frame`) against the same rows of
+/// the previous frame. Each pixel that differs ends a stretch of its old
+/// colour: that colour goes to `add` weighted by the number of frames it
+/// stood, unless it was transparent, and `since` restarts at `frame`.
+/// Returns whether any pixel of `cur` is transparent.
+#[inline(always)]
+pub fn scan_changed_runs(
+    cur: &[u8],
+    prev: &[u8],
+    since: &mut [u32],
+    frame: u32,
+    mut add: impl FnMut(u32, u32),
+) -> bool {
+    debug_assert!(cur.len() == prev.len() && cur.len() == since.len() * 4);
+    const ALPHA_TOP: u64 = 0x8000_0000_8000_0000;
+    let mut opaque = ALPHA_TOP;
+    let (cb, ct) = cur.as_chunks::<{ CHANGE_BLOCK * 4 }>();
+    let (pb, pt) = prev.as_chunks::<{ CHANGE_BLOCK * 4 }>();
+    let (sb, st) = since.as_chunks_mut::<CHANGE_BLOCK>();
+    for ((c, p), s) in cb.iter().zip(pb).zip(sb) {
+        let (cw, pw) = (c.as_chunks::<8>().0, p.as_chunks::<8>().0);
+        let mut diff = 0u64;
+        for (x, y) in cw.iter().zip(pw) {
+            let x = u64::from_le_bytes(*x);
+            diff |= x ^ u64::from_le_bytes(*y);
+            opaque &= x;
+        }
+        if diff == 0 {
+            continue;
+        }
+        // Word arrays and branch-free reductions over them, so the block
+        // tests below compile to a few vector compares.
+        let cu: [u32; CHANGE_BLOCK] = std::array::from_fn(|i| le_pixel(c, i));
+        let pu: [u32; CHANGE_BLOCK] = std::array::from_fn(|i| le_pixel(p, i));
+        // A block that was one flat colour, all of it since the same
+        // frame, is one entry: closing the colour's stretch early for the
+        // pixels that did not change is still exact, since they simply
+        // start a new stretch of the same colour. Without this a fade or
+        // a cut across a fill pays per pixel here for what the per-frame
+        // scan covered with a few long runs.
+        let (p0, s0) = (pu[0], s[0]);
+        let (mut ragged, mut changed) = (0u32, 0u32);
+        for i in 0..CHANGE_BLOCK {
+            ragged |= (pu[i] ^ p0) | (s[i] ^ s0);
+            changed |= u32::from(cu[i] != pu[i]) << i;
+        }
+        if ragged == 0 {
+            if le_pixel_opaque(p0) {
+                // two halves, so the weight cannot overflow on a long clip
+                let half = (frame - s0) * (CHANGE_BLOCK as u32 / 2);
+                add(le_pixel_key(p0), half);
+                add(le_pixel_key(p0), half);
+            }
+            s.fill(frame);
+            continue;
+        }
+        while changed != 0 {
+            let i = changed.trailing_zeros() as usize;
+            changed &= changed - 1;
+            if le_pixel_opaque(pu[i]) {
+                add(le_pixel_key(pu[i]), frame - s[i]);
+            }
+            s[i] = frame;
+        }
+    }
+    for ((a, b), s) in ct
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(pt.as_chunks::<4>().0)
+        .zip(st)
+    {
+        opaque &= u64::from(u32::from_le_bytes(*a)) << 32 | ALPHA_TOP >> 32;
+        if a != b {
+            let old = u32::from_le_bytes(*b);
+            if le_pixel_opaque(old) {
+                add(le_pixel_key(old), frame - *s);
+            }
+            *s = frame;
+        }
+    }
+    opaque != ALPHA_TOP
+}
+
+/// Emit what `scan_changed_runs` still owes once the last frame is in:
+/// every opaque pixel of that frame (`last`), weighted by the frames its
+/// colour has stood (`frames` is the clip's frame count).
+#[inline(always)]
+pub fn scan_final_runs(last: &[u8], since: &[u32], frames: u32, mut add: impl FnMut(u32, u32)) {
+    debug_assert_eq!(last.len(), since.len() * 4);
+    for (px, &s) in last.as_chunks::<4>().0.iter().zip(since) {
+        let px = u32::from_le_bytes(*px);
+        if le_pixel_opaque(px) {
+            add(le_pixel_key(px), frames - s);
+        }
+    }
+}
+
+/// Whether any pixel of an RGBA buffer is transparent (alpha < 128).
+pub fn has_transparent(rgba: &[u8]) -> bool {
+    let top = rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .fold(0x80u8, |acc, px| acc & px[3]);
+    top == 0
 }
 
 /// Scatter a frame's packed runs by red byte into `sorted` (reused;
@@ -395,19 +595,18 @@ pub fn accumulate_entries_coarse(bins: &mut [[u64; 4]], entries: &[(u32, u32)]) 
     }
 }
 
-#[inline(always)]
+/// The per-frame scan: every opaque pixel of an RGBA buffer, as runs.
+/// The encoder counts RGBA input by change instead (see "Temporal
+/// accumulation" below); this is what that has to agree with, and the
+/// tests hold it to it.
+#[cfg(test)]
 fn scan_runs_with(rgba: &[u8], mut add: impl FnMut(u32, u32)) -> bool {
-    let pixels = rgba.as_chunks::<4>().0;
-    let n = pixels.len();
     let mut has_alpha = false;
     let mut last: u32 = u32::MAX;
     let mut run: u32 = 0;
-    let mut i = 0usize;
-    while i < n {
-        let px = pixels[i];
+    for px in rgba.as_chunks::<4>().0 {
         if px[3] < 128 {
             has_alpha = true;
-            i += 1;
             continue;
         }
         let c = ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | px[2] as u32;
@@ -420,55 +619,11 @@ fn scan_runs_with(rgba: &[u8], mut add: impl FnMut(u32, u32)) -> bool {
             last = c;
             run = 1;
         }
-        i += 1;
-        // Extend repeated raw pixels after a scalar equality guard, so
-        // noisy content avoids building a vector pattern for every pixel.
-        // NEON also finds the first mismatch within the final block;
-        // other targets retain whole-block equality checks. Equal raw
-        // words share alpha, so every counted pixel is opaque.
-        if i < n && pixels[i] == px {
-            #[cfg(target_arch = "aarch64")]
-            {
-                let extra = crate::simdops::rgba_run_prefix(&rgba[i * 4..], px);
-                run += extra as u32;
-                i += extra;
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                let mut pattern = [0u8; 32];
-                for chunk in pattern.as_chunks_mut::<4>().0 {
-                    *chunk = px;
-                }
-                let bytes = &rgba[i * 4..];
-                let mut off = 0usize;
-                while off + 32 <= bytes.len() && eq32(&bytes[off..off + 32], &pattern) {
-                    off += 32;
-                }
-                run += (off / 4) as u32;
-                i += off / 4;
-            }
-        }
     }
     if run > 0 {
         add(last, run);
     }
     has_alpha
-}
-
-/// 32-byte equality via four u64 loads. Slice `==` lowers to libc
-/// `memcmp`, which musl implements as a byte loop; this stays fast on
-/// every target.
-#[inline]
-#[cfg(not(target_arch = "aarch64"))]
-fn eq32(a: &[u8], b: &[u8; 32]) -> bool {
-    debug_assert_eq!(a.len(), 32);
-    let mut acc = 0u64;
-    for k in 0..4 {
-        let x = u64::from_ne_bytes(a[k * 8..k * 8 + 8].try_into().unwrap());
-        let y = u64::from_ne_bytes(b[k * 8..k * 8 + 8].try_into().unwrap());
-        acc |= x ^ y;
-    }
-    acc == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -2532,6 +2687,135 @@ mod tests {
             assert_eq!(r as u64, (sum[0] + cnt / 2) / cnt);
             assert_eq!(g as u64, (sum[1] + cnt / 2) / cnt);
             assert_eq!(b as u64, (sum[2] + cnt / 2) / cnt);
+        }
+    }
+
+    /// Counting by change must give the per-frame scan's histogram and
+    /// its per-frame transparency flags, whatever the content does:
+    /// sparse changes, whole-frame fades over flat fills (the block fast
+    /// path), noise, alpha crossing the threshold with and without the
+    /// colour moving, sizes that leave partial blocks, and any split into
+    /// row strips.
+    #[test]
+    fn temporal_accumulation_matches_per_frame_scan() {
+        use std::collections::HashMap;
+        let mut seed = 0x6c07_8965u32;
+        let mut rng = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for case in 0..48 {
+            let (w, h) = [(1, 1), (5, 3), (16, 4), (37, 9), (64, 7), (131, 5)][case % 6];
+            let nframes = 1 + case % 13;
+            let strip_px = [w * h, w, 2 * w, 3 * w][case % 4].max(1);
+            let palette: Vec<[u8; 4]> = (0..6)
+                .map(|_| {
+                    let v = rng().to_le_bytes();
+                    [
+                        v[0],
+                        v[1],
+                        v[2],
+                        [255, 255, 128, 127, 0, 255][rng() as usize % 6],
+                    ]
+                })
+                .collect();
+            // frame 0: wide flat bands, so later full-frame changes meet
+            // whole blocks of one colour
+            let mut frame: Vec<[u8; 4]> = (0..w * h).map(|i| palette[(i / 48) % 3]).collect();
+            let mut want: HashMap<u32, u64> = HashMap::new();
+            let mut got: HashMap<u32, u64> = HashMap::new();
+            let mut since = vec![0u32; w * h];
+            let mut prev: Vec<u8> = Vec::new();
+            let collect = |sink: RunSink, got: &mut HashMap<u32, u64>| {
+                let (runs, offs) = sink.finish();
+                assert_eq!(offs.len(), 257);
+                assert_eq!(*offs.last().unwrap() as usize, runs.len());
+                for b in 0..256 {
+                    for &e in &runs[offs[b] as usize..offs[b + 1] as usize] {
+                        let (c, n) = unpack_run(e);
+                        assert_eq!((c >> 16) as usize, b, "run in the wrong bucket");
+                        *got.entry(c).or_default() += n as u64;
+                    }
+                }
+            };
+            for k in 0..nframes {
+                if k > 0 {
+                    match (case / 6 + k) % 6 {
+                        // everything moves to one new value per old value
+                        0 => {
+                            let shift = palette[3 + k % 3];
+                            for px in frame.iter_mut() {
+                                *px = [
+                                    px[0].wrapping_add(shift[0] | 1),
+                                    px[1].wrapping_add(shift[1]),
+                                    px[2],
+                                    px[3],
+                                ];
+                            }
+                        }
+                        // a sprinkle of changes
+                        1 => {
+                            for px in frame.iter_mut() {
+                                if rng().is_multiple_of(11) {
+                                    *px = palette[rng() as usize % 6];
+                                }
+                            }
+                        }
+                        // alpha alone flips, colour stays
+                        2 => {
+                            for px in frame.iter_mut() {
+                                if rng().is_multiple_of(5) {
+                                    px[3] = [0, 127, 128, 255][rng() as usize % 4];
+                                }
+                            }
+                        }
+                        // noise
+                        3 => {
+                            for px in frame.iter_mut() {
+                                px[rng() as usize % 3] ^= (rng() % 3) as u8;
+                            }
+                        }
+                        // nothing at all
+                        4 => {}
+                        // back to the bands: pixels already there keep
+                        // their stretch, so a flat block's pixels now date
+                        // from different frames
+                        _ => {
+                            for (i, px) in frame.iter_mut().enumerate() {
+                                *px = palette[(i / 48) % 3];
+                            }
+                        }
+                    }
+                }
+                let cur: Vec<u8> = frame.iter().flatten().copied().collect();
+                let mut runs = Vec::new();
+                let alpha_want = scan_rgba_runs(&cur, &mut runs);
+                for (c, n) in runs {
+                    *want.entry(c).or_default() += n as u64;
+                }
+                let mut alpha_got = false;
+                for (si, since) in since.chunks_mut(strip_px).enumerate() {
+                    let lo = si * strip_px * 4;
+                    let hi = lo + since.len() * 4;
+                    let mut sink = RunSink::new();
+                    alpha_got |= if k == 0 {
+                        has_transparent(&cur[lo..hi])
+                    } else {
+                        scan_changed_runs(&cur[lo..hi], &prev[lo..hi], since, k as u32, |c, n| {
+                            sink.add(c, n)
+                        })
+                    };
+                    collect(sink, &mut got);
+                }
+                assert_eq!(alpha_got, alpha_want, "case {case}, frame {k}");
+                prev = cur;
+            }
+            let mut sink = RunSink::new();
+            scan_final_runs(&prev, &since, nframes as u32, |c, n| sink.add(c, n));
+            collect(sink, &mut got);
+            assert_eq!(got, want, "case {case}: {w}x{h}, {nframes} frames");
         }
     }
 
