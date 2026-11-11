@@ -403,6 +403,9 @@ fn run(args: &Args) -> io::Result<()> {
     // per thread balances well enough.
     let strip_rows = h.div_ceil(4 * nthreads).clamp(1, STRIP_ROWS);
     let strip_px = strip_rows * w;
+    // Phase B splits the runs by bucket across threads; alone, it takes
+    // them as they come (see `accumulate_sorted`).
+    let sort_runs = nthreads > 1;
     let (read_res, mut indexed_frames, any_alpha) = std::thread::scope(|scope| {
         let meta_ref = &meta;
         let hold = args.hold;
@@ -724,7 +727,7 @@ fn run(args: &Args) -> io::Result<()> {
                             &mut sink,
                         );
                     }
-                    let (runs, offs) = sink.finish();
+                    let (runs, offs) = sink.finish(sort_runs);
                     Sorted { runs, offs }
                 });
                 // every planar format is opaque
@@ -756,7 +759,7 @@ fn run(args: &Args) -> io::Result<()> {
                                 &mut sink,
                             );
                         }
-                        let (runs, offs) = sink.finish();
+                        let (runs, offs) = sink.finish(sort_runs);
                         (Sorted { runs, offs }, alpha)
                     });
                 let frame_alpha = (0..batch.len())
@@ -815,7 +818,7 @@ fn run(args: &Args) -> io::Result<()> {
                         palette::finish_key_strip(&prev_keys[lo..hi], since, mode, total, &mut sink)
                     }
                 }
-                let (runs, offs) = sink.finish();
+                let (runs, offs) = sink.finish(sort_runs);
                 Sorted { runs, offs }
             });
             accumulate_sorted(pool, &sorted, &mut hists, &mut bins, &mut coarse);
@@ -1209,7 +1212,8 @@ fn zeroed_by_writing<T: Copy>(n: usize, zero: T) -> Vec<T> {
 /// input.
 struct Sorted {
     runs: Vec<palette::PackedRun>,
-    /// 257 bucket boundaries into `runs`.
+    /// 257 bucket boundaries into `runs`; empty when the runs were left
+    /// unsorted for a single thread.
     offs: Vec<u32>,
 }
 
@@ -1225,9 +1229,10 @@ fn fold_slabs(pool: &Pool, hists: &[palette::ColorHist]) -> Vec<Vec<[u64; 4]>> {
     })
 }
 
-/// Pass 1 phase B: add bucket-sorted runs to the histogram, one task per
-/// bucket (or per slab once the histogram has gone coarse), then decide
-/// whether it has outgrown the exact tables.
+/// Pass 1 phase B: add a batch's runs to the histogram — bucket-sorted,
+/// one task per bucket (or per slab once the histogram has gone coarse),
+/// or unsorted on a single thread — then decide whether it has outgrown
+/// the exact tables.
 fn accumulate_sorted(
     pool: &Pool,
     parts: &[Sorted],
@@ -1239,7 +1244,22 @@ fn accumulate_sorted(
         *bins = fold_slabs(pool, hists);
         *hists = Vec::new();
     }
-    if *coarse {
+    if pool.threads() == 1 {
+        // Nothing to split the buckets across: the runs were left in the
+        // order they were found, and each is routed as it is added.
+        for r in parts {
+            debug_assert!(r.offs.is_empty());
+            if *coarse {
+                palette::accumulate_unsorted_coarse(bins, &r.runs);
+            } else {
+                palette::accumulate_unsorted(hists, &r.runs);
+            }
+        }
+        if !*coarse {
+            let distinct: usize = hists.iter().map(|h| h.len()).sum();
+            *coarse = distinct > palette::FOLD_MAX;
+        }
+    } else if *coarse {
         pool.for_each_mut(bins, |_, g, slab| {
             for r in parts {
                 let s = &r.runs[r.offs[4 * g] as usize..r.offs[4 * g + 4] as usize];

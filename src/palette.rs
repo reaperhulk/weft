@@ -357,9 +357,16 @@ impl RunSink {
         }
     }
 
-    /// The runs, bucket-sorted by red byte, and the 257 bucket boundaries.
-    pub fn finish(mut self) -> (Vec<PackedRun>, Vec<u32>) {
+    /// The runs, bucket-sorted by red byte, and the 257 bucket boundaries
+    /// — or, with `sort` off, the runs as they came and no boundaries, for
+    /// `accumulate_unsorted`. Sorting is what lets phase B give each
+    /// bucket to one task; a single thread has no use for it and skips
+    /// the extra pass over the runs.
+    pub fn finish(mut self, sort: bool) -> (Vec<PackedRun>, Vec<u32>) {
         self.flush();
+        if !sort {
+            return (self.runs, Vec::new());
+        }
         let mut sorted = Vec::new();
         let offs = bucket_runs_chunks(&[&self.runs], &self.counts, &mut sorted);
         (sorted, offs)
@@ -862,6 +869,28 @@ pub fn accumulate_runs(hist: &mut ColorHist, runs: &[PackedRun]) {
         }
         let (c, n) = unpack_run(runs[j]);
         hist.add(c, n);
+    }
+}
+
+/// Add runs in no particular order to the exact tables, one per red byte,
+/// each run routed to its table as it comes (the single-thread form of
+/// phase B; see `RunSink::finish`). Same prefetch as `accumulate_runs`.
+pub fn accumulate_unsorted(hists: &mut [ColorHist], runs: &[PackedRun]) {
+    for j in 0..runs.len() {
+        if let Some(&e) = runs.get(j + 8) {
+            hists[(e >> 24) as usize].prefetch(e >> 8);
+        }
+        let (c, n) = unpack_run(runs[j]);
+        hists[(c >> 16) as usize].add(c, n);
+    }
+}
+
+/// `accumulate_unsorted` once the histogram has gone coarse: `bins` is
+/// one array per red slab.
+pub fn accumulate_unsorted_coarse(bins: &mut [Vec<[u64; 4]>], runs: &[PackedRun]) {
+    for &e in runs {
+        let (c, n) = unpack_run(e);
+        add_run_coarse(&mut bins[(c >> 18) as usize], c, n);
     }
 }
 
@@ -3073,7 +3102,7 @@ mod tests {
             seed
         };
         fn collect(sink: RunSink, got: &mut HashMap<u32, u64>) {
-            let (runs, offs) = sink.finish();
+            let (runs, offs) = sink.finish(true);
             assert_eq!(offs.len(), 257);
             assert_eq!(*offs.last().unwrap() as usize, runs.len());
             for b in 0..256 {
