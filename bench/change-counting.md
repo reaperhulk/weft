@@ -95,8 +95,8 @@ where every pixel changes into as many runs as pixels. The second figure
 is after the last commit of the round.
 
 The static musl build (mimalloc) measures the same: 0.796x wall, 0.767x
-CPU at production flags and 4 threads, five runs, before the page-fault
-change.
+CPU at production flags and 4 threads, five runs (Rust 1.97.0, on a
+noisier stretch of the host than the headline table).
 
 ## Retained changes
 
