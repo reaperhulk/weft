@@ -1,35 +1,53 @@
 # Changelog
 
-## Unreleased
+## 0.5.1
 
-Faster on every clip measured, with **byte-identical output**: 34% more
-throughput at `--lossy 30 --hold 12` and 35% at the defaults over the
-20-clip Frinkiac corpus (geometric mean, 4 threads), for 27-29% less CPU
-time. Verified identical across RGBA, y4m and alpha input, six flag sets
-and 1-13 threads (960 runs). No flag, default, palette or compression
-threshold changed. See [bench/change-counting.md](bench/change-counting.md).
+A third faster, with **byte-identical output**. No flag, default, palette,
+or compression threshold changed. (#75)
 
-- The histogram pass counts pixels by change instead of by frame. A frame
-  is compared with its predecessor and only the pixels that differ emit a
-  run, for the colour that just ended, weighted by how many frames it
-  stood; the rest of the clip is counted once at the end. The sums are
-  the integers the per-frame scan produced. Row strips whose content
-  changes everywhere into long runs (fades, animated gradients) fall back
-  to the per-frame scan, with an exact hand-over in both directions. This
-  roughly halves the pass on video-sourced clips, for RGBA and y4m alike.
+Measured over the 20-clip Frinkiac corpus at four threads (geometric
+mean): 35% more throughput at `--lossy 30 --hold 12` and 33% at the
+defaults, for 28% less CPU time. Every clip improves, by 9% to 74%; the
+stillest gain most. y4m input gains 15-75% on the same clips. These
+figures are from a 4-vCPU machine, not the 20-40 cores earlier releases
+were measured on, where the read phase is paced by the reader rather than
+by CPU; expect the gain there to differ. See
+[bench/change-counting.md](bench/change-counting.md).
+
+- The histogram pass counts pixels by change instead of by frame. Each
+  frame is compared with its predecessor and only the pixels that differ
+  emit a run, for the colour that just ended, weighted by how many frames
+  it stood; what is still on screen is counted once at the end. The sums
+  are the integers the per-frame scan produced, so the palette is
+  unchanged. On cartoon clips 5-37% of pixels change per frame behind
+  `--hold 12` (10-62% without), and the pass roughly halves. RGBA and y4m
+  alike.
+- Row strips whose content changes everywhere into long runs (a fade
+  across flat fills, an animated gradient) are still scanned per frame,
+  which handles them better. A strip switches after two frames of
+  producing three times more changes than runs, and switches back when
+  that stops; both hand-overs are exact.
 - LZW starts a match that begins in a transparent run at the deepest
   all-transparent dictionary string the run reaches, instead of walking
   there one pixel and one hash probe at a time. Transparent runs are most
-  of a delta frame; 94% of their pixels were being walked. Applies to
-  lossless and `--lossy` encoding.
+  of a delta frame. `--lossy` and lossless encoding both benefit (about 8%
+  and 6% end to end).
 - Zero-initialised tables that are read before they are first written (the
   coarse histogram bins, the shared nearest-colour cache) no longer fault
   twice per page. The second fault had to interrupt every other core to
-  flush a mapping, which was 5% of all samples at four threads.
+  flush a mapping; that was 5% of all samples at four threads, and it
+  grows with the thread count.
 - On Linux, stdin's pipe buffer is raised to 1 MiB where the system allows
-  it: 5% less wall time when frames are piped in.
-- Peak memory is up 5-8 MiB at 480x360 (per-pixel state for the change
-  counter, and the two tables above now being fully resident).
+  it (the default is 64 KiB, a tenth of a 480x360 RGBA frame): 5% less
+  wall time when frames are piped in.
+
+Costs: peak memory is up 5-8 MiB at 480x360, for the change counter's
+per-pixel state and the two tables above now being fully resident. One
+case got slower: a mandelbrot zoom at `--threads 1`, by 2.6%.
+
+Verified identical to 0.5.0 across RGBA, y4m and alpha input under six
+flag sets at 1-13 threads (960 runs, no mismatch), and on the static musl
+build.
 
 ## 0.5.0
 
