@@ -134,18 +134,18 @@ pub fn encode_frame(
                 // ~45% transparent; 60% leaves margin while skipping the
                 // double encode on the sparse-change frames that dominate
                 // typical animations.
-                enc.encode(min_code_size, punched, lossy, scale, &mut body);
+                enc.encode(min_code_size, punched, trans_idx, lossy, scale, &mut body);
             } else if trans_count * 20 <= punched.len() {
                 // Almost everything changed: punching would only shatter
                 // smooth runs with scattered transparent pixels, so skip
                 // it — on dense-motion content this halves the LZW work.
-                enc.encode(min_code_size, plain, lossy, scale, &mut body);
+                enc.encode(min_code_size, plain, trans_idx, lossy, scale, &mut body);
             } else {
                 // In between, encode both and keep the smaller (gifsicle
                 // -O2/-O3 behavior).
-                enc.encode(min_code_size, punched, lossy, scale, &mut body);
+                enc.encode(min_code_size, punched, trans_idx, lossy, scale, &mut body);
                 let mut alt = Vec::new();
-                enc.encode(min_code_size, plain, lossy, scale, &mut alt);
+                enc.encode(min_code_size, plain, trans_idx, lossy, scale, &mut alt);
                 if alt.len() < body.len() - descriptor_len {
                     // the opaque encoding won: swap it in after the descriptor
                     body.truncate(descriptor_len);
@@ -153,7 +153,7 @@ pub fn encode_frame(
                 }
             }
         }
-        None => enc.encode(min_code_size, idx, lossy, scale, &mut body),
+        None => enc.encode(min_code_size, idx, trans_idx, lossy, scale, &mut body),
     }
 
     EncodedFrame {

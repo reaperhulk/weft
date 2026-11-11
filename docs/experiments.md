@@ -228,6 +228,17 @@ Content facts worth not re-deriving: mean horizontal run is **1.5–2.7 px**
 (these are noisy video frames, not clean cel art, so run-coalescing does
 not pay), and there are **24k–42k distinct colours per frame**.
 
+**Landed** (2026-11): the phase no longer scans frames at all unless it
+has to. Phase A's cost turned out to be the run-length scan itself, a
+mispredicted branch per run, and most pixels do not change from one frame
+to the next; comparing with the previous frame and emitting only what
+changed halves the phase. See [bench/change-counting.md](../bench/change-counting.md),
+which also lists what was rejected on the way (no fallback; a per-frame
+switching rule; sampling in unchanged blocks; recycling input buffers).
+The run-redundancy and run-coalescing notes above describe the per-frame
+scan, which now only runs on strips whose content changes everywhere into
+long runs.
+
 ## Quantize
 
 **Landed** (#42): the nearest-colour memo cache is sized by dividing a

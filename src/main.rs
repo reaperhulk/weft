@@ -226,8 +226,40 @@ fn main() {
     }
 }
 
+/// Ask the kernel for a larger buffer on stdin when it is a pipe.
+///
+/// Input usually arrives down a pipe from a decoder, and the reader thread
+/// paces the whole read-and-histogram phase. Linux pipes hold 64 KiB by
+/// default, a tenth of one 480x360 RGBA frame, so each frame costs the
+/// writer and the reader a dozen sleep/wake round trips. A megabyte (the
+/// default unprivileged ceiling) lets a frame cross in one or two.
+///
+/// This is only a request: it fails harmlessly when stdin is not a pipe,
+/// when the system's limit is lower, or when the user's pipe allowance is
+/// used up, and the stream reads the same either way.
+#[cfg(target_os = "linux")]
+fn widen_stdin_pipe() {
+    use std::ffi::c_int;
+    use std::os::fd::AsRawFd;
+    extern "C" {
+        fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    }
+    const F_SETPIPE_SZ: c_int = 1031;
+    const WANT: c_int = 1 << 20;
+    // SAFETY: fcntl(F_SETPIPE_SZ) takes an int argument and touches no
+    // memory of ours; the descriptor is stdin's, open for the process's
+    // lifetime. Any error is the "leave it as it is" answer.
+    unsafe {
+        fcntl(io::stdin().as_raw_fd(), F_SETPIPE_SZ, WANT);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn widen_stdin_pipe() {}
+
 fn run(args: &Args) -> io::Result<()> {
     let t0 = Instant::now();
+    widen_stdin_pipe();
     // Stdin (not StdinLock): the reader moves to a worker thread, and
     // StdinLock is not Send. Refills lock per read; at 1 MB granularity the
     // lock cost vanishes.
@@ -304,20 +336,26 @@ fn run(args: &Args) -> io::Result<()> {
     // ---- read + histogram, overlapped -------------------------------------
     // A reader thread streams frames into a bounded channel; the main
     // thread drains it in batches and runs each batch through two parallel
-    // phases. (A) Every frame is converted to RGB-key runs and its runs are
-    // counting-sorted into 256 buckets by red byte. (B) Each bucket is
-    // summed into that bucket's own histogram by one task. Partitioning by
-    // color instead of by frame means each color is hashed once, into one
-    // small (mostly L2-resident) table; there is no per-worker duplicate
-    // state to merge or dedup afterwards — bucket order is sorted order —
-    // and pass 1 can use every thread instead of a capped pool. (The
-    // previous frame-partitioned design had every worker growing a table
-    // holding most of the clip's colors, then a serial multi-million-entry
-    // sort+dedup to merge them.) With a single thread there is nothing to
-    // parallelize, so the runs are added straight from each row's RLE
-    // buffer instead of being materialized per frame. Alpha presence is
-    // detected here too: pass 2+3 needs it before the first frame is
-    // quantized.
+    // phases. (A) The batch is turned into runs of colour, counting-sorted
+    // into 256 buckets by red byte. (B) Each bucket is summed into that
+    // bucket's own histogram by one task. Partitioning by color instead of
+    // by frame means each color is hashed once, into one small (mostly
+    // L2-resident) table; there is no per-worker duplicate state to merge
+    // or dedup afterwards — bucket order is sorted order — and pass 1 can
+    // use every thread instead of a capped pool. (The previous
+    // frame-partitioned design had every worker growing a table holding
+    // most of the clip's colors, then a serial multi-million-entry
+    // sort+dedup to merge them.)
+    //
+    // Phase A's tasks are row strips, each walked through the batch in
+    // frame order, because the runs are mostly not a scan of the frames:
+    // a strip compares each frame with the one before and emits a run only
+    // for the pixels that changed, weighted by how long the colour they
+    // replace had stood (see "Counting by change" in palette.rs). Most
+    // pixels of most frames do not change, so that is a fraction of the
+    // runs for the same histogram; a strip where most do change scans its
+    // frames instead. Alpha presence is detected here too: pass 2+3 needs
+    // it before the first frame is quantized.
     let t1 = Instant::now();
     let pool = pool::global();
     let nthreads = pool.threads();
@@ -328,10 +366,9 @@ fn run(args: &Args) -> io::Result<()> {
     let batch_cap = 2 * nthreads;
     let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Frame)>(batch_cap);
     const BUCKETS: usize = 256;
-    /// Rows per strip when a frame's scan is split across threads. 32 rows
-    /// of 480 px is ~60 KiB of source and ~40 KiB of runs -- big enough
-    /// that the per-strip Vec and merge are noise, small enough that a
-    /// 12-frame batch still yields ~140 tasks.
+    /// Most rows a strip task covers: 32 rows of 480 px is ~60 KiB of
+    /// source per frame, which stays cache-resident from one frame's
+    /// comparison to the next.
     const STRIP_ROWS: usize = 32;
     // Bucket state: one exact table per red-byte bucket, until the tables
     // together exceed FOLD_MAX distinct colors. Past that the palette
@@ -349,33 +386,26 @@ fn run(args: &Args) -> io::Result<()> {
         .map(|_| palette::ColorHist::with_capacity(1 << 10))
         .collect();
     let mut bins: Vec<Vec<[u64; 4]>> = Vec::new();
-    let fold_slabs = |hists: &[palette::ColorHist]| -> Vec<Vec<[u64; 4]>> {
-        pool.map(hists.len() / 4, |_, g| {
-            let mut b = vec![[0u64; 4]; palette::SLAB_BINS];
-            for h in &hists[4 * g..4 * g + 4] {
-                palette::accumulate_entries_coarse(&mut b, &h.entries());
-            }
-            b
-        })
-    };
-    struct Routed {
-        idx: usize,
-        frame: Frame,
-        alpha: bool,
-        runs: Vec<palette::PackedRun>, // this frame's runs, bucket-sorted
-        offs: Vec<u32>,                // BUCKETS + 1 bucket boundaries into runs
-    }
-    /// One row strip's scan output, before the per-frame merge.
-    struct StripOut {
-        runs: Vec<palette::PackedRun>,
-        counts: [u32; BUCKETS],
-        alpha: bool,
-    }
     let mut coarse = false;
-    // Per-frame run buffers are recycled between batches: a fresh ~MB
-    // allocation per frame (an mmap plus a page fault per 4 KiB) costs
-    // more than the hashing itself at low thread counts.
-    let run_pool: Mutex<Vec<Vec<palette::PackedRun>>> = Mutex::new(Vec::new());
+    // Strip state for counting by change, carried from batch to batch: per
+    // pixel, the frame its current colour arrived in; per strip, how it is
+    // being counted; and the previous frame to compare with — for RGBA,
+    // the last frame of the previous batch kept as it arrived (the frames
+    // themselves are packed to RGB once counted); for planar input, which
+    // has no stored RGB, its rows converted to colour keys.
+    let mut since: Vec<u32> = Vec::new();
+    let mut modes: Vec<palette::StripMode> = Vec::new();
+    let mut prev_raw: Option<Vec<u8>> = None;
+    let mut prev_keys: Vec<u32> = Vec::new();
+    let mut seen = 0usize;
+    // Rows per strip. A strip walks its rows through the whole batch, so
+    // a short batch does not limit how many tasks there are, and a few
+    // per thread balances well enough.
+    let strip_rows = h.div_ceil(4 * nthreads).clamp(1, STRIP_ROWS);
+    let strip_px = strip_rows * w;
+    // Phase B splits the runs by bucket across threads; alone, it takes
+    // them as they come (see `accumulate_sorted`).
+    let sort_runs = nthreads > 1;
     let (read_res, mut indexed_frames, any_alpha) = std::thread::scope(|scope| {
         let meta_ref = &meta;
         let hold = args.hold;
@@ -445,14 +475,9 @@ fn run(args: &Args) -> io::Result<()> {
             let prefault = std::thread::spawn(move || loop {
                 // Deliberately not `vec![0; fsize]`: that is calloc, whose
                 // pages stay unmapped until first written, i.e. the fault
-                // would land on the reader after all. resize() stores the
-                // zeros itself, which is the first touch we want here.
-                #[allow(clippy::slow_vector_initialization)]
-                let v: Vec<u8> = {
-                    let mut v = Vec::with_capacity(fsize);
-                    v.resize(fsize, 0);
-                    v
-                };
+                // would land on the reader after all. Storing the zeros
+                // is the first touch we want here.
+                let v: Vec<u8> = zeroed_by_writing(fsize, 0);
                 if btx.send(v).is_err() {
                     break;
                 }
@@ -652,8 +677,6 @@ fn run(args: &Args) -> io::Result<()> {
         drop(tx);
         let mut frames: Vec<(usize, Frame)> = Vec::new();
         let mut any_alpha = false;
-        let (mut row1, mut keys1) = (vec![0u8; w * 4], vec![0u32; w]);
-        let mut runs1: Vec<(u32, u32)> = Vec::new();
         loop {
             let mut batch: Vec<(usize, Frame)> = Vec::with_capacity(batch_cap);
             match rx.recv() {
@@ -666,176 +689,139 @@ fn run(args: &Args) -> io::Result<()> {
                     Err(_) => break,
                 }
             }
-            if nthreads == 1 {
-                // Nothing to parallelize: skip materializing the runs and
-                // add them straight into the bucket tables (on dithered
-                // content the runs are most of a byte per pixel per pass,
-                // and one thread pays that traffic in full).
-                if coarse && bins.is_empty() {
-                    bins = fold_slabs(&hists);
-                    hists = Vec::new();
+            // The strips compare each frame with its predecessor, so the
+            // frames have to arrive in order: they do, the reader and the
+            // hold stage both being sequential.
+            debug_assert!(batch.iter().enumerate().all(|(k, (i, _))| *i == seen + k));
+            let planar = matches!(batch[0].1, Frame::Yuv(_));
+            if since.is_empty() {
+                since = zeroed_by_writing(w * h, 0u32);
+                modes = vec![palette::StripMode::default(); h.div_ceil(strip_rows)];
+                if planar {
+                    prev_keys = vec![0u32; w * h];
                 }
-                // per row: RLE into an L1-resident run buffer, then add
-                // with the table slot a few runs ahead prefetched — the
-                // bucket tables together are still a few MB, and each add
-                // otherwise serializes behind its miss
-                let add_runs = |hists: &mut [palette::ColorHist],
-                                bins: &mut [Vec<[u64; 4]>],
-                                runs: &[(u32, u32)]| {
-                    if coarse {
-                        for &(c, n) in runs {
-                            palette::add_run_coarse(&mut bins[(c >> 18) as usize], c, n);
-                        }
-                    } else {
-                        for j in 0..runs.len() {
-                            if let Some(&(c, _)) = runs.get(j + 8) {
-                                hists[(c >> 16) as usize].prefetch(c);
-                            }
-                            let (c, n) = runs[j];
-                            hists[(c >> 16) as usize].add(c, n);
-                        }
-                    }
-                };
-                for (i, f) in batch {
-                    let mut alpha = false;
-                    {
-                        let src = color::RowSource::new(&f, w, h, meta_ref.chroma);
-                        if src.has_direct_rgb_keys() {
-                            for y in 0..h {
-                                src.fill_rgb_keys(y, &mut keys1);
-                                palette::scan_rgb_key_runs(&keys1, &mut runs1);
-                                add_runs(&mut hists, &mut bins, &runs1);
-                            }
-                        } else {
-                            for y in 0..h {
-                                let rgba = rgba_row(&src, y, &mut row1);
-                                alpha |= palette::scan_rgba_runs(rgba, &mut runs1);
-                                add_runs(&mut hists, &mut bins, &runs1);
-                            }
-                        }
-                    }
-                    let frame = match f {
-                        Frame::Rgba(rgba) if !alpha => Frame::Rgb(color::rgba_to_rgb(&rgba)),
-                        other => other,
-                    };
-                    any_alpha |= alpha;
-                    frames.push((i, frame));
-                }
-                if !coarse {
-                    let distinct: usize = hists.iter().map(|h| h.len()).sum();
-                    coarse = distinct > palette::FOLD_MAX;
-                }
-                continue;
             }
-            // phase A: frames -> bucket-sorted runs, all threads.
-            //
-            // A batch is only as deep as the reader/hold chain has queued
-            // -- measured at 12-15 frames against a cap of 80 -- so
-            // parallelising over frames alone leaves most of a 40-thread
-            // machine idle. Split each frame into row strips too, and run
-            // every (frame, strip) pair from a single flat parallel region:
-            // a region per frame would re-run the per-worker init for every
-            // frame and make each frame's collect a barrier. The scan is
-            // per-row and the strips are concatenated in order, so the runs
-            // -- and the palette -- are exactly what the sequential row
-            // order produced.
-            let nstrips = h.div_ceil(STRIP_ROWS);
-            let frames_in: Vec<&Frame> = batch.iter().map(|(_, f)| f).collect();
-            let strip_out: Vec<StripOut> = pool.map_init(
-                frames_in.len() * nstrips,
-                || (vec![0u8; w * 4], vec![0u32; w]),
-                |(row, keys), _, t| {
-                    let (fi, si) = (t / nstrips, t % nstrips);
-                    let y0 = si * STRIP_ROWS;
-                    let y1 = ((si + 1) * STRIP_ROWS).min(h);
-                    // one run per pixel is the worst case, so this
-                    // capacity is never exceeded and never regrown
-                    let mut runs = Vec::with_capacity((y1 - y0) * w);
-                    let mut counts = [0u32; BUCKETS];
-                    let mut alpha = false;
-                    let src = color::RowSource::new(frames_in[fi], w, h, meta_ref.chroma);
-                    if src.has_direct_rgb_keys() {
-                        for y in y0..y1 {
-                            src.fill_rgb_keys(y, keys);
-                            palette::scan_rgb_key_runs_counted(keys, &mut runs, &mut counts);
-                        }
-                    } else {
-                        for y in y0..y1 {
-                            alpha |= palette::scan_rgba_runs_counted(
-                                rgba_row(&src, y, row),
-                                &mut runs,
-                                &mut counts,
+            let first = seen as u32;
+            // phase A: strips -> bucket-sorted runs, all threads
+            let (sorted, frame_alpha): (Vec<Sorted>, Vec<bool>) = if planar {
+                let frames_in: Vec<&Frame> = batch.iter().map(|(_, f)| f).collect();
+                let strips: Vec<_> = since
+                    .chunks_mut(strip_px)
+                    .zip(prev_keys.chunks_mut(strip_px))
+                    .zip(modes.iter_mut())
+                    .collect();
+                let sorted = pool.map_into(strips, |_, si, ((since, prev), mode)| {
+                    let y0 = si * strip_rows;
+                    let mut keys = vec![0u32; w];
+                    let mut sink = palette::RunSink::new();
+                    for (k, f) in frames_in.iter().enumerate() {
+                        let src = color::RowSource::new(f, w, h, meta_ref.chroma);
+                        palette::count_key_strip(
+                            |r, keys| src.fill_rgb_keys(y0 + r, keys),
+                            w,
+                            &mut keys,
+                            prev,
+                            since,
+                            mode,
+                            first + k as u32,
+                            &mut sink,
+                        );
+                    }
+                    let (runs, offs) = sink.finish(sort_runs);
+                    Sorted { runs, offs }
+                });
+                // every planar format is opaque
+                (sorted, vec![false; batch.len()])
+            } else {
+                let bufs: Vec<&[u8]> = batch
+                    .iter()
+                    .map(|(_, f)| match f {
+                        Frame::Rgba(b) => b.as_slice(),
+                        _ => unreachable!("pass 1 sees frames as they were read"),
+                    })
+                    .collect();
+                let prev0 = prev_raw.as_deref();
+                let strips: Vec<_> = since.chunks_mut(strip_px).zip(modes.iter_mut()).collect();
+                let outs: Vec<(Sorted, Vec<bool>)> =
+                    pool.map_into(strips, |_, si, (since, mode)| {
+                        let lo = si * strip_px * 4;
+                        let hi = lo + since.len() * 4;
+                        let mut sink = palette::RunSink::new();
+                        let mut alpha = vec![false; bufs.len()];
+                        for (k, buf) in bufs.iter().enumerate() {
+                            let prev = if k == 0 { prev0 } else { Some(bufs[k - 1]) };
+                            alpha[k] = palette::count_rgba_strip(
+                                &buf[lo..hi],
+                                prev.map(|p| &p[lo..hi]),
+                                since,
+                                mode,
+                                first + k as u32,
+                                &mut sink,
                             );
                         }
+                        let (runs, offs) = sink.finish(sort_runs);
+                        (Sorted { runs, offs }, alpha)
+                    });
+                let frame_alpha = (0..batch.len())
+                    .map(|k| outs.iter().any(|(_, a)| a[k]))
+                    .collect();
+                (outs.into_iter().map(|(s, _)| s).collect(), frame_alpha)
+            };
+            seen += batch.len();
+            any_alpha |= frame_alpha.iter().any(|&a| a);
+            // The scan just told us which RGBA frames use any
+            // transparency; in one that doesn't, the alpha plane is a
+            // constant and the frame can be packed to RGB for the rest of
+            // its (clip-long) life. The RGBA buffer is freed at once
+            // (bar the batch's last, which the next batch compares
+            // against), so the extra resident bytes are one frame per busy
+            // worker, not one per clip.
+            let last = batch.len() - 1;
+            let packed: Vec<(usize, Frame, Option<Vec<u8>>)> =
+                pool.map_into(batch, |_, k, (i, f)| match f {
+                    Frame::Rgba(rgba) if !frame_alpha[k] => {
+                        let rgb = Frame::Rgb(color::rgba_to_rgb(&rgba));
+                        (i, rgb, (k == last).then_some(rgba))
                     }
-                    StripOut {
-                        runs,
-                        counts,
-                        alpha,
+                    Frame::Rgba(rgba) => {
+                        let keep = (k == last).then(|| rgba.clone());
+                        (i, Frame::Rgba(rgba), keep)
                     }
-                },
-            );
-            drop(frames_in);
-            let routed: Vec<Routed> = pool.map_into(batch, |_, fi, (i, f)| {
-                let strips = &strip_out[fi * nstrips..(fi + 1) * nstrips];
-                let mut counts = [0u32; BUCKETS];
-                let mut alpha = false;
-                for st in strips {
-                    for (t, v) in counts.iter_mut().zip(st.counts.iter()) {
-                        *t += v;
-                    }
-                    alpha |= st.alpha;
+                    other => (i, other, None),
+                });
+            for (i, f, keep) in packed {
+                frames.push((i, f));
+                if keep.is_some() {
+                    prev_raw = keep;
                 }
-                let chunks: Vec<&[palette::PackedRun]> =
-                    strips.iter().map(|st| st.runs.as_slice()).collect();
-                let mut runs = run_pool.lock().unwrap().pop().unwrap_or_default();
-                let offs = palette::bucket_runs_chunks(&chunks, &counts, &mut runs);
-                // The scan just told us whether this frame uses any
-                // transparency; when it doesn't, the alpha plane is
-                // a constant and the frame can be packed to RGB for
-                // the rest of its (clip-long) life. The RGBA buffer
-                // is freed immediately, so the extra resident bytes
-                // are one frame per busy worker, not one per clip.
-                let frame = match f {
-                    Frame::Rgba(rgba) if !alpha => Frame::Rgb(color::rgba_to_rgb(&rgba)),
-                    other => other,
-                };
-                Routed {
-                    idx: i,
-                    frame,
-                    alpha,
-                    runs,
-                    offs,
-                }
-            });
+            }
             // phase B: one task per bucket, all of the batch's runs for it
-            if coarse && bins.is_empty() {
-                bins = fold_slabs(&hists);
-                hists = Vec::new();
-            }
-            if coarse {
-                pool.for_each_mut(&mut bins, |_, g, slab| {
-                    for r in &routed {
-                        let s = &r.runs[r.offs[4 * g] as usize..r.offs[4 * g + 4] as usize];
-                        palette::accumulate_runs_coarse(slab, s);
+            accumulate_sorted(pool, &sorted, &mut hists, &mut bins, &mut coarse);
+        }
+        if seen > 0 {
+            // Strips counting by change still owe everything on screen.
+            let total = seen as u32;
+            let strips: Vec<_> = since.chunks(strip_px).zip(modes.iter()).collect();
+            let sorted: Vec<Sorted> = pool.map_into(strips, |_, si, (since, &mode)| {
+                let lo = si * strip_px;
+                let hi = lo + since.len();
+                let mut sink = palette::RunSink::new();
+                match &prev_raw {
+                    Some(last) => palette::finish_rgba_strip(
+                        &last[lo * 4..hi * 4],
+                        since,
+                        mode,
+                        total,
+                        &mut sink,
+                    ),
+                    None => {
+                        palette::finish_key_strip(&prev_keys[lo..hi], since, mode, total, &mut sink)
                     }
-                });
-            } else {
-                pool.for_each_mut(&mut hists, |_, b, hist| {
-                    for r in &routed {
-                        let s = &r.runs[r.offs[b] as usize..r.offs[b + 1] as usize];
-                        palette::accumulate_runs(hist, s);
-                    }
-                });
-                let distinct: usize = hists.iter().map(|h| h.len()).sum();
-                coarse = distinct > palette::FOLD_MAX;
-            }
-            let mut recycle = run_pool.lock().unwrap();
-            for r in routed {
-                any_alpha |= r.alpha;
-                frames.push((r.idx, r.frame));
-                recycle.push(r.runs);
-            }
+                }
+                let (runs, offs) = sink.finish(sort_runs);
+                Sorted { runs, offs }
+            });
+            accumulate_sorted(pool, &sorted, &mut hists, &mut bins, &mut coarse);
         }
         let read_res = reader_handle.join().expect("reader thread panicked");
         let (t_hold, hold_t_sum, hold_frames) = hold_handle
@@ -868,7 +854,7 @@ fn run(args: &Args) -> io::Result<()> {
     let entries: Vec<(u32, u32)> = if coarse {
         if bins.is_empty() {
             // the switch came at the last batch: nothing has folded yet
-            bins = fold_slabs(&hists);
+            bins = fold_slabs(pool, &hists);
             hists = Vec::new();
         }
         // slab order is grid order, and each slab's bins are in grid order
@@ -1197,18 +1183,98 @@ fn run(args: &Args) -> io::Result<()> {
     Ok(())
 }
 
-/// Row `y` of `src` as RGBA: borrowed straight from the frame when it is
-/// already stored that way, otherwise converted into `scratch` (len w*4).
-/// RGBA input is by far the hot case, and copying every source byte into a
-/// scratch row just to read it back is pure overhead.
-#[inline]
-fn rgba_row<'r>(src: &color::RowSource<'r>, y: usize, scratch: &'r mut [u8]) -> &'r [u8] {
-    match src.rgba_row(y) {
-        Some(borrowed) => borrowed,
-        None => {
-            src.fill_row(y, scratch);
-            scratch
+/// `vec![zero; n]`, except that the zeros are stored rather than asked
+/// for.
+///
+/// `vec![0; n]` is calloc, whose pages are not there until touched — and
+/// what the first touch is matters. A *read* of such a page maps the
+/// kernel's shared zero page; the first write after that is a second
+/// fault that has to replace the mapping, which means interrupting every
+/// other core running this process to flush it. A buffer that is read
+/// before it is written (an accumulator: load, add, store) pays that pair
+/// on every page, and the interrupts grow with the thread count. Writing
+/// the zeros here makes each page's first touch a write: one fault, no
+/// flush.
+///
+/// The `black_box` is load-bearing. An allocation followed by a fill with
+/// zeros is exactly what the optimizer rewrites into one zeroed
+/// allocation — calloc again — and it did, here, until the pointer was
+/// made to escape in between.
+#[allow(clippy::slow_vector_initialization)]
+fn zeroed_by_writing<T: Copy>(n: usize, zero: T) -> Vec<T> {
+    let mut v = Vec::with_capacity(n);
+    std::hint::black_box(v.as_mut_ptr());
+    v.resize(n, zero);
+    v
+}
+
+/// Pass-1 runs bucket-sorted by red byte: phase A's output, phase B's
+/// input.
+struct Sorted {
+    runs: Vec<palette::PackedRun>,
+    /// 257 bucket boundaries into `runs`; empty when the runs were left
+    /// unsorted for a single thread.
+    offs: Vec<u32>,
+}
+
+/// Fold the exact per-red-byte tables into coarse bins, one array per red
+/// slab (four adjacent buckets).
+fn fold_slabs(pool: &Pool, hists: &[palette::ColorHist]) -> Vec<Vec<[u64; 4]>> {
+    pool.map(hists.len() / 4, |_, g| {
+        let mut b = zeroed_by_writing(palette::SLAB_BINS, [0u64; 4]);
+        for h in &hists[4 * g..4 * g + 4] {
+            palette::accumulate_entries_coarse(&mut b, &h.entries());
         }
+        b
+    })
+}
+
+/// Pass 1 phase B: add a batch's runs to the histogram — bucket-sorted,
+/// one task per bucket (or per slab once the histogram has gone coarse),
+/// or unsorted on a single thread — then decide whether it has outgrown
+/// the exact tables.
+fn accumulate_sorted(
+    pool: &Pool,
+    parts: &[Sorted],
+    hists: &mut Vec<palette::ColorHist>,
+    bins: &mut Vec<Vec<[u64; 4]>>,
+    coarse: &mut bool,
+) {
+    if *coarse && bins.is_empty() {
+        *bins = fold_slabs(pool, hists);
+        *hists = Vec::new();
+    }
+    if pool.threads() == 1 {
+        // Nothing to split the buckets across: the runs were left in the
+        // order they were found, and each is routed as it is added.
+        for r in parts {
+            debug_assert!(r.offs.is_empty());
+            if *coarse {
+                palette::accumulate_unsorted_coarse(bins, &r.runs);
+            } else {
+                palette::accumulate_unsorted(hists, &r.runs);
+            }
+        }
+        if !*coarse {
+            let distinct: usize = hists.iter().map(|h| h.len()).sum();
+            *coarse = distinct > palette::FOLD_MAX;
+        }
+    } else if *coarse {
+        pool.for_each_mut(bins, |_, g, slab| {
+            for r in parts {
+                let s = &r.runs[r.offs[4 * g] as usize..r.offs[4 * g + 4] as usize];
+                palette::accumulate_runs_coarse(slab, s);
+            }
+        });
+    } else {
+        pool.for_each_mut(hists, |_, b, hist| {
+            for r in parts {
+                let s = &r.runs[r.offs[b] as usize..r.offs[b + 1] as usize];
+                palette::accumulate_runs(hist, s);
+            }
+        });
+        let distinct: usize = hists.iter().map(|h| h.len()).sum();
+        *coarse = distinct > palette::FOLD_MAX;
     }
 }
 
