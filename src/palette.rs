@@ -191,29 +191,6 @@ pub fn accumulate_frame_coarse(
     has_alpha
 }
 
-/// RLE-scan a row of canonical `0xRRGGBB` keys into `runs` (cleared
-/// first). Run-length batching keeps histogram traffic low on flat
-/// content.
-#[inline(always)]
-pub fn scan_rgb_key_runs(keys: &[u32], runs: &mut Vec<(u32, u32)>) {
-    runs.clear();
-    if keys.is_empty() {
-        return;
-    }
-    let mut last = keys[0];
-    let mut run = 1u32;
-    for &key in &keys[1..] {
-        if key == last {
-            run += 1;
-        } else {
-            runs.push((last, run));
-            last = key;
-            run = 1;
-        }
-    }
-    runs.push((last, run));
-}
-
 /// RLE-scan an RGBA row into `runs` (cleared first). Pixels with alpha
 /// < 128 are skipped; returns true when any were, so the pipeline knows
 /// the disposal mode (and thus whether delta encoding is possible) before
@@ -298,7 +275,7 @@ pub fn unpack_run(e: PackedRun) -> (u32, u32) {
 
 /// RLE-scan a row of canonical keys, appending the packed runs to `all`
 /// and counting them per red byte (pass 1 phase A).
-#[inline(always)]
+#[cfg(test)]
 pub fn scan_rgb_key_runs_counted(keys: &[u32], all: &mut Vec<PackedRun>, counts: &mut [u32; 256]) {
     scan_rgb_key_runs_with(keys, |c, n| push_packed_runs(all, counts, c, n))
 }
@@ -315,19 +292,30 @@ pub fn scan_rgba_runs_counted(
 }
 
 // ---------------------------------------------------------------------------
-// Temporal accumulation (pass 1, RGBA input)
+// Counting by change (pass 1)
 //
 // Scanning every frame counts every pixel once per frame. But most pixels
 // of most frames are the pixel that was there a frame ago — more so behind
 // `--hold`, which exists to make that true — and a colour that sits at one
 // position for k frames can be counted once, with weight k, when it is
-// finally replaced. So instead of scanning frames, compare each frame with
-// its predecessor and emit one weighted entry per *changed* pixel, for the
-// colour that just ended; `since` remembers, per pixel, the frame its
-// current colour arrived in. Whatever is still standing when the clip ends
-// is emitted by `scan_final_runs`. The sums are the same integers the
-// per-frame scan produces, so the histogram — and everything downstream of
-// it — is identical.
+// finally replaced. So a frame is compared with its predecessor and only
+// the pixels that *changed* produce an entry, for the colour that just
+// ended; `since` remembers, per pixel, the frame its current colour
+// arrived in, and whatever is still standing when the clip ends is emitted
+// then. The sums are the same integers the per-frame scan produces, so the
+// histogram — and everything downstream of it — is identical.
+//
+// That wins when few pixels change. When they all do it still holds its
+// own on noisy or detailed content, where the per-frame scan was paying a
+// mispredicted branch per run and this pays a table of compares per block
+// — but not on smooth content: a fade across flat fills changes every
+// pixel every frame, and a per-frame scan covers it in a few long runs
+// where counting by change pays per pixel. So a row strip that keeps
+// producing several times more changes than its frames have runs is
+// scanned per frame instead (`StripMode`), and returns once that stops
+// being true. The hand-over is exact in both directions: going to
+// per-frame scans closes every open stretch first, and coming back starts
+// every stretch afresh.
 
 /// Collects weighted colours into packed runs, merging consecutive
 /// entries of one colour (the sums are all a consumer sees, so entries
@@ -378,6 +366,92 @@ impl RunSink {
     }
 }
 
+/// How a row strip is being counted (see the section comment), and how
+/// long the evidence for counting it the other way has held.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StripMode {
+    /// False: by change, an entry per pixel that differs from the previous
+    /// frame, with `since` carrying each pixel's open stretch. True: by
+    /// frame, every frame scanned into runs, nothing left open (and
+    /// `since` not maintained).
+    frames: bool,
+    /// Consecutive frames whose tally favoured the other mode.
+    streak: u8,
+}
+
+impl StripMode {
+    /// Frames in a row that have to favour the other mode before a strip
+    /// switches. A cut changes every pixel once; switching for it would
+    /// pay the hand-over to scan one frame and then switch back.
+    const PATIENCE: u8 = 2;
+
+    /// Note whether this frame favoured the other mode; true when the
+    /// strip should now switch.
+    fn vote(&mut self, other: bool) -> bool {
+        self.streak = if other { self.streak + 1 } else { 0 };
+        self.streak >= Self::PATIENCE
+    }
+
+    fn switch(&mut self) {
+        *self = StripMode {
+            frames: !self.frames,
+            streak: 0,
+        };
+    }
+}
+
+/// Pixels per block of the changed-pixel scan: one 64-byte compare decides
+/// whether any of them needs looking at.
+const CHANGE_BLOCK: usize = 16;
+
+/// How thinly a strip samples what the mode it is *not* in would be
+/// doing: counting by change, one block in this many has its runs
+/// counted; scanning per frame, one block (of RGBA input) or row (of
+/// planar input) in this many is compared with the previous frame.
+const SAMPLE_EVERY: usize = 8;
+
+/// What one frame cost a strip in the mode it is in, and an estimate of
+/// what the other mode would have had to do.
+#[derive(Clone, Copy, Default)]
+struct Tally {
+    /// Entries emitted: changed pixels (flat blocks counting once) when
+    /// counting by change, runs when scanning per frame.
+    entries: usize,
+    /// Over `sampled_px` pixels: breaks between unequal neighbours when
+    /// counting by change (a stand-in for runs, taken from sampled blocks
+    /// among those that changed), changed pixels when scanning per frame.
+    sampled: usize,
+    sampled_px: usize,
+}
+
+impl Tally {
+    fn add(&mut self, o: Tally) {
+        self.entries += o.entries;
+        self.sampled += o.sampled;
+        self.sampled_px += o.sampled_px;
+    }
+
+    /// The other mode's entries for all `px` pixels, by the sample.
+    fn other(&self, px: usize) -> usize {
+        self.sampled * px / self.sampled_px.max(1)
+    }
+
+    /// Counting by change, and a per-frame scan would have been clearly
+    /// cheaper: a real share of the strip changed, into at least three
+    /// times as many entries as it has runs.
+    fn frames_cheaper(&self, px: usize) -> bool {
+        self.entries * 8 > px && self.sampled_px > 0 && self.entries > self.other(px) * 3
+    }
+
+    /// Scanning per frame, and that no longer has the clear advantage
+    /// that got it chosen. The gap between the two tests (3x to enter, 2x
+    /// to leave) keeps a strip near the boundary from flipping.
+    fn changes_cheaper(&self, px: usize) -> bool {
+        let changes = self.other(px);
+        changes * 16 < px || changes < self.entries * 2
+    }
+}
+
 /// Canonical `0xRRGGBB` key of a pixel loaded as a little-endian word.
 #[inline(always)]
 fn le_pixel_key(px: u32) -> u32 {
@@ -391,20 +465,82 @@ fn le_pixel_opaque(px: u32) -> bool {
     px >> 31 != 0
 }
 
-/// Pixel `i` of an RGBA byte block, as a little-endian word.
+/// The histogram key of an RGBA pixel loaded as a little-endian word, or
+/// None for a transparent one.
 #[inline(always)]
-fn le_pixel(block: &[u8; CHANGE_BLOCK * 4], i: usize) -> u32 {
-    u32::from_le_bytes([
-        block[4 * i],
-        block[4 * i + 1],
-        block[4 * i + 2],
-        block[4 * i + 3],
-    ])
+fn rgba_key(px: u32) -> Option<u32> {
+    le_pixel_opaque(px).then(|| le_pixel_key(px))
 }
 
-/// Pixels per block of the changed-pixel scan: one 64-byte compare decides
-/// whether any of them needs looking at.
-const CHANGE_BLOCK: usize = 16;
+/// An RGBA byte block as little-endian pixel words.
+#[inline(always)]
+fn le_pixels(block: &[u8; CHANGE_BLOCK * 4]) -> [u32; CHANGE_BLOCK] {
+    std::array::from_fn(|i| {
+        u32::from_le_bytes([
+            block[4 * i],
+            block[4 * i + 1],
+            block[4 * i + 2],
+            block[4 * i + 3],
+        ])
+    })
+}
+
+/// Pixels of a block that differ from their left neighbour in the block.
+#[inline(always)]
+fn block_breaks(b: &[u32; CHANGE_BLOCK]) -> usize {
+    let mut n = 0u32;
+    for i in 1..CHANGE_BLOCK {
+        n += u32::from(b[i] != b[i - 1]);
+    }
+    n as usize
+}
+
+/// One block of a changed-pixel scan that is known to hold a change:
+/// `cur` and `prev` are the block's pixels now and a frame ago, in any
+/// encoding in which equal words are equal pixels, and `key` maps one to
+/// its histogram key (None: not counted). Returns the entries emitted.
+/// Written as branch-free reductions over the word arrays so the block
+/// tests compile to a few vector compares.
+#[inline(always)]
+fn changed_block(
+    cur: &[u32; CHANGE_BLOCK],
+    prev: &[u32; CHANGE_BLOCK],
+    since: &mut [u32; CHANGE_BLOCK],
+    frame: u32,
+    key: impl Fn(u32) -> Option<u32>,
+    add: &mut impl FnMut(u32, u32),
+) -> usize {
+    // A block that was one flat colour, all of it since the same frame,
+    // is one entry: closing the colour's stretch early for the pixels
+    // that did not change is still exact, since they simply start a new
+    // stretch of the same colour.
+    let (p0, s0) = (prev[0], since[0]);
+    let (mut ragged, mut changed) = (0u32, 0u32);
+    for i in 0..CHANGE_BLOCK {
+        ragged |= (prev[i] ^ p0) | (since[i] ^ s0);
+        changed |= u32::from(cur[i] != prev[i]) << i;
+    }
+    if ragged == 0 {
+        if let Some(c) = key(p0) {
+            // two halves, so the weight cannot overflow on a long clip
+            let half = (frame - s0) * (CHANGE_BLOCK as u32 / 2);
+            add(c, half);
+            add(c, half);
+        }
+        since.fill(frame);
+        return 1;
+    }
+    let entries = changed.count_ones() as usize;
+    while changed != 0 {
+        let i = changed.trailing_zeros() as usize;
+        changed &= changed - 1;
+        if let Some(c) = key(prev[i]) {
+            add(c, frame - since[i]);
+        }
+        since[i] = frame;
+    }
+    entries
+}
 
 /// Compare RGBA rows `cur` (frame number `frame`) against the same rows of
 /// the previous frame. Each pixel that differs ends a stretch of its old
@@ -412,20 +548,21 @@ const CHANGE_BLOCK: usize = 16;
 /// stood, unless it was transparent, and `since` restarts at `frame`.
 /// Returns whether any pixel of `cur` is transparent.
 #[inline(always)]
-pub fn scan_changed_runs(
+fn scan_changed_runs(
     cur: &[u8],
     prev: &[u8],
     since: &mut [u32],
     frame: u32,
     mut add: impl FnMut(u32, u32),
-) -> bool {
+) -> (bool, Tally) {
     debug_assert!(cur.len() == prev.len() && cur.len() == since.len() * 4);
     const ALPHA_TOP: u64 = 0x8000_0000_8000_0000;
     let mut opaque = ALPHA_TOP;
+    let mut tally = Tally::default();
     let (cb, ct) = cur.as_chunks::<{ CHANGE_BLOCK * 4 }>();
     let (pb, pt) = prev.as_chunks::<{ CHANGE_BLOCK * 4 }>();
     let (sb, st) = since.as_chunks_mut::<CHANGE_BLOCK>();
-    for ((c, p), s) in cb.iter().zip(pb).zip(sb) {
+    for (bi, ((c, p), s)) in cb.iter().zip(pb).zip(sb).enumerate() {
         let (cw, pw) = (c.as_chunks::<8>().0, p.as_chunks::<8>().0);
         let mut diff = 0u64;
         for (x, y) in cw.iter().zip(pw) {
@@ -433,42 +570,13 @@ pub fn scan_changed_runs(
             diff |= x ^ u64::from_le_bytes(*y);
             opaque &= x;
         }
-        if diff == 0 {
-            continue;
-        }
-        // Word arrays and branch-free reductions over them, so the block
-        // tests below compile to a few vector compares.
-        let cu: [u32; CHANGE_BLOCK] = std::array::from_fn(|i| le_pixel(c, i));
-        let pu: [u32; CHANGE_BLOCK] = std::array::from_fn(|i| le_pixel(p, i));
-        // A block that was one flat colour, all of it since the same
-        // frame, is one entry: closing the colour's stretch early for the
-        // pixels that did not change is still exact, since they simply
-        // start a new stretch of the same colour. Without this a fade or
-        // a cut across a fill pays per pixel here for what the per-frame
-        // scan covered with a few long runs.
-        let (p0, s0) = (pu[0], s[0]);
-        let (mut ragged, mut changed) = (0u32, 0u32);
-        for i in 0..CHANGE_BLOCK {
-            ragged |= (pu[i] ^ p0) | (s[i] ^ s0);
-            changed |= u32::from(cu[i] != pu[i]) << i;
-        }
-        if ragged == 0 {
-            if le_pixel_opaque(p0) {
-                // two halves, so the weight cannot overflow on a long clip
-                let half = (frame - s0) * (CHANGE_BLOCK as u32 / 2);
-                add(le_pixel_key(p0), half);
-                add(le_pixel_key(p0), half);
+        if diff != 0 {
+            let c = le_pixels(c);
+            tally.entries += changed_block(&c, &le_pixels(p), s, frame, rgba_key, &mut add);
+            if bi % SAMPLE_EVERY == 0 {
+                tally.sampled += block_breaks(&c);
+                tally.sampled_px += CHANGE_BLOCK;
             }
-            s.fill(frame);
-            continue;
-        }
-        while changed != 0 {
-            let i = changed.trailing_zeros() as usize;
-            changed &= changed - 1;
-            if le_pixel_opaque(pu[i]) {
-                add(le_pixel_key(pu[i]), frame - s[i]);
-            }
-            s[i] = frame;
         }
     }
     for ((a, b), s) in ct
@@ -480,38 +588,227 @@ pub fn scan_changed_runs(
     {
         opaque &= u64::from(u32::from_le_bytes(*a)) << 32 | ALPHA_TOP >> 32;
         if a != b {
-            let old = u32::from_le_bytes(*b);
-            if le_pixel_opaque(old) {
-                add(le_pixel_key(old), frame - *s);
+            if let Some(c) = rgba_key(u32::from_le_bytes(*b)) {
+                add(c, frame - *s);
             }
             *s = frame;
+            tally.entries += 1;
         }
     }
-    opaque != ALPHA_TOP
+    (opaque != ALPHA_TOP, tally)
 }
 
-/// Emit what `scan_changed_runs` still owes once the last frame is in:
-/// every opaque pixel of that frame (`last`), weighted by the frames its
-/// colour has stood (`frames` is the clip's frame count).
+/// Close every open stretch of an RGBA strip: each opaque pixel of
+/// `rows`, weighted by the frames its colour has stood up to (not
+/// including) frame `until`.
 #[inline(always)]
-pub fn scan_final_runs(last: &[u8], since: &[u32], frames: u32, mut add: impl FnMut(u32, u32)) {
-    debug_assert_eq!(last.len(), since.len() * 4);
-    for (px, &s) in last.as_chunks::<4>().0.iter().zip(since) {
-        let px = u32::from_le_bytes(*px);
-        if le_pixel_opaque(px) {
-            add(le_pixel_key(px), frames - s);
+fn scan_final_runs(rows: &[u8], since: &[u32], until: u32, mut add: impl FnMut(u32, u32)) {
+    debug_assert_eq!(rows.len(), since.len() * 4);
+    for (px, &s) in rows.as_chunks::<4>().0.iter().zip(since) {
+        if let Some(c) = rgba_key(u32::from_le_bytes(*px)) {
+            add(c, until - s);
         }
     }
 }
 
 /// Whether any pixel of an RGBA buffer is transparent (alpha < 128).
-pub fn has_transparent(rgba: &[u8]) -> bool {
+fn has_transparent(rgba: &[u8]) -> bool {
     let top = rgba
         .as_chunks::<4>()
         .0
         .iter()
         .fold(0x80u8, |acc, px| acc & px[3]);
     top == 0
+}
+
+/// Count frame `frame` of an RGBA row strip into `sink`. `cur` is the
+/// strip's rows in that frame and `prev` the same rows a frame earlier
+/// (None for the clip's first frame); `since` and `mode` are the strip's
+/// state, carried from frame to frame and starting zeroed and default.
+/// Returns whether any pixel of `cur` is transparent.
+pub fn count_rgba_strip(
+    cur: &[u8],
+    prev: Option<&[u8]>,
+    since: &mut [u32],
+    mode: &mut StripMode,
+    frame: u32,
+    sink: &mut RunSink,
+) -> bool {
+    let Some(prev) = prev else {
+        // nothing has ended yet; every stretch opens at frame 0
+        return has_transparent(cur);
+    };
+    let px = since.len();
+    if !mode.frames {
+        let (alpha, tally) = scan_changed_runs(cur, prev, since, frame, |c, n| sink.add(c, n));
+        if mode.vote(tally.frames_cheaper(px)) {
+            scan_final_runs(cur, since, frame + 1, |c, n| sink.add(c, n));
+            mode.switch();
+        }
+        return alpha;
+    }
+    let mut tally = Tally::default();
+    let alpha = scan_runs_with(cur, |c, n| {
+        tally.entries += 1;
+        sink.add(c, n)
+    });
+    let (cb, pb) = (
+        cur.as_chunks::<{ CHANGE_BLOCK * 4 }>().0,
+        prev.as_chunks::<{ CHANGE_BLOCK * 4 }>().0,
+    );
+    for (c, p) in cb.iter().zip(pb).step_by(SAMPLE_EVERY) {
+        let (c, p) = (le_pixels(c), le_pixels(p));
+        let mut n = 0u32;
+        for i in 0..CHANGE_BLOCK {
+            n += u32::from(c[i] != p[i]);
+        }
+        tally.sampled += n as usize;
+        tally.sampled_px += CHANGE_BLOCK;
+    }
+    if mode.vote(tally.changes_cheaper(px)) {
+        // every stretch starts afresh with the next frame
+        since.fill(frame + 1);
+        mode.switch();
+    }
+    alpha
+}
+
+/// Emit what a strip counted by change still owes once the last frame is
+/// in: `last` is its rows in that frame, `frames` the clip's frame count.
+pub fn finish_rgba_strip(
+    last: &[u8],
+    since: &[u32],
+    mode: StripMode,
+    frames: u32,
+    sink: &mut RunSink,
+) {
+    if !mode.frames {
+        scan_final_runs(last, since, frames, |c, n| sink.add(c, n));
+    }
+}
+
+/// `scan_changed_runs` for a row already converted to `0xRRGGBB` keys
+/// (planar input, which has no stored RGB to compare): `prev` holds the
+/// previous frame's keys for the row and is brought up to date.
+#[inline(always)]
+fn scan_changed_keys(
+    cur: &[u32],
+    prev: &mut [u32],
+    since: &mut [u32],
+    frame: u32,
+    mut add: impl FnMut(u32, u32),
+) -> Tally {
+    debug_assert!(cur.len() == prev.len() && cur.len() == since.len());
+    let mut tally = Tally::default();
+    let (cb, ct) = cur.as_chunks::<CHANGE_BLOCK>();
+    let (pb, pt) = prev.as_chunks_mut::<CHANGE_BLOCK>();
+    let (sb, st) = since.as_chunks_mut::<CHANGE_BLOCK>();
+    for (bi, ((c, p), s)) in cb.iter().zip(pb).zip(sb).enumerate() {
+        let mut diff = 0u32;
+        for (x, y) in c.iter().zip(p.iter()) {
+            diff |= x ^ y;
+        }
+        if diff != 0 {
+            tally.entries += changed_block(c, p, s, frame, Some, &mut add);
+            if bi % SAMPLE_EVERY == 0 {
+                tally.sampled += block_breaks(c);
+                tally.sampled_px += CHANGE_BLOCK;
+            }
+            *p = *c;
+        }
+    }
+    for ((c, p), s) in ct.iter().zip(pt).zip(st) {
+        if c != p {
+            add(*p, frame - *s);
+            *s = frame;
+            *p = *c;
+            tally.entries += 1;
+        }
+    }
+    tally
+}
+
+/// Count frame `frame` of a planar row strip into `sink`. `fill(r, keys)`
+/// converts row `r` of the strip in that frame to `0xRRGGBB` keys;
+/// `scratch` is a row of working space. `prev` (the strip's keys as of the
+/// previous frame), `since` and `mode` are the strip's state, carried from
+/// frame to frame; `prev` needs no initial contents.
+#[allow(clippy::too_many_arguments)]
+pub fn count_key_strip(
+    mut fill: impl FnMut(usize, &mut [u32]),
+    w: usize,
+    scratch: &mut [u32],
+    prev: &mut [u32],
+    since: &mut [u32],
+    mode: &mut StripMode,
+    frame: u32,
+    sink: &mut RunSink,
+) {
+    let px = since.len();
+    if frame == 0 {
+        // nothing has ended yet; every stretch opens at frame 0
+        for (r, prev) in prev.chunks_mut(w).enumerate() {
+            fill(r, prev);
+        }
+        return;
+    }
+    let mut tally = Tally::default();
+    if !mode.frames {
+        for (r, (prev, since)) in prev.chunks_mut(w).zip(since.chunks_mut(w)).enumerate() {
+            fill(r, scratch);
+            tally.add(scan_changed_keys(scratch, prev, since, frame, |c, n| {
+                sink.add(c, n)
+            }));
+        }
+        if mode.vote(tally.frames_cheaper(px)) {
+            for (&c, &s) in prev.iter().zip(since.iter()) {
+                sink.add(c, frame + 1 - s);
+            }
+            mode.switch();
+        }
+        return;
+    }
+    for (r, prev) in prev.chunks_mut(w).enumerate() {
+        if r % SAMPLE_EVERY == 0 {
+            fill(r, scratch);
+            let mut n = 0u32;
+            for (a, b) in scratch.iter().zip(prev.iter()) {
+                n += u32::from(a != b);
+            }
+            tally.sampled += n as usize;
+            tally.sampled_px += w;
+            prev.copy_from_slice(scratch);
+        } else {
+            // straight into the strip's state: it has to hold this
+            // frame's keys by the time counting by change resumes, and
+            // nothing here needs the old ones
+            fill(r, prev);
+        }
+        scan_rgb_key_runs_with(prev, |c, n| {
+            tally.entries += 1;
+            sink.add(c, n)
+        });
+    }
+    if mode.vote(tally.changes_cheaper(px)) {
+        since.fill(frame + 1);
+        mode.switch();
+    }
+}
+
+/// `finish_rgba_strip` for a planar strip: `prev` is its state after the
+/// last frame.
+pub fn finish_key_strip(
+    prev: &[u32],
+    since: &[u32],
+    mode: StripMode,
+    frames: u32,
+    sink: &mut RunSink,
+) {
+    if !mode.frames {
+        for (&c, &s) in prev.iter().zip(since) {
+            sink.add(c, frames - s);
+        }
+    }
 }
 
 /// Scatter a frame's packed runs by red byte into `sorted` (reused;
@@ -595,18 +892,21 @@ pub fn accumulate_entries_coarse(bins: &mut [[u64; 4]], entries: &[(u32, u32)]) 
     }
 }
 
-/// The per-frame scan: every opaque pixel of an RGBA buffer, as runs.
-/// The encoder counts RGBA input by change instead (see "Temporal
-/// accumulation" below); this is what that has to agree with, and the
-/// tests hold it to it.
-#[cfg(test)]
+/// The per-frame scan: every opaque pixel of an RGBA buffer, as runs;
+/// returns whether any pixel was transparent.
+#[inline(always)]
 fn scan_runs_with(rgba: &[u8], mut add: impl FnMut(u32, u32)) -> bool {
+    let pixels = rgba.as_chunks::<4>().0;
+    let n = pixels.len();
     let mut has_alpha = false;
     let mut last: u32 = u32::MAX;
     let mut run: u32 = 0;
-    for px in rgba.as_chunks::<4>().0 {
+    let mut i = 0usize;
+    while i < n {
+        let px = pixels[i];
         if px[3] < 128 {
             has_alpha = true;
+            i += 1;
             continue;
         }
         let c = ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | px[2] as u32;
@@ -619,11 +919,55 @@ fn scan_runs_with(rgba: &[u8], mut add: impl FnMut(u32, u32)) -> bool {
             last = c;
             run = 1;
         }
+        i += 1;
+        // Extend repeated raw pixels after a scalar equality guard, so
+        // noisy content avoids building a vector pattern for every pixel.
+        // NEON also finds the first mismatch within the final block;
+        // other targets retain whole-block equality checks. Equal raw
+        // words share alpha, so every counted pixel is opaque.
+        if i < n && pixels[i] == px {
+            #[cfg(target_arch = "aarch64")]
+            {
+                let extra = crate::simdops::rgba_run_prefix(&rgba[i * 4..], px);
+                run += extra as u32;
+                i += extra;
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let mut pattern = [0u8; 32];
+                for chunk in pattern.as_chunks_mut::<4>().0 {
+                    *chunk = px;
+                }
+                let bytes = &rgba[i * 4..];
+                let mut off = 0usize;
+                while off + 32 <= bytes.len() && eq32(&bytes[off..off + 32], &pattern) {
+                    off += 32;
+                }
+                run += (off / 4) as u32;
+                i += off / 4;
+            }
+        }
     }
     if run > 0 {
         add(last, run);
     }
     has_alpha
+}
+
+/// 32-byte equality via four u64 loads. Slice `==` lowers to libc
+/// `memcmp`, which musl implements as a byte loop; this stays fast on
+/// every target.
+#[inline]
+#[cfg(not(target_arch = "aarch64"))]
+fn eq32(a: &[u8], b: &[u8; 32]) -> bool {
+    debug_assert_eq!(a.len(), 32);
+    let mut acc = 0u64;
+    for k in 0..4 {
+        let x = u64::from_ne_bytes(a[k * 8..k * 8 + 8].try_into().unwrap());
+        let y = u64::from_ne_bytes(b[k * 8..k * 8 + 8].try_into().unwrap());
+        acc |= x ^ y;
+    }
+    acc == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -2690,14 +3034,17 @@ mod tests {
         }
     }
 
-    /// Counting by change must give the per-frame scan's histogram and
-    /// its per-frame transparency flags, whatever the content does:
-    /// sparse changes, whole-frame fades over flat fills (the block fast
-    /// path), noise, alpha crossing the threshold with and without the
-    /// colour moving, sizes that leave partial blocks, and any split into
-    /// row strips.
+    /// Pass 1's strip counters must give the per-frame scan's histogram
+    /// and its per-frame transparency flags, whatever the content does and
+    /// whichever way each strip ends up counting it: sparse changes,
+    /// whole-frame changes over flat fills (the block fast path) and over
+    /// stripes (which sends strips to per-frame scanning), stillness
+    /// (which brings them back), noise, alpha crossing the threshold with
+    /// and without the colour moving, sizes that leave partial blocks, and
+    /// any split into row strips. The planar counter runs on the same
+    /// clips with alpha ignored.
     #[test]
-    fn temporal_accumulation_matches_per_frame_scan() {
+    fn strip_counting_matches_per_frame_scan() {
         use std::collections::HashMap;
         let mut seed = 0x6c07_8965u32;
         let mut rng = move || {
@@ -2706,10 +3053,33 @@ mod tests {
             seed ^= seed << 5;
             seed
         };
-        for case in 0..48 {
-            let (w, h) = [(1, 1), (5, 3), (16, 4), (37, 9), (64, 7), (131, 5)][case % 6];
-            let nframes = 1 + case % 13;
-            let strip_px = [w * h, w, 2 * w, 3 * w][case % 4].max(1);
+        fn collect(sink: RunSink, got: &mut HashMap<u32, u64>) {
+            let (runs, offs) = sink.finish();
+            assert_eq!(offs.len(), 257);
+            assert_eq!(*offs.last().unwrap() as usize, runs.len());
+            for b in 0..256 {
+                for &e in &runs[offs[b] as usize..offs[b + 1] as usize] {
+                    let (c, n) = unpack_run(e);
+                    assert_eq!((c >> 16) as usize, b, "run in the wrong bucket");
+                    *got.entry(c).or_default() += n as u64;
+                }
+            }
+        }
+        // [to per-frame, back to change] switches seen, per counter
+        let mut switches = [[0usize; 2]; 2];
+        for case in 0..56 {
+            let (w, h) = [
+                (1, 1),
+                (5, 3),
+                (16, 4),
+                (37, 9),
+                (64, 7),
+                (131, 5),
+                (96, 12),
+            ][case % 7];
+            let nframes = 1 + (case * 5) % 31;
+            let strip_rows = [h, 1, 2, 3][case % 4];
+            let strip_px = strip_rows * w;
             let palette: Vec<[u8; 4]> = (0..6)
                 .map(|_| {
                     let v = rng().to_le_bytes();
@@ -2724,25 +3094,21 @@ mod tests {
             // frame 0: wide flat bands, so later full-frame changes meet
             // whole blocks of one colour
             let mut frame: Vec<[u8; 4]> = (0..w * h).map(|i| palette[(i / 48) % 3]).collect();
-            let mut want: HashMap<u32, u64> = HashMap::new();
-            let mut got: HashMap<u32, u64> = HashMap::new();
+            let key = |px: &[u8; 4]| (px[0] as u32) << 16 | (px[1] as u32) << 8 | px[2] as u32;
+            let (mut want, mut got) = (HashMap::new(), HashMap::new());
+            let (mut want_keys, mut got_keys) = (HashMap::new(), HashMap::new());
             let mut since = vec![0u32; w * h];
+            let mut modes = vec![StripMode::default(); h.div_ceil(strip_rows)];
+            let mut since_keys = vec![0u32; w * h];
+            let mut modes_keys = modes.clone();
+            let mut prev_keys = vec![0xdead_beefu32; w * h];
+            let mut scratch = vec![0u32; w];
             let mut prev: Vec<u8> = Vec::new();
-            let collect = |sink: RunSink, got: &mut HashMap<u32, u64>| {
-                let (runs, offs) = sink.finish();
-                assert_eq!(offs.len(), 257);
-                assert_eq!(*offs.last().unwrap() as usize, runs.len());
-                for b in 0..256 {
-                    for &e in &runs[offs[b] as usize..offs[b + 1] as usize] {
-                        let (c, n) = unpack_run(e);
-                        assert_eq!((c >> 16) as usize, b, "run in the wrong bucket");
-                        *got.entry(c).or_default() += n as u64;
-                    }
-                }
-            };
             for k in 0..nframes {
+                // each kind of change holds for three frames, long enough
+                // for a strip to act on it
                 if k > 0 {
-                    match (case / 6 + k) % 6 {
+                    match (case / 7 + k / 3) % 7 {
                         // everything moves to one new value per old value
                         0 => {
                             let shift = palette[3 + k % 3];
@@ -2782,40 +3148,97 @@ mod tests {
                         // back to the bands: pixels already there keep
                         // their stretch, so a flat block's pixels now date
                         // from different frames
-                        _ => {
+                        5 => {
                             for (i, px) in frame.iter_mut().enumerate() {
                                 *px = palette[(i / 48) % 3];
+                            }
+                        }
+                        // marching stripes: every pixel changes, into few
+                        // runs, with no block flat
+                        _ => {
+                            for (i, px) in frame.iter_mut().enumerate() {
+                                let stripe = (i % w) / 6 + k;
+                                *px = [(stripe % 5) as u8 * 40, (stripe % 3) as u8, 9, 255];
                             }
                         }
                     }
                 }
                 let cur: Vec<u8> = frame.iter().flatten().copied().collect();
+                let keys: Vec<u32> = frame.iter().map(key).collect();
                 let mut runs = Vec::new();
                 let alpha_want = scan_rgba_runs(&cur, &mut runs);
                 for (c, n) in runs {
                     *want.entry(c).or_default() += n as u64;
                 }
+                for &c in &keys {
+                    *want_keys.entry(c).or_default() += 1u64;
+                }
                 let mut alpha_got = false;
-                for (si, since) in since.chunks_mut(strip_px).enumerate() {
+                for (si, (since, mode)) in since.chunks_mut(strip_px).zip(&mut modes).enumerate() {
                     let lo = si * strip_px * 4;
                     let hi = lo + since.len() * 4;
                     let mut sink = RunSink::new();
-                    alpha_got |= if k == 0 {
-                        has_transparent(&cur[lo..hi])
-                    } else {
-                        scan_changed_runs(&cur[lo..hi], &prev[lo..hi], since, k as u32, |c, n| {
-                            sink.add(c, n)
-                        })
-                    };
+                    let was = mode.frames;
+                    alpha_got |= count_rgba_strip(
+                        &cur[lo..hi],
+                        (k > 0).then(|| &prev[lo..hi]),
+                        since,
+                        mode,
+                        k as u32,
+                        &mut sink,
+                    );
+                    switches[0][usize::from(was)] += usize::from(was != mode.frames);
                     collect(sink, &mut got);
                 }
                 assert_eq!(alpha_got, alpha_want, "case {case}, frame {k}");
+                for (si, ((since, prev), mode)) in since_keys
+                    .chunks_mut(strip_px)
+                    .zip(prev_keys.chunks_mut(strip_px))
+                    .zip(&mut modes_keys)
+                    .enumerate()
+                {
+                    let lo = si * strip_px;
+                    let mut sink = RunSink::new();
+                    let was = mode.frames;
+                    count_key_strip(
+                        |r, out| out.copy_from_slice(&keys[lo + r * w..lo + (r + 1) * w]),
+                        w,
+                        &mut scratch,
+                        prev,
+                        since,
+                        mode,
+                        k as u32,
+                        &mut sink,
+                    );
+                    switches[1][usize::from(was)] += usize::from(was != mode.frames);
+                    collect(sink, &mut got_keys);
+                }
+                assert_eq!(prev_keys, keys, "case {case}, frame {k}: stale strip state");
                 prev = cur;
             }
-            let mut sink = RunSink::new();
-            scan_final_runs(&prev, &since, nframes as u32, |c, n| sink.add(c, n));
-            collect(sink, &mut got);
+            for (si, (since, &mode)) in since.chunks(strip_px).zip(&modes).enumerate() {
+                let lo = si * strip_px * 4;
+                let mut sink = RunSink::new();
+                let last = &prev[lo..lo + since.len() * 4];
+                finish_rgba_strip(last, since, mode, nframes as u32, &mut sink);
+                collect(sink, &mut got);
+            }
+            for (si, (since, &mode)) in since_keys.chunks(strip_px).zip(&modes_keys).enumerate() {
+                let lo = si * strip_px;
+                let mut sink = RunSink::new();
+                let last = &prev_keys[lo..lo + since.len()];
+                finish_key_strip(last, since, mode, nframes as u32, &mut sink);
+                collect(sink, &mut got_keys);
+            }
             assert_eq!(got, want, "case {case}: {w}x{h}, {nframes} frames");
+            assert_eq!(
+                got_keys, want_keys,
+                "case {case}: {w}x{h}, {nframes} frames (planar)"
+            );
+        }
+        // both hand-overs have to have happened for this to have tested them
+        for (counter, s) in ["rgba", "planar"].iter().zip(switches) {
+            assert!(s[0] > 3 && s[1] > 3, "{counter}: switches {s:?}");
         }
     }
 

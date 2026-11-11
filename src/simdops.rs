@@ -30,6 +30,35 @@ pub fn level() -> Level {
 }
 
 #[cfg(target_arch = "aarch64")]
+/// Length in pixels of the initial run equal to `pixel`, including the
+/// partial vector at the end. No alignment or alpha assumptions needed.
+pub fn rgba_run_prefix(rgba: &[u8], pixel: [u8; 4]) -> usize {
+    fearless_simd::dispatch!(level(), simd => rgba_run_prefix_impl(simd, rgba, pixel))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn rgba_run_prefix_impl<S: Simd>(simd: S, rgba: &[u8], pixel: [u8; 4]) -> usize {
+    let pattern = u32x8::splat(simd, u32::from_ne_bytes(pixel));
+    let mut i = 0;
+    while i + 32 <= rgba.len() {
+        let words: u32x8<S> = fearless_simd::u8x32::from_slice(simd, &rgba[i..i + 32]).bitcast();
+        let n = words.simd_eq(pattern).to_bitmask().trailing_ones() as usize;
+        i += n * 4;
+        if n < 8 {
+            return i / 4;
+        }
+    }
+    for px in rgba[i..].as_chunks::<4>().0 {
+        if *px != pixel {
+            break;
+        }
+        i += 4;
+    }
+    i / 4
+}
+
+#[cfg(target_arch = "aarch64")]
 /// Palette colors are padded to four lanes to load all three components
 /// together. The fourth lane is zero and is excluded from the distance.
 pub fn resolve_candidates(pal: &[[f32; 4]], cands: &[u8], q: [f32; 3]) -> u8 {
@@ -1054,6 +1083,36 @@ fn cell_distances_impl<S: Simd>(simd: S, pal: &PalSoa, q: [f32; 3], dists: &mut 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn rgba_run_prefix_matches_scalar_at_every_boundary() {
+        for pixel in [[0; 4], [255; 4], [41, 99, 203, 128]] {
+            for len in 0..=65 {
+                for end in 0..=len {
+                    for channel in 0..4 {
+                        // Offset the row and include an incomplete trailing pixel.
+                        let mut buf = vec![19];
+                        for _ in 0..len {
+                            buf.extend_from_slice(&pixel);
+                        }
+                        buf.extend_from_slice(&[7, 8, 9]);
+                        if end < len {
+                            buf[1 + end * 4 + channel] ^= 1;
+                        }
+                        let row = &buf[1..];
+                        let expected = row
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .take_while(|p| **p == pixel)
+                            .count();
+                        assert_eq!(rgba_run_prefix(row, pixel), expected);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn candidates_preserve_order_boundaries_and_prefix() {
