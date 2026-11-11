@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+Faster on every clip measured, with **byte-identical output**: 34% more
+throughput at `--lossy 30 --hold 12` and 35% at the defaults over the
+20-clip Frinkiac corpus (geometric mean, 4 threads), for 27-29% less CPU
+time. Verified identical across RGBA, y4m and alpha input, six flag sets
+and 1-13 threads (960 runs). No flag, default, palette or compression
+threshold changed. See [bench/change-counting.md](bench/change-counting.md).
+
+- The histogram pass counts pixels by change instead of by frame. A frame
+  is compared with its predecessor and only the pixels that differ emit a
+  run, for the colour that just ended, weighted by how many frames it
+  stood; the rest of the clip is counted once at the end. The sums are
+  the integers the per-frame scan produced. Row strips whose content
+  changes everywhere into long runs (fades, animated gradients) fall back
+  to the per-frame scan, with an exact hand-over in both directions. This
+  roughly halves the pass on video-sourced clips, for RGBA and y4m alike.
+- LZW starts a match that begins in a transparent run at the deepest
+  all-transparent dictionary string the run reaches, instead of walking
+  there one pixel and one hash probe at a time. Transparent runs are most
+  of a delta frame; 94% of their pixels were being walked. Applies to
+  lossless and `--lossy` encoding.
+- Zero-initialised tables that are read before they are first written (the
+  coarse histogram bins, the shared nearest-colour cache) no longer fault
+  twice per page. The second fault had to interrupt every other core to
+  flush a mapping, which was 5% of all samples at four threads.
+- On Linux, stdin's pipe buffer is raised to 1 MiB where the system allows
+  it: 5% less wall time when frames are piped in.
+- Peak memory is up 5-8 MiB at 480x360 (per-pixel state for the change
+  counter, and the two tables above now being fully resident).
+
 ## 0.5.0
 
 weft no longer depends on rayon. Every parallel stage now runs on a

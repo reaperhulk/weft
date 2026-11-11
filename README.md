@@ -355,22 +355,43 @@ mostly idles, it costs 13% less CPU than rayon did (see
 [bench/pool.md](bench/pool.md)).
 
 1. **Read + histogram, overlapped.** A reader thread streams frames into a
-   bounded channel while workers RLE-scan them into packed runs and route
-   those runs into 256 buckets by red byte; a second pass then accumulates
-   one bucket per task into an open-addressed table keyed by 24-bit color.
-   Bucketing rather than giving each worker its own table is what keeps the
-   merge free — bucket order *is* sorted order, so there is no duplicate
-   per-worker state to dedup afterwards. Above 131k distinct colors the
-   histogram folds to a 6-bit/channel grid, which is the common path on
-   real footage; below 255 the palette is exact and the whole search is
-   skipped. Scanning is split across 32-row strips as well as across
-   frames, because a batch is only as deep as the reader has queued and
-   that measured 12-15 frames against 40 workers. RGBA rows are hashed in
-   place, straight out of the frame; only y4m pays a conversion into a
-   scratch row. This pass also records, per frame, whether any pixel is
-   transparent — the pipeline needs that before quantization to pick a
-   disposal mode, and it doubles as the test for packing an all-opaque
-   frame down to 3 bytes/pixel for the rest of the run.
+   bounded channel while workers turn each batch into packed runs of
+   colour, routed into 256 buckets by red byte; a second pass then
+   accumulates one bucket per task into an open-addressed table keyed by
+   24-bit color. Bucketing rather than giving each worker its own table is
+   what keeps the merge free — bucket order *is* sorted order, so there is
+   no duplicate per-worker state to dedup afterwards. Above 131k distinct
+   colors the histogram folds to a 6-bit/channel grid, which is the common
+   path on real footage; below 255 the palette is exact and the whole
+   search is skipped.
+
+   The runs are mostly not a scan of the frames. Most pixels of most
+   frames are the pixel that was there a frame ago (5-37% change per frame
+   on cartoon clips behind `--hold 12`, 10-62% without, against a new
+   run every 1.5-2.7 pixels when scanning), and a colour that sits at one
+   position for *k* frames can be counted once, with weight *k*, when it
+   is replaced. So each frame is compared with its predecessor 16 pixels
+   at a time, and only the pixels that changed produce a run, for the
+   colour that just ended; what is still on screen when the clip ends is
+   counted then. The sums are the same integers a per-frame scan gives,
+   so the palette is identical. The work is split by row strip, each
+   walked through the batch in frame order, so a batch only as deep as
+   the reader has queued (12-15 frames, measured, against 40 workers)
+   still yields plenty of tasks. Content where everything changes into
+   long runs — a fade across flat fills, an animated gradient — is the one
+   case a per-frame scan handles better, so a strip that keeps producing
+   three times more changes than its frames have runs is scanned per
+   frame until that stops being true; the hand-over is exact both ways.
+   RGBA frames are compared in place; y4m rows are converted to colour
+   keys and compared against the previous frame's, which each strip keeps.
+   This pass also records, per frame, whether any pixel is transparent —
+   the pipeline needs that before quantization to pick a disposal mode,
+   and it doubles as the test for packing an all-opaque frame down to 3
+   bytes/pixel for the rest of the run.
+
+   On Linux the encoder also asks for a 1 MiB pipe buffer on stdin (the
+   default is 64 KiB, a tenth of a 480x360 RGBA frame), so a frame crosses
+   from the decoder in one or two wake-ups rather than a dozen.
 2. **Palette: variance median cut in OkLab**, mirroring ffmpeg ≥5.x
    palettegen: the box with the largest single-channel squared error (in
    Lab) splits at its count-weighted median along that channel; each box
@@ -397,7 +418,8 @@ the YUV→RGBA row conversion (16 px/iteration through widen/zip, feeding
 both the histogram and quantize passes) and the nearest-map distance
 sweep. 720p end-to-end: 2.48 s → 2.13 s. Bulk histogram run extension
 (8-pixel blocks, guarded by one scalar compare so noisy content skips the
-overhead) uses branchless u64 word compares rather than slice equality:
+overhead; used where a strip is scanned per frame) uses branchless u64
+word compares rather than slice equality:
 slice `==` lowers to libc `memcmp`, which musl implements as a
 byte-at-a-time loop — that single call site made the static binary's
 histogram pass up to 6× slower. Verified not to help: sierra2 error diffusion (the
