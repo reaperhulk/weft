@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.1
+## 0.8.0
 
 A third faster, with **byte-identical output**. No flag, default, palette,
 or compression threshold changed. (#75)
@@ -45,7 +45,7 @@ Costs: peak memory is up 5-8 MiB at 480x360, for the change counter's
 per-pixel state and the two tables above now being fully resident. One
 case got slower: a mandelbrot zoom at `--threads 1`, by 2.6%.
 
-Verified identical to 0.5.0 across RGBA, y4m and alpha input under six
+Verified identical to the previous build across RGBA, y4m and alpha input under six
 flag sets at 1-13 threads (960 runs, no mismatch), and on the static musl
 build.
 
