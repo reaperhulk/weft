@@ -472,14 +472,9 @@ fn run(args: &Args) -> io::Result<()> {
             let prefault = std::thread::spawn(move || loop {
                 // Deliberately not `vec![0; fsize]`: that is calloc, whose
                 // pages stay unmapped until first written, i.e. the fault
-                // would land on the reader after all. resize() stores the
-                // zeros itself, which is the first touch we want here.
-                #[allow(clippy::slow_vector_initialization)]
-                let v: Vec<u8> = {
-                    let mut v = Vec::with_capacity(fsize);
-                    v.resize(fsize, 0);
-                    v
-                };
+                // would land on the reader after all. Storing the zeros
+                // is the first touch we want here.
+                let v: Vec<u8> = zeroed_by_writing(fsize, 0);
                 if btx.send(v).is_err() {
                     break;
                 }
@@ -697,7 +692,7 @@ fn run(args: &Args) -> io::Result<()> {
             debug_assert!(batch.iter().enumerate().all(|(k, (i, _))| *i == seen + k));
             let planar = matches!(batch[0].1, Frame::Yuv(_));
             if since.is_empty() {
-                since = vec![0u32; w * h];
+                since = zeroed_by_writing(w * h, 0u32);
                 modes = vec![palette::StripMode::default(); h.div_ceil(strip_rows)];
                 if planar {
                     prev_keys = vec![0u32; w * h];
@@ -1185,6 +1180,31 @@ fn run(args: &Args) -> io::Result<()> {
     Ok(())
 }
 
+/// `vec![zero; n]`, except that the zeros are stored rather than asked
+/// for.
+///
+/// `vec![0; n]` is calloc, whose pages are not there until touched — and
+/// what the first touch is matters. A *read* of such a page maps the
+/// kernel's shared zero page; the first write after that is a second
+/// fault that has to replace the mapping, which means interrupting every
+/// other core running this process to flush it. A buffer that is read
+/// before it is written (an accumulator: load, add, store) pays that pair
+/// on every page, and the interrupts grow with the thread count. Writing
+/// the zeros here makes each page's first touch a write: one fault, no
+/// flush.
+///
+/// The `black_box` is load-bearing. An allocation followed by a fill with
+/// zeros is exactly what the optimizer rewrites into one zeroed
+/// allocation — calloc again — and it did, here, until the pointer was
+/// made to escape in between.
+#[allow(clippy::slow_vector_initialization)]
+fn zeroed_by_writing<T: Copy>(n: usize, zero: T) -> Vec<T> {
+    let mut v = Vec::with_capacity(n);
+    std::hint::black_box(v.as_mut_ptr());
+    v.resize(n, zero);
+    v
+}
+
 /// Pass-1 runs bucket-sorted by red byte: phase A's output, phase B's
 /// input.
 struct Sorted {
@@ -1197,7 +1217,7 @@ struct Sorted {
 /// slab (four adjacent buckets).
 fn fold_slabs(pool: &Pool, hists: &[palette::ColorHist]) -> Vec<Vec<[u64; 4]>> {
     pool.map(hists.len() / 4, |_, g| {
-        let mut b = vec![[0u64; 4]; palette::SLAB_BINS];
+        let mut b = zeroed_by_writing(palette::SLAB_BINS, [0u64; 4]);
         for h in &hists[4 * g..4 * g + 4] {
             palette::accumulate_entries_coarse(&mut b, &h.entries());
         }

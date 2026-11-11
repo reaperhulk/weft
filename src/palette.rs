@@ -1881,12 +1881,31 @@ impl NearestMap {
         for (slot, c) in pal_rgb.iter_mut().zip(colors) {
             *slot = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
         }
+        let shared: Vec<std::sync::atomic::AtomicU8> = (0..1 << 24)
+            .map(|_| std::sync::atomic::AtomicU8::new(0))
+            .collect();
+        // The table arrives as untouched zero pages, and a lookup reads a
+        // slot before it ever stores one. A page first touched by a read
+        // is mapped to the kernel's shared zero page, and the store that
+        // follows has to replace that mapping, interrupting every other
+        // core running the encoder to flush it. Store to each page once
+        // up front, in parallel, so every page's first touch is a write.
+        // With one thread there is nobody to interrupt and nothing to
+        // gain, so the pages are left to fault in as they are used.
+        let pool = pool::global();
+        if pool.threads() > 1 {
+            const PAGE: usize = 4096;
+            const CHUNK: usize = 64 * PAGE;
+            pool.for_each(shared.len() / CHUNK, |_, i| {
+                for slot in shared[i * CHUNK..(i + 1) * CHUNK].iter().step_by(PAGE) {
+                    slot.store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
         Self {
             kd: kd_build(&pal_lab),
             tiled: cfg!(all(target_arch = "aarch64", target_vendor = "apple")),
-            shared: (0..1 << 24)
-                .map(|_| std::sync::atomic::AtomicU8::new(0))
-                .collect(),
+            shared,
             direct: Vec::new(),
             cands: Vec::new(),
             pal_rgb,
