@@ -226,8 +226,40 @@ fn main() {
     }
 }
 
+/// Ask the kernel for a larger buffer on stdin when it is a pipe.
+///
+/// Input usually arrives down a pipe from a decoder, and the reader thread
+/// paces the whole read-and-histogram phase. Linux pipes hold 64 KiB by
+/// default, a tenth of one 480x360 RGBA frame, so each frame costs the
+/// writer and the reader a dozen sleep/wake round trips. A megabyte (the
+/// default unprivileged ceiling) lets a frame cross in one or two.
+///
+/// This is only a request: it fails harmlessly when stdin is not a pipe,
+/// when the system's limit is lower, or when the user's pipe allowance is
+/// used up, and the stream reads the same either way.
+#[cfg(target_os = "linux")]
+fn widen_stdin_pipe() {
+    use std::ffi::c_int;
+    use std::os::fd::AsRawFd;
+    extern "C" {
+        fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    }
+    const F_SETPIPE_SZ: c_int = 1031;
+    const WANT: c_int = 1 << 20;
+    // SAFETY: fcntl(F_SETPIPE_SZ) takes an int argument and touches no
+    // memory of ours; the descriptor is stdin's, open for the process's
+    // lifetime. Any error is the "leave it as it is" answer.
+    unsafe {
+        fcntl(io::stdin().as_raw_fd(), F_SETPIPE_SZ, WANT);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn widen_stdin_pipe() {}
+
 fn run(args: &Args) -> io::Result<()> {
     let t0 = Instant::now();
+    widen_stdin_pipe();
     // Stdin (not StdinLock): the reader moves to a worker thread, and
     // StdinLock is not Send. Refills lock per read; at 1 MB granularity the
     // lock cost vanishes.
